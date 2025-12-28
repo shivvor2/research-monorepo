@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "research_monorepo"
+version = "0.1.0"
+authors = [{ name = "Loo Jun Zing", email = "jzloo11111@gmail.com" }]
+requires-python = ">=3.12"
+dependencies = [
+    # Core DL
+    "torch>=2.1.0",
+
+    # Hugging Face Ecosystem
+    "transformers",
+    "diffusers",
+    "timm",
+    "accelerate",
+    "tokenizers",
+    "datasets",
+    "peft",
+    "evaluate",
+    "trl",
+
+    # Optimization
+    "bitsandbytes",
+    "einops",
+    # "flash-attn", # Commented out: Install manually to ensure CUDA compatibility
+
+    # Infrastructure & Config
+    "wandb",
+    "omegaconf",
+    "hydra-core",
+
+    # Utilities
+    "numpy",
+    "pandas",
+    "scipy",
+    "tqdm",
+    "pytest",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pre-commit",
+    "black",
+    "isort",
+    "ruff",
+]
+unsloth = [
+    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["*"]
