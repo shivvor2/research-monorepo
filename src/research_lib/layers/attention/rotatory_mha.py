@@ -16,6 +16,7 @@ class RotaryMultiheadAttention(nn.Module):
 
     API designed to closely match nn.MultiheadAttention for drop-in replacement.
     Uses F.scaled_dot_product_attention for efficient computation.
+    Integrates with lucidrains/rotary-embedding-torch for advanced RoPE features.
 
     Args:
         embed_dim: Total dimension of the model.
@@ -30,9 +31,12 @@ class RotaryMultiheadAttention(nn.Module):
                      as (batch, seq, feature). Default: True.
         device: Device to place parameters on. Default: None.
         dtype: Data type for parameters. Default: None.
-        rotary_dim: Dimension for rotary embeddings. Default: None (uses head_dim).
-        rotary_base: Base for rotary embedding frequencies. Default: 10000.0.
-        rotary_interleaved: Whether to use interleaved rotary style. Default: False.
+        rotary_dim: Dimension for rotary embeddings. If None, uses head_dim. Default: None.
+        rotary_base: Base for rotary embedding frequencies (theta). Default: 10000.0.
+        use_xpos: If True, uses Extrapolatable Position Embedding (xPos). Default: False.
+        xpos_scale_base: Base scale for xPos decay. Default: 512.
+        interpolate_factor: Factor for NTK-aware interpolation to extend context length.
+                            Default: 1.0 (no interpolation).
 
     Examples:
         >>> # Basic usage
@@ -41,6 +45,9 @@ class RotaryMultiheadAttention(nn.Module):
 
         >>> # Self-attention with causal masking (most common for decoders)
         >>> attn_output, _ = rotary_attn(x, x, x, is_causal=True, need_weights=False)
+
+        >>> # Usage with xPos for length extrapolation
+        >>> rotary_attn = RotaryMultiheadAttention(512, 8, use_xpos=True)
 
         >>> # Drop-in replacement for nn.MultiheadAttention
         >>> # Before:
