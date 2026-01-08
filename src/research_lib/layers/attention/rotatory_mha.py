@@ -7,31 +7,7 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-# You can swap this with lucidrains/rotary-embedding-torch if preferred
-try:
-    from flash_attn.layers.rotary import RotaryEmbedding
-except ImportError:
-    # Fallback to lucidrains implementation
-    from rotary_embedding_torch import RotaryEmbedding as _RotaryEmbedding
-
-    class RotaryEmbedding(nn.Module):
-        """Wrapper to match flash_attn's RotaryEmbedding API using lucidrains'."""
-
-        def __init__(
-            self,
-            dim: int,
-            base: float = 10000.0,
-            interleaved: bool = False,
-            device: Optional[torch.device] = None,
-        ):
-            super().__init__()
-            self._rotary = _RotaryEmbedding(dim=dim, theta=base)
-            self.interleaved = interleaved
-
-        def forward(self, x: torch.Tensor, seqlen_offset: int = 0) -> torch.Tensor:
-            # x: (B, S, H, D)
-            return self._rotary.rotate_queries_or_keys(x, offset=seqlen_offset)
+from rotary_embedding_torch import RotaryEmbedding
 
 
 class RotaryMultiheadAttention(nn.Module):
@@ -84,10 +60,12 @@ class RotaryMultiheadAttention(nn.Module):
         batch_first: bool = True,
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
-        # RoPE-specific arguments
+        # RoPE-specific arguments (lucidrains implementation)
         rotary_dim: Optional[int] = None,
         rotary_base: float = 10000.0,
-        rotary_interleaved: bool = False,
+        use_xpos: bool = False,  # NEW: length extrapolation
+        xpos_scale_base: int = 512,  # NEW: xpos scale base
+        interpolate_factor: float = 1.0,  # NEW: context extension (NTK-aware)
     ) -> None:
         super().__init__()
 
@@ -161,10 +139,16 @@ class RotaryMultiheadAttention(nn.Module):
         rotary_dim = rotary_dim if rotary_dim is not None else self.head_dim
         self.rotary_emb = RotaryEmbedding(
             dim=rotary_dim,
-            base=rotary_base,
-            interleaved=rotary_interleaved,
-            device=device,
+            theta=rotary_base,  # 'theta' not 'base'
+            # interleaved is not a param here - lucidrains uses rotate_half style by default
+            cache_if_possible=True,
+            cache_max_seq_len=8192,
+            seq_before_head_dim=False,  # We use (B, H, S, D) format internally
+            use_xpos=use_xpos,  # NEW: support for xpos
+            xpos_scale_base=xpos_scale_base,  # NEW: xpos scale base
+            interpolate_factor=interpolate_factor,  # NEW: for context length extension
         )
+        self.use_xpos = use_xpos
 
         self._reset_parameters()
 
@@ -191,28 +175,32 @@ class RotaryMultiheadAttention(nn.Module):
         self,
         q: torch.Tensor,
         k: torch.Tensor,
-        seqlen_offset: int = 0,
+        seq_dim: int = -2,
+        offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply rotary embeddings to queries and keys.
+        Apply rotary embeddings to queries and keys using lucidrains' implementation.
 
         Args:
             q: Queries of shape (B, num_heads, L, head_dim)
             k: Keys of shape (B, num_heads, S, head_dim)
-            seqlen_offset: Offset for sequence position (useful for KV-cache inference)
+            seq_dim: Dimension where sequence length is. Default -2 for (B, H, S, D)
+            offset: Position offset for KV-cache inference
 
         Returns:
             Tuple of rotated (q, k)
         """
-        # RotaryEmbedding expects (B, S, H, D) format
-        q = q.transpose(1, 2)  # (B, L, num_heads, head_dim)
-        k = k.transpose(1, 2)  # (B, S, num_heads, head_dim)
-
-        q = self.rotary_emb(q, seqlen_offset=seqlen_offset)
-        k = self.rotary_emb(k, seqlen_offset=seqlen_offset)
-
-        q = q.transpose(1, 2)  # (B, num_heads, L, head_dim)
-        k = k.transpose(1, 2)  # (B, num_heads, S, head_dim)
+        if self.use_xpos:
+            # xpos requires both q and k to be rotated together for proper scaling
+            q, k = self.rotary_emb.rotate_queries_and_keys(q, k, seq_dim=seq_dim)
+        else:
+            # Standard RoPE - can rotate independently
+            q = self.rotary_emb.rotate_queries_or_keys(
+                q, seq_dim=seq_dim, offset=offset
+            )
+            k = self.rotary_emb.rotate_queries_or_keys(
+                k, seq_dim=seq_dim, offset=offset
+            )
 
         return q, k
 
@@ -251,7 +239,7 @@ class RotaryMultiheadAttention(nn.Module):
                                   heads. Default: True.
             is_causal: If True, applies a causal mask. Default: False.
             seqlen_offset: Position offset for rotary embeddings (for KV-cache).
-                           Default: 0.
+                           Only used when use_xpos=False. Default: 0.
 
         Returns:
             attn_output: Attention outputs of shape (N, L, E) when batch_first=True,
@@ -316,7 +304,7 @@ class RotaryMultiheadAttention(nn.Module):
             )
 
         # Apply rotary embeddings to Q and K
-        q, k = self._apply_rotary(q, k, seqlen_offset=seqlen_offset)
+        q, k = self._apply_rotary(q, k, seq_dim=-2, offset=seqlen_offset)
 
         # Prepare attention mask
         combined_mask = self._prepare_attention_mask(
