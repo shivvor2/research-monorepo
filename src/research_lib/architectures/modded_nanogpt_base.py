@@ -1,7 +1,8 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from rotary_embedding_torch import RotaryEmbedding
 
 from ..layers.activations import SquaredReLU
 from ..layers.attention import RotaryMultiheadAttention
@@ -12,12 +13,13 @@ from .config import NanoGPTConfig
 
 class TransformerBlock(nn.Module):
     def __init__(self, config: NanoGPTConfig):
-        super.__init__()
+        super().__init__()
         self.norm_1 = nn.RMSNorm(config.n_embd)
         self.attn = RotaryMultiheadAttention(
             embed_dim=config.n_embd,
-            num_heads=config.n_heads,
+            num_heads=config.n_head,
             dropout=config.dropout,
+            use_xpos=True,
             bias=config.bias,
             batch_first=True,
         )
@@ -32,17 +34,29 @@ class TransformerBlock(nn.Module):
 
     # Apply casual masking to attention?
     # To do sparse attention, apply a left diagonal mask
-    def forward(self, x, attn_mask=None):
+    def forward(
+        self,
+        x,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ):
         # Attention and Post norm
         # Replace Residuals with mHC later
-        x_1 = self.attn(x, x, x, attn_mask=attn_mask, is_casual=True)
-        x_1 = self.norm1(x)
+        attn_output, _ = self.attn(
+            x,
+            x,
+            x,  # Self-attention: Q=K=V
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=False,  # Use SDPA for efficiency
+            is_causal=True,  # Causal masking for decoder
+        )
+        x_1 = x + attn_output
+        x_1 = self.norm_1(x_1)
         x = x + x_1
 
         # Position-Wise Feed Forward and post norm
-        x_2 = self.ff(x)
-        x_2 = self.norm_2(x)
-        x = x + x_2
+        x = self.norm_2(self.ff(x))
 
         return x
 
@@ -69,9 +83,6 @@ class ModdedNanoGPT(nn.Module):
 
         # Embeddings
         x = self.embedding(x)
-
-        # TODO Initialize Casual Mask by default (prevent model from seeing future tokens)
-        #
 
         for b in self.blocks:
             x = b(x, attn_mask)
