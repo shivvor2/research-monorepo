@@ -28,10 +28,12 @@ To change polar express parameters mid-training (e.g., for annealing):
 
 from typing import Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 import torch.nn as nn
 import triton
 import triton.language as tl
+from numpy.polynomial import chebyshev as cheb
 from torch import Tensor
 from torch.optim.optimizer import Optimizer
 
@@ -351,6 +353,93 @@ DEFAULT_SAFETY_FACTOR = 0.02
 DEFAULT_CUSHION = 0.1
 
 
+def remez_sign_approx(lower: float, upper: float, degree: int) -> np.ndarray:
+    """Compute optimal polynomial approximation to sign(x) on [lower, upper]."""
+    # Transform to [-1, 1] for Chebyshev basis
+    scale = 2.0 / (upper - lower)
+    shift = -(upper + lower) / (upper - lower)
+
+    def sign_transformed(x):
+        # sign((x - shift) / scale) = sign(x) for x in [-1, 1] mapped to [lower, upper]
+        return np.sign((x - shift) / scale)
+
+    # Use Chebyshev nodes for initial approximation
+    n_points = degree + 2
+    cheb_nodes = np.cos(np.pi * np.arange(n_points) / (n_points - 1))
+
+    # Remez exchange algorithm
+    nodes = cheb_nodes.copy()
+    for _ in range(50):  # Max iterations
+        # Solve for polynomial coefficients
+        V = np.vander(nodes[:-1], degree + 1, increasing=True)
+        signs = np.array([(-1) ** i for i in range(degree + 1)])
+        V = np.column_stack([V, signs])
+
+        target = sign_transformed(nodes[:-1])
+        target = np.append(target, sign_transformed(nodes[-1]))
+
+        try:
+            coeffs_and_err = np.linalg.solve(
+                np.vstack(
+                    [
+                        V,
+                        np.append(
+                            np.vander([nodes[-1]], degree + 1, increasing=True)[0],
+                            (-1) ** (degree + 1),
+                        ),
+                    ]
+                ),
+                target,
+            )
+        except np.linalg.LinAlgError:
+            break
+
+        coeffs = coeffs_and_err[:-1]
+
+        # Find new extrema
+        test_points = np.linspace(-1, 1, 1000)
+        poly_vals = np.polyval(coeffs[::-1], test_points)
+        errors = sign_transformed(test_points) - poly_vals
+
+        # Find local extrema of error
+        extrema_idx = []
+        for i in range(1, len(errors) - 1):
+            if (errors[i] > errors[i - 1] and errors[i] > errors[i + 1]) or (
+                errors[i] < errors[i - 1] and errors[i] < errors[i + 1]
+            ):
+                extrema_idx.append(i)
+
+        if len(extrema_idx) >= degree + 2:
+            nodes = test_points[extrema_idx[: degree + 2]]
+        else:
+            break
+
+    return coeffs
+
+
+def poly_to_iteration_coeffs(
+    coeffs: np.ndarray, lower: float, upper: float
+) -> Tuple[float, float, float]:
+    """Convert polynomial coefficients to (a, b, c) iteration form."""
+    # The iteration computes: X_new = a*X + b*X@(X@X.T) + c*X@(X@X.T)@(X@X.T)
+    # which corresponds to p(x) = a + b*x^2 + c*x^4 applied to singular values
+    # We need to extract these from the Remez polynomial
+
+    # For a degree-5 odd polynomial p(x) = c1*x + c3*x^3 + c5*x^5
+    # The iteration form uses X, X@X.T@X, X@(X.T@X)^2
+    # which applies q(s) = a + b*s + c*s^2 to singular values squared
+
+    if len(coeffs) >= 6:
+        # Odd polynomial: p(x) = c1*x + c3*x^3 + c5*x^5
+        c1 = coeffs[1] if len(coeffs) > 1 else 0
+        c3 = coeffs[3] if len(coeffs) > 3 else 0
+        c5 = coeffs[5] if len(coeffs) > 5 else 0
+        return (float(c1), float(c3), float(c5))
+    else:
+        # Fallback for lower degree
+        return (1.0, 0.0, 0.0)
+
+
 def compute_polar_express_coeffs(
     num_iters: int = DEFAULT_NUM_ITERS,
     safety_factor: float = DEFAULT_SAFETY_FACTOR,
@@ -380,93 +469,6 @@ def compute_polar_express_coeffs(
         List of (a, b, c) coefficient tuples for each iteration, where the
         polynomial is p(x) = a*x + b*x*(x@x.T) + c*x*(x@x.T)@(x@x.T).
     """
-    import numpy as np
-    from numpy.polynomial import chebyshev as cheb
-
-    def remez_sign_approx(lower: float, upper: float, degree: int) -> np.ndarray:
-        """Compute optimal polynomial approximation to sign(x) on [lower, upper]."""
-        # Transform to [-1, 1] for Chebyshev basis
-        scale = 2.0 / (upper - lower)
-        shift = -(upper + lower) / (upper - lower)
-
-        def sign_transformed(x):
-            # sign((x - shift) / scale) = sign(x) for x in [-1, 1] mapped to [lower, upper]
-            return np.sign((x - shift) / scale)
-
-        # Use Chebyshev nodes for initial approximation
-        n_points = degree + 2
-        cheb_nodes = np.cos(np.pi * np.arange(n_points) / (n_points - 1))
-
-        # Remez exchange algorithm
-        nodes = cheb_nodes.copy()
-        for _ in range(50):  # Max iterations
-            # Solve for polynomial coefficients
-            V = np.vander(nodes[:-1], degree + 1, increasing=True)
-            signs = np.array([(-1) ** i for i in range(degree + 1)])
-            V = np.column_stack([V, signs])
-
-            target = sign_transformed(nodes[:-1])
-            target = np.append(target, sign_transformed(nodes[-1]))
-
-            try:
-                coeffs_and_err = np.linalg.solve(
-                    np.vstack(
-                        [
-                            V,
-                            np.append(
-                                np.vander([nodes[-1]], degree + 1, increasing=True)[0],
-                                (-1) ** (degree + 1),
-                            ),
-                        ]
-                    ),
-                    target,
-                )
-            except np.linalg.LinAlgError:
-                break
-
-            coeffs = coeffs_and_err[:-1]
-
-            # Find new extrema
-            test_points = np.linspace(-1, 1, 1000)
-            poly_vals = np.polyval(coeffs[::-1], test_points)
-            errors = sign_transformed(test_points) - poly_vals
-
-            # Find local extrema of error
-            extrema_idx = []
-            for i in range(1, len(errors) - 1):
-                if (errors[i] > errors[i - 1] and errors[i] > errors[i + 1]) or (
-                    errors[i] < errors[i - 1] and errors[i] < errors[i + 1]
-                ):
-                    extrema_idx.append(i)
-
-            if len(extrema_idx) >= degree + 2:
-                nodes = test_points[extrema_idx[: degree + 2]]
-            else:
-                break
-
-        return coeffs
-
-    def poly_to_iteration_coeffs(
-        coeffs: np.ndarray, lower: float, upper: float
-    ) -> Tuple[float, float, float]:
-        """Convert polynomial coefficients to (a, b, c) iteration form."""
-        # The iteration computes: X_new = a*X + b*X@(X@X.T) + c*X@(X@X.T)@(X@X.T)
-        # which corresponds to p(x) = a + b*x^2 + c*x^4 applied to singular values
-        # We need to extract these from the Remez polynomial
-
-        # For a degree-5 odd polynomial p(x) = c1*x + c3*x^3 + c5*x^5
-        # The iteration form uses X, X@X.T@X, X@(X.T@X)^2
-        # which applies q(s) = a + b*s + c*s^2 to singular values squared
-
-        if len(coeffs) >= 6:
-            # Odd polynomial: p(x) = c1*x + c3*x^3 + c5*x^5
-            c1 = coeffs[1] if len(coeffs) > 1 else 0
-            c3 = coeffs[3] if len(coeffs) > 3 else 0
-            c5 = coeffs[5] if len(coeffs) > 5 else 0
-            return (float(c1), float(c3), float(c5))
-        else:
-            # Fallback for lower degree
-            return (1.0, 0.0, 0.0)
 
     # Compute coefficients for each iteration
     coeffs_list = []
