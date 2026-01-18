@@ -2,10 +2,27 @@
 Utilities for selecting and partitioning model parameters into optimizer groups.
 
 This module provides functions to separate model parameters based on naming
-patterns, similar to PEFT's target_modules approach. The core primitive is
-:func:`select_parameters`, which returns parameters matching given patterns.
-Higher-level functions like :func:`partition_parameters` are built on top
-of this primitive for common use cases.
+patterns, following PEFT's target_modules pattern matching convention.
+
+Pattern Matching Behavior:
+    The pattern matching follows HuggingFace PEFT's convention:
+
+    1. **Simple strings** (no regex metacharacters): Suffix matching
+       - Pattern "attn" matches "layers.0.attn" but NOT "layers.0.attn_proj"
+       - Pattern "q_proj" matches "layers.0.self_attn.q_proj"
+       - Specifically: matches if ``name == pattern`` or ``name.endswith("." + pattern)``
+
+    2. **Regex patterns** (contains metacharacters like ., *, ^, $, etc.): Full regex match
+       - Pattern ".*attn.*" matches any name containing "attn"
+       - Pattern r"layers\\.\\d+\\.attn" matches "layers.0.attn", "layers.1.attn", etc.
+       - Uses ``re.fullmatch(pattern, name)``
+
+    Regex metacharacters detected: . ^ $ * + ? { } [ ] | ( ) \\
+
+    Migration from substring matching:
+        If you previously used patterns like ["attn", "mlp"] expecting substring matching,
+        update to [".*attn.*", ".*mlp.*"] for equivalent behavior. However, the PEFT-style
+        suffix matching is recommended as it's more precise and ecosystem-compatible.
 
 Design Rationale:
     Using name-based selection rather than shape-based selection because:
@@ -32,7 +49,7 @@ Overlap Handling:
     both "attn" and "mlp"), the behavior depends on the function and settings:
 
     - :func:`select_parameters`: Returns the param (no overlap concern for single selection)
-    - :func:`partition_parameters`: Target patterns are checked with `any()`, no overlap issue
+    - :func:`partition_parameters`: Target patterns are checked, no overlap issue
     - :func:`partition_parameters_multi`: Configurable via `overlap_strategy`:
         - "first" (default): First matching group wins, with optional warning
         - "error": Raise ValueError if any param matches multiple groups
@@ -41,57 +58,27 @@ Overlap Handling:
     predicates), use :func:`select_parameters` directly and implement your
     own logic. This keeps the library simple while allowing full flexibility.
 
-Possible Extensions:
-    - Regex pattern support in addition to substring matching
-    - Pattern exclusion (e.g., "attn" but not "attn_bias")
-    - Glob-style patterns (e.g., "layers.*.attn")
-    - User-provided priority/resolution callbacks (see note above about
-      using primitives for this instead)
-
 Example:
     Basic partitioning for Muon + AdamW training::
 
         from research_lib.training.param_utils import partition_parameters
 
-        target_modules = ["attn", "mlp", "qkv", "c_fc", "c_proj"]
+        # Suffix matching: matches layers.*.attn, layers.*.mlp, etc.
+        target_modules = ["attn", "mlp", "q_proj", "k_proj", "v_proj"]
         muon_params, adam_params = partition_parameters(
             model=model,
             target_patterns=target_modules,
         )
 
-        muon_optimizer = Muon(muon_params, lr=0.02)
-        adam_optimizer = AdamW(adam_params, lr=0.001)
+    Using regex for more control::
 
-    Three-group partitioning::
+        # Match all attention-related params (substring-like behavior)
+        target_modules = [".*attn.*", ".*mlp.*"]
+        muon_params, adam_params = partition_parameters(model, target_modules)
 
-        from research_lib.training.param_utils import partition_parameters_multi
-
-        pattern_groups = [
-            ["attn"],           # Group 0: Attention weights
-            ["mlp"],            # Group 1: MLP weights
-            [],                 # Group 2: Everything else (empty pattern = catch-all)
-        ]
-        param_groups = partition_parameters_multi(model, pattern_groups)
-
-        attn_params, mlp_params, other_params = param_groups
-
-    Using primitives for custom logic::
-
-        from research_lib.training.param_utils import select_parameters
-
-        # Select only attention params
-        attn_params = select_parameters(model, ["attn"])
-
-        # Custom overlap handling: prefer longer pattern matches
-        # (This is an example of why primitives exist - custom logic)
-        all_params = dict(model.named_parameters())
-        assigned = set()
-
-        for pattern in sorted(patterns, key=len, reverse=True):  # Longer first
-            for name, param in all_params.items():
-                if name not in assigned and pattern in name:
-                    my_groups[pattern].append(param)
-                    assigned.add(name)
+        # Match specific layer indices
+        target_modules = [r"layers\\.[0-5]\\.attn"]  # Only layers 0-5
+        selected, _ = partition_parameters(model, target_modules)
 
 See Also:
     - HuggingFace PEFT's target_modules pattern: https://huggingface.co/docs/peft
@@ -99,12 +86,83 @@ See Also:
 
 from __future__ import annotations
 
+import re
 import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Literal, Tuple
 
 import torch.nn as nn
 from torch import Tensor
+
+# =============================================================================
+# Pattern Matching
+# =============================================================================
+
+# Characters that indicate a pattern should be treated as regex
+_REGEX_METACHARACTERS = set(r"\.^$*+?{}[]|()")
+
+
+def _is_regex_pattern(pattern: str) -> bool:
+    """Check if a pattern contains regex metacharacters.
+
+    Args:
+        pattern: The pattern to check.
+
+    Returns:
+        True if the pattern contains regex metacharacters, False otherwise.
+    """
+    return any(c in pattern for c in _REGEX_METACHARACTERS)
+
+
+def _matches_pattern(name: str, pattern: str) -> bool:
+    """Check if a parameter name matches a pattern.
+
+    Follows PEFT's target_modules matching convention:
+    - Simple strings: suffix matching (checks if pattern appears as a complete
+      component in the module path, ignoring the final .weight/.bias suffix)
+    - Regex patterns: full regex match via re.fullmatch
+
+    Args:
+        name: The full parameter name (e.g., "model.layers.0.self_attn.q_proj.weight").
+        pattern: The pattern to match against.
+
+    Returns:
+        True if the name matches the pattern, False otherwise.
+
+    Example:
+        >>> _matches_pattern("layers.0.attn.weight", "attn")
+        True
+        >>> _matches_pattern("layers.0.attn_proj.weight", "attn")
+        False
+        >>> _matches_pattern("layers.0.attn_proj.weight", ".*attn.*")
+        True
+    """
+    if _is_regex_pattern(pattern):
+        # Regex pattern: use fullmatch on the full name
+        return re.fullmatch(pattern, name) is not None
+    else:
+        # Simple string: suffix matching (PEFT convention)
+        # For parameter names, we need to check the module path components
+        # e.g., "layers.0.attn.weight" should match pattern "attn"
+        #
+        # Split by "." and check if pattern matches any component exactly,
+        # OR if the name (minus common suffixes) ends with the pattern
+        parts = name.split(".")
+
+        # Check exact match with any component
+        if pattern in parts:
+            return True
+
+        # Also check if pattern matches the module name (excluding .weight/.bias/etc)
+        # This handles cases like pattern="q_proj" matching "layers.0.q_proj.weight"
+        if len(parts) >= 2:
+            module_name = parts[-2]  # Second to last is usually the module name
+            if module_name == pattern:
+                return True
+
+        # Original PEFT check: full name ends with .pattern
+        return name == pattern or name.endswith(f".{pattern}")
+
 
 # =============================================================================
 # Primitives: Core Selection Functions
@@ -121,14 +179,16 @@ def select_parameters(
     This is the core primitive for parameter selection. All other partitioning
     functions are built on top of this.
 
-    A parameter matches if ANY pattern is a substring of its name. For more
-    complex matching (regex, exclusions), use this function as a building
-    block for custom logic.
+    Pattern matching follows PEFT's convention:
+    - Simple strings (no regex chars): suffix matching
+      e.g., "attn" matches "layers.0.attn" but not "layers.0.attn_proj"
+    - Regex patterns: full match via re.fullmatch
+      e.g., ".*attn.*" matches anything containing "attn"
 
     Args:
         model: The model whose parameters to select from.
-        patterns: List of substrings to match against parameter names.
-            A parameter is selected if ANY pattern is found in its name.
+        patterns: List of patterns to match against parameter names.
+            A parameter is selected if ANY pattern matches.
             Pass an empty list to select nothing.
         require_grad: If True, only consider parameters with requires_grad=True.
             Default: True.
@@ -138,7 +198,12 @@ def select_parameters(
 
     Example:
         >>> model = GPT(...)
-        >>> attn_params = select_parameters(model, ["attn", "qkv"])
+        >>> # Suffix matching (recommended, PEFT-compatible)
+        >>> attn_params = select_parameters(model, ["attn", "q_proj", "v_proj"])
+        >>>
+        >>> # Regex for substring matching
+        >>> attn_params = select_parameters(model, [".*attn.*"])
+        >>>
         >>> print(f"Selected {len(attn_params)} attention parameters")
 
     Note:
@@ -153,7 +218,7 @@ def select_parameters(
         if require_grad and not param.requires_grad:
             continue
 
-        if any(pattern in name for pattern in patterns):
+        if any(_matches_pattern(name, pattern) for pattern in patterns):
             selected.append(param)
 
     return selected
@@ -169,9 +234,11 @@ def select_parameters_with_names(
     Same as :func:`select_parameters` but returns (name, param) tuples for
     debugging, logging, or custom processing.
 
+    Pattern matching follows PEFT's convention (see :func:`select_parameters`).
+
     Args:
         model: The model whose parameters to select from.
-        patterns: List of substrings to match against parameter names.
+        patterns: List of patterns to match against parameter names.
         require_grad: If True, only consider parameters with requires_grad=True.
 
     Returns:
@@ -190,7 +257,7 @@ def select_parameters_with_names(
         if require_grad and not param.requires_grad:
             continue
 
-        if any(pattern in name for pattern in patterns):
+        if any(_matches_pattern(name, pattern) for pattern in patterns):
             selected.append((name, param))
 
     return selected
@@ -379,7 +446,7 @@ def partition_parameters_multi(
                 # Empty pattern list = catch-all (matches everything)
                 # But only counts as a match if no other group matched
                 continue
-            if any(pattern in name for pattern in patterns):
+            if any(_matches_pattern(name, pattern) for pattern in patterns):
                 matching_groups.append(group_idx)
 
         param_to_groups[name] = matching_groups
@@ -479,7 +546,7 @@ def partition_parameters_multi_with_names(
         for group_idx, patterns in enumerate(pattern_groups):
             if not patterns:
                 continue
-            if any(pattern in name for pattern in patterns):
+            if any(_matches_pattern(name, pattern) for pattern in patterns):
                 matching_groups.append(group_idx)
 
         param_to_groups[name] = matching_groups
