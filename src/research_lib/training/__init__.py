@@ -24,6 +24,9 @@ Typical usage with Muon + AdamW::
     adam_config = default_adam_config(lr=0.001)
 
     # Create module
+    # target_modules supports PEFT-style matching:
+    # - "attn" matches "layers.0.attn" (suffix/component match)
+    # - ".*attn.*" matches any name containing "attn" (regex match)
     module = DualOptimizerModule(
         model=my_model,
         training_config=training_config,
@@ -67,9 +70,9 @@ For multi-group parameter partitioning (3+ optimizer groups)::
     from research_lib.training import partition_parameters_multi
 
     pattern_groups = [
-        ["attn"],    # Group 0: Attention weights
-        ["mlp"],     # Group 1: MLP weights
-        [],          # Group 2: Everything else (catch-all)
+        ["attn", "q_proj"],  # Group 0: Attention weights
+        ["mlp", "down_proj"],# Group 1: MLP weights
+        [],                  # Group 2: Everything else (catch-all)
     ]
     attn_params, mlp_params, other_params = partition_parameters_multi(
         model, pattern_groups

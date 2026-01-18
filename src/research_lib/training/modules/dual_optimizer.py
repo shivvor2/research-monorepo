@@ -108,7 +108,7 @@ class DualOptimizerModule(L.LightningModule):
         training_config: Global training configuration.
         matrix_optimizer_config: Config for the matrix/weight optimizer (e.g., Muon).
         vector_optimizer_config: Config for the vector/embedding optimizer (e.g., AdamW).
-        target_modules: Patterns for selecting matrix optimizer parameters.
+        target_modules: PEFT style patterns for selecting matrix optimizer parameters.
 
     Note:
         This module uses manual optimization. The training_step handles:

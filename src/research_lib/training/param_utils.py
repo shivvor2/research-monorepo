@@ -279,14 +279,14 @@ def partition_parameters(
     for attention/MLP weights, AdamW for embeddings). It is built on
     :func:`select_parameters`.
 
-    Parameters whose names contain any of the target_patterns are placed in
+    Parameters whose names match any of the target_patterns are placed in
     the first group (target_params). All other parameters go to the second
     group (other_params).
 
     Args:
         model: The model whose parameters to partition.
-        target_patterns: List of substrings to match against parameter names.
-            A parameter matches if ANY pattern is found in its name.
+        target_patterns: List of patterns (suffixes or regex) to match against parameter names.
+            A parameter matches if it satisfies the PEFT matching convention for ANY pattern.
             Examples: ["attn", "mlp"], ["q_proj", "v_proj", "c_fc"].
         require_grad: If True, only include parameters with requires_grad=True.
             Default: True.
@@ -338,7 +338,7 @@ def partition_parameters_with_names(
 
     Args:
         model: The model whose parameters to partition.
-        target_patterns: List of substrings to match against parameter names.
+        target_patterns: List of patterns (suffixes or regex) to match against parameter names.
         require_grad: If True, only include parameters with requires_grad=True.
 
     Returns:
