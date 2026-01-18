@@ -15,6 +15,7 @@ dependencies = [
     "rotary-embedding-torch",
 
     # Hugging Face Ecosystem
+    "huggingface_hub",
     "transformers",
     "diffusers",
     "timm",
@@ -25,9 +26,13 @@ dependencies = [
     "evaluate",
     "trl",
 
-    # Optimization
+    # Pytorch lightning (trainer) and ecosystem
+    "lightning",
+
+    # Model Optimization
     "bitsandbytes",
     "einops",
+    "triton",
     # "flash-attn", # Commented out: Install manually to ensure CUDA compatibility
 
     # Infrastructure & Config
