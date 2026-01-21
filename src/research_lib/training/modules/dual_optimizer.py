@@ -46,7 +46,7 @@ Example:
             training_config=TrainingConfig(total_steps=10000),
             matrix_optimizer_config=default_muon_config(),
             vector_optimizer_config=default_adam_config(),
-            target_modules=["attn", "mlp", "qkv", "c_fc", "c_proj"],
+            matrix_target_modules=["attn", "mlp", "qkv", "c_fc", "c_proj"],
         )
 
         # Configure logging and checkpointing at Trainer level
@@ -60,8 +60,27 @@ Example:
         )
         trainer.fit(module, train_dataloader)
 
+    Custom loss function via subclassing::
+
+        class DistillationModule(DualOptimizerModule):
+            def __init__(self, teacher_model, alpha=0.5, **kwargs):
+                super().__init__(**kwargs)
+                self.teacher = teacher_model
+                self.alpha = alpha
+
+            def compute_loss(self, model_output, batch):
+                ce_loss = super().compute_loss(model_output, batch)
+                with torch.no_grad():
+                    teacher_logits = self.teacher(batch["input_ids"])
+                kl_loss = F.kl_div(
+                    F.log_softmax(model_output, dim=-1),
+                    F.softmax(teacher_logits, dim=-1),
+                    reduction="batchmean",
+                )
+                return self.alpha * ce_loss + (1 - self.alpha) * kl_loss
+
 Possible Extensions:
-    - Support for different loss functions via constructor argument
+    - Dynamic gradient accumulation scheduling (batch size warmup)
     - Hooks for custom training logic (e.g., EMA updates)
     - Integration with learning rate finders
 
@@ -71,7 +90,7 @@ See Also:
     - :mod:`research_lib.training.scheduling` for param_group scheduling
 """
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import lightning as L
 import torch
@@ -100,8 +119,22 @@ class DualOptimizerModule(L.LightningModule):
         - Gradient accumulation with proper scaling
         - Gradient clipping
 
-    The module is model-agnostic and can be used with any nn.Module that
-    accepts input_ids and returns logits (e.g., GPT, BERT, encoder-decoder).
+    Partitioning Logic:
+        You can specify which parameters belong to which optimizer using EITHER
+        `matrix_target_modules` OR `vector_target_modules` (mutually exclusive).
+
+        - If `matrix_target_modules` is set: Matched params → Matrix Optimizer,
+          remaining params → Vector Optimizer.
+        - If `vector_target_modules` is set: Matched params → Vector Optimizer,
+          remaining params → Matrix Optimizer.
+        - If neither is set: All params → Vector Optimizer (single optimizer mode).
+
+    Loss Computation:
+        By Default, the module is model-agnostic and can be used with any nn.Module
+        that accepts input_ids and returns logits (e.g., GPT, BERT, encoder-decoder).
+
+        Override `compute_loss()` for custom loss functions. The default
+        implementation assumes causal language modeling (next-token prediction).
 
     Attributes:
         model: The neural network model to train.
@@ -121,6 +154,13 @@ class DualOptimizerModule(L.LightningModule):
     Note:
         Logging and checkpointing are configured at the Trainer level, not here.
         This module uses `self.log()` which routes to whatever logger is configured.
+
+    Note:
+        Lightning's ``global_step`` counter increments on each ``optimizer.step()``
+        call. With multiple optimizers, this would cause ``max_steps`` to be reached
+        prematurely (e.g., ``max_steps=100`` would stop after 50 logical training
+        steps with 2 optimizers). This module avoids that by stepping secondary
+        optimizers directly, so ``max_steps`` corresponds to actual training steps.
     """
 
     def __init__(
@@ -129,9 +169,10 @@ class DualOptimizerModule(L.LightningModule):
         training_config: TrainingConfig,
         matrix_optimizer_config: OptimizerConfig,
         vector_optimizer_config: OptimizerConfig,
-        target_modules: List[str],
+        matrix_target_modules: Optional[List[str]] = None,
+        vector_target_modules: Optional[List[str]] = None,
     ):
-        """Initialize the Lightning module.
+        """Lightning module for training with two optimizers.
 
         Args:
             model: The model to train. Can be any nn.Module with a forward
@@ -141,18 +182,31 @@ class DualOptimizerModule(L.LightningModule):
                 parameters matching target_modules (typically Muon).
             vector_optimizer_config: Configuration for the optimizer handling
                 all other parameters (typically AdamW).
-            target_modules: List of substrings to match against parameter names.
-                Parameters containing any of these patterns use matrix_optimizer.
-                All other parameters use vector_optimizer.
-                Pass empty list [] for single-optimizer (vector only) training.
+            matrix_target_modules: Patterns for parameters that MUST go to the
+                matrix optimizer. Remainder goes to vector optimizer.
+            vector_target_modules: Patterns for parameters that MUST go to the
+                vector optimizer. Remainder goes to matrix optimizer.
+
+        Raises:
+            ValueError: If both matrix_target_modules and vector_target_modules provided
 
         Example:
+            >>> # Target attention/MLP for matrix optimizer (e.g., Muon)
             >>> module = DualOptimizerModule(
             ...     model=MyModel(),
             ...     training_config=TrainingConfig(total_steps=10000),
             ...     matrix_optimizer_config=default_muon_config(),
             ...     vector_optimizer_config=default_adam_config(),
-            ...     target_modules=["attn", "mlp"],
+            ...     matrix_target_modules=["attn", "mlp"],
+            ... )
+
+            >>> # Alternatively, target embeddings for vector optimizer
+            >>> module = DualOptimizerModule(
+            ...     model=MyModel(),
+            ...     training_config=TrainingConfig(total_steps=10000),
+            ...     matrix_optimizer_config=default_muon_config(),
+            ...     vector_optimizer_config=default_adam_config(),
+            ...     vector_target_modules=["embed", "norm"],
             ... )
         """
         super().__init__()
@@ -164,13 +218,29 @@ class DualOptimizerModule(L.LightningModule):
         self.training_config = training_config
         self.matrix_optimizer_config = matrix_optimizer_config
         self.vector_optimizer_config = vector_optimizer_config
-        self.target_modules = target_modules
 
         # Store model
         self.model = model
 
         # Track optimization step count (different from global_step with grad accum)
         self._optimizer_step_count = 0
+
+        # Handle param partitioning
+        if matrix_target_modules is not None and vector_target_modules is not None:
+            raise ValueError(
+                "Cannot specify both `matrix_target_modules` and `vector_target_modules`. "
+                "Please select one targeting strategy."
+            )
+
+        if vector_target_modules is not None:
+            self.target_modules = vector_target_modules
+            self._target_strategy = "vector"
+        else:
+            # Default to matrix strategy (empty list if None provided)
+            self.target_modules = (
+                matrix_target_modules if matrix_target_modules is not None else []
+            )
+            self._target_strategy = "matrix"
 
         # Save hyperparameters for logging (exclude model and configs with classes)
         self.save_hyperparameters(
@@ -189,6 +259,57 @@ class DualOptimizerModule(L.LightningModule):
         """
         return self.model(input_ids, **kwargs)
 
+    def compute_loss(
+        self,
+        model_output: torch.Tensor,
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """Compute the training loss.
+
+        Override this method for custom loss functions (e.g., distillation,
+        contrastive learning, auxiliary losses, non-LM tasks).
+
+        The default implementation assumes causal language modeling:
+        cross-entropy loss on next-token prediction with shifted logits/labels.
+
+        Args:
+            model_output: Output from self.forward(). For the default implementation,
+                this should be logits of shape (batch_size, seq_len, vocab_size).
+            batch: The full batch dictionary. Default implementation uses
+                batch["labels"] if present, otherwise batch["input_ids"] as labels.
+
+        Returns:
+            Scalar loss tensor.
+
+        Example:
+            Subclass for distillation::
+
+                class DistillationModule(DualOptimizerModule):
+                    def __init__(self, teacher, alpha=0.5, **kwargs):
+                        super().__init__(**kwargs)
+                        self.teacher = teacher
+                        self.alpha = alpha
+
+                    def compute_loss(self, model_output, batch):
+                        ce_loss = super().compute_loss(model_output, batch)
+                        with torch.no_grad():
+                            teacher_out = self.teacher(batch["input_ids"])
+                        kl_loss = compute_kl_divergence(model_output, teacher_out)
+                        return self.alpha * ce_loss + (1 - self.alpha) * kl_loss
+        """
+        logits = model_output
+        labels = batch.get("labels", batch["input_ids"])
+
+        # Causal LM: predict next token (shift by 1)
+        shift_logits = logits[..., :-1, :].contiguous()
+        shift_labels = labels[..., 1:].contiguous()
+
+        return F.cross_entropy(
+            shift_logits.view(-1, shift_logits.size(-1)),
+            shift_labels.view(-1),
+            ignore_index=-100,
+        )
+
     def configure_optimizers(self) -> Tuple[List[Optimizer], List[LRScheduler]]:
         """Configure optimizers and LR schedulers.
 
@@ -196,9 +317,19 @@ class DualOptimizerModule(L.LightningModule):
             Tuple of (optimizers_list, schedulers_list).
         """
         # Partition parameters
-        matrix_params, vector_params = partition_parameters(
+        matched_params, other_params = partition_parameters(
             self.model, self.target_modules
         )
+
+        # Route parameters based on strategy
+        if self._target_strategy == "vector":
+            # Matches -> Vector, Others -> Matrix
+            vector_params = matched_params
+            matrix_params = other_params
+        else:
+            # Matches -> Matrix, Others -> Vector (Default)
+            matrix_params = matched_params
+            vector_params = other_params
 
         # Log partition summary
         if self.trainer is not None:
@@ -223,7 +354,9 @@ class DualOptimizerModule(L.LightningModule):
             optimizers.append(matrix_opt)
             schedulers.append(matrix_sch)
         else:
-            # No matrix params - still need placeholders for indexing
+            # Placeholder to maintain index alignment if needed,
+            # but usually we just append what exists.
+            # Here we append None to maintain logic in _update_custom_schedules
             optimizers.append(None)
             schedulers.append(None)
 
@@ -253,7 +386,8 @@ class DualOptimizerModule(L.LightningModule):
         Handles gradient accumulation, optimizer stepping, and scheduling.
 
         Args:
-            batch: Dictionary containing 'input_ids' and optionally 'labels'.
+            batch: Dictionary containing at minimum 'input_ids'. May also contain
+                'labels' and other keys accessible in compute_loss().
             batch_idx: Index of the current batch within the epoch.
 
         Returns:
@@ -270,25 +404,19 @@ class DualOptimizerModule(L.LightningModule):
             schs = [schs]
 
         # Determine if we should step this batch
-        grad_accum = self.training_config.grad_accum_steps
+        # Force strict integer casting
+        grad_accum = int(self.training_config.grad_accum_steps)
+        if grad_accum < 1:
+            grad_accum = 1
+
         should_step = (batch_idx + 1) % grad_accum == 0
 
-        # Extract inputs
-        input_ids = batch["input_ids"]
-        labels = batch.get("labels", input_ids)
-
         # Forward pass
-        logits = self.forward(input_ids)
+        input_ids = batch["input_ids"]
+        model_output = self.forward(input_ids)
 
-        # Compute loss (causal LM: predict next token)
-        shift_logits = logits[..., :-1, :].contiguous()
-        shift_labels = labels[..., 1:].contiguous()
-
-        loss = F.cross_entropy(
-            shift_logits.view(-1, shift_logits.size(-1)),
-            shift_labels.view(-1),
-            ignore_index=-100,
-        )
+        # Compute loss via (overridable) method
+        loss = self.compute_loss(model_output, batch)
 
         # Scale loss for gradient accumulation
         scaled_loss = loss / grad_accum
@@ -307,9 +435,13 @@ class DualOptimizerModule(L.LightningModule):
                         gradient_clip_algorithm="norm",
                     )
 
-            # Step all optimizers
-            for opt in opts:
-                opt.step()
+            # Step all optimizers - only first one should increment global_step
+            for i, opt in enumerate(opts):
+                if i == 0:
+                    opt.step()  # This increments global_step
+                else:
+                    # Access underlying optimizer directly to avoid double-counting
+                    opt.optimizer.step()
                 opt.zero_grad()
 
             # Step all schedulers
@@ -349,31 +481,42 @@ class DualOptimizerModule(L.LightningModule):
         step = self._optimizer_step_count
         total_steps = self.training_config.total_steps
 
-        # Determine which config goes with which optimizer
-        matrix_params, vector_params = partition_parameters(
+        # Partition parameters again to determine which optimizer is which
+        matched_params, other_params = partition_parameters(
             self.model, self.target_modules
         )
 
+        # IMPORTANT: Respect strategy when mapping variables
+        if self._target_strategy == "vector":
+            matrix_params = other_params
+            vector_params = matched_params
+        else:
+            matrix_params = matched_params
+            vector_params = other_params
+
+        # Map logic relies on configure_optimizers appending in order [Matrix, Vector]
         opt_idx = 0
 
-        # Matrix optimizer schedules
-        if matrix_params and opt_idx < len(optimizers):
-            update_param_group_schedules(
-                optimizers[opt_idx],
-                self.matrix_optimizer_config.scheduler_config,
-                step,
-                total_steps,
-            )
-            opt_idx += 1
+        # Check Matrix optimizer existence (if matrix params exist)
+        if matrix_params:
+            if opt_idx < len(optimizers):
+                update_param_group_schedules(
+                    optimizers[opt_idx],
+                    self.matrix_optimizer_config.scheduler_config,
+                    step,
+                    total_steps,
+                )
+                opt_idx += 1
 
-        # Vector optimizer schedules
-        if vector_params and opt_idx < len(optimizers):
-            update_param_group_schedules(
-                optimizers[opt_idx],
-                self.vector_optimizer_config.scheduler_config,
-                step,
-                total_steps,
-            )
+        # Check Vector optimizer existence (if vector params exist)
+        if vector_params:
+            if opt_idx < len(optimizers):
+                update_param_group_schedules(
+                    optimizers[opt_idx],
+                    self.vector_optimizer_config.scheduler_config,
+                    step,
+                    total_steps,
+                )
 
     def validation_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -391,16 +534,8 @@ class DualOptimizerModule(L.LightningModule):
         labels = batch.get("labels", input_ids)
 
         with torch.no_grad():
-            logits = self.forward(input_ids)
-
-            shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
-
-            loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1),
-                ignore_index=-100,
-            )
+            model_output = self.forward(input_ids)
+            loss = self.compute_loss(model_output, batch)
 
         self.log(
             "val/loss",
@@ -416,9 +551,16 @@ class DualOptimizerModule(L.LightningModule):
     def on_train_start(self) -> None:
         """Log model information at the start of training."""
         # Log parameter counts
-        matrix_params, vector_params = partition_parameters(
+        matched_params, other_params = partition_parameters(
             self.model, self.target_modules
         )
+
+        if self._target_strategy == "vector":
+            matrix_params = other_params
+            vector_params = matched_params
+        else:
+            matrix_params = matched_params
+            vector_params = other_params
 
         total_params = sum(p.numel() for p in self.model.parameters())
         matrix_count = sum(p.numel() for p in matrix_params)
