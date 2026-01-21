@@ -4,6 +4,11 @@ from warnings import warn
 
 from dotenv import load_dotenv
 
+ALL_SERVICES = [
+    "WANDB_API_KEY",
+    "HF_TOKEN",
+]
+
 
 def _load_secrets() -> None:
     """
@@ -29,7 +34,6 @@ def _load_secrets() -> None:
     if env_path.exists():
         load_dotenv(dotenv_path=env_path, override=True)
     else:
-        # In a strict environment, you should log a warning here if the .env is critical.
         warn(f"Could not find .env file at {env_path}")
         pass
 
@@ -43,10 +47,10 @@ def check_auth():
     Call this inside your main() if you want to fail fast.
     """
     missing = []
-    if not os.getenv("WANDB_API_KEY"):
-        missing.append("WANDB_API_KEY")
-    if not os.getenv("HF_TOKEN"):
-        missing.append("HF_TOKEN")
+
+    for service in ALL_SERVICES:
+        if not os.getenv(service):
+            missing.append(service)
 
     if missing:
         raise PermissionError(
