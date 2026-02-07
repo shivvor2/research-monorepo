@@ -7,17 +7,17 @@ independent scheduling for each.
 
 Key Features:
     - Manual optimization for multiple optimizer support
-    - Independent LR and param_group scheduling per optimizer
+    - Independent param_group scheduling per optimizer via ParamSchedule
     - Gradient accumulation with proper loss scaling
     - Configurable gradient clipping
-    - Automatic param_group value updates (momentum, etc.)
+    - Automatic param_group value updates (lr, momentum, etc.)
 
 Design Decisions:
     1. Uses manual optimization (self.automatic_optimization = False) because
        Lightning's automatic optimization doesn't support multiple optimizers
        with different stepping patterns.
 
-    2. Optimizer and scheduler configs are passed via dependency injection
+    2. Optimizer and schedule configs are passed via dependency injection
        (OptimizerConfig dataclasses) for flexibility and serializability.
 
     3. Parameter partitioning uses name-based patterns (target_modules) rather
@@ -31,6 +31,9 @@ Design Decisions:
     5. Checkpointing is handled by Lightning callbacks, not by this module.
        Users configure checkpointing at the Trainer level.
 
+    6. LR scheduling is handled via ParamSchedule, not LambdaLR. This means
+       `configure_optimizers` returns just a list of optimizers
+
 Example:
     Basic usage::
 
@@ -38,14 +41,14 @@ Example:
             DualOptimizerModule,
             TrainingConfig,
             default_muon_config,
-            default_adam_config,
+            default_adamw_config,
         )
 
         module = DualOptimizerModule(
             model=my_model,
             training_config=TrainingConfig(total_steps=10000),
             matrix_optimizer_config=default_muon_config(),
-            vector_optimizer_config=default_adam_config(),
+            vector_optimizer_config=default_adamw_config(),
             matrix_target_modules=["attn", "mlp", "qkv", "c_fc", "c_proj"],
         )
 
@@ -97,15 +100,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Optimizer
-from torch.optim.lr_scheduler import LRScheduler
 
-from ..configs import OptimizerConfig, TrainingConfig
+from ..configs import OptimizerConfig, TrainingConfig, update_optimizer_schedules
 from ..param_utils import partition_parameters, summarize_partition
-from ..scheduling import (
-    get_current_lr,
-    get_param_group_value,
-    update_param_group_schedules,
-)
+from ..scheduling.utils import get_current_lr, get_param_value
 
 
 class DualOptimizerModule(L.LightningModule):
@@ -114,8 +112,7 @@ class DualOptimizerModule(L.LightningModule):
     This module handles:
         - Parameter partitioning based on target_modules
         - Dual optimizer setup (matrix optimizer + vector optimizer)
-        - Independent LR scheduling per optimizer
-        - Custom param_group scheduling (momentum, etc.)
+        - Independent scheduling per optimizer via ParamSchedule
         - Gradient accumulation with proper scaling
         - Gradient clipping
 
@@ -149,7 +146,7 @@ class DualOptimizerModule(L.LightningModule):
         2. Scaled backward pass (for gradient accumulation)
         3. Gradient clipping (if configured)
         4. Optimizer stepping (when accumulation is complete)
-        5. Scheduler stepping and param_group updates
+        5. Schedule updates via update_optimizer_schedules
 
     Note:
         Logging and checkpointing are configured at the Trainer level, not here.
@@ -310,11 +307,12 @@ class DualOptimizerModule(L.LightningModule):
             ignore_index=-100,
         )
 
-    def configure_optimizers(self) -> Tuple[List[Optimizer], List[LRScheduler]]:
-        """Configure optimizers and LR schedulers.
+    def configure_optimizers(self) -> List[Optimizer]:
+        """Configure optimizers.
 
         Returns:
-            Tuple of (optimizers_list, schedulers_list).
+            Tuple of (optimizers_list, empty_list).
+            The scheduler list is empty because LR is handled via ParamSchedule.
         """
         # Partition parameters
         matched_params, other_params = partition_parameters(
@@ -343,40 +341,26 @@ class DualOptimizerModule(L.LightningModule):
 
         # Build optimizers
         optimizers = []
-        schedulers = []
 
         # Matrix optimizer (e.g., Muon) - skip if no target params
         if matrix_params:
             matrix_opt = self.matrix_optimizer_config.build_optimizer(matrix_params)
-            matrix_sch = self.matrix_optimizer_config.build_scheduler(
-                matrix_opt, self.training_config
-            )
             optimizers.append(matrix_opt)
-            schedulers.append(matrix_sch)
         else:
-            # Placeholder to maintain index alignment if needed,
-            # but usually we just append what exists.
-            # Here we append None to maintain logic in _update_custom_schedules
             optimizers.append(None)
-            schedulers.append(None)
 
         # Vector optimizer (e.g., AdamW) - skip if no other params
         if vector_params:
             vector_opt = self.vector_optimizer_config.build_optimizer(vector_params)
-            vector_sch = self.vector_optimizer_config.build_scheduler(
-                vector_opt, self.training_config
-            )
             optimizers.append(vector_opt)
-            schedulers.append(vector_sch)
         else:
             optimizers.append(None)
-            schedulers.append(None)
 
         # Filter out None values
         optimizers = [o for o in optimizers if o is not None]
-        schedulers = [s for s in schedulers if s is not None]
 
-        return optimizers, schedulers
+        # Return empty scheduler list - LR handled via ParamSchedule
+        return optimizers
 
     def training_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
@@ -393,15 +377,12 @@ class DualOptimizerModule(L.LightningModule):
         Returns:
             The unscaled loss tensor for logging.
         """
-        # Get optimizers and schedulers
+        # Get optimizers
         opts = self.optimizers()
-        schs = self.lr_schedulers()
 
         # Handle single optimizer case
         if not isinstance(opts, list):
             opts = [opts]
-        if not isinstance(schs, list):
-            schs = [schs]
 
         # Determine if we should step this batch
         # Force strict integer casting
@@ -444,12 +425,8 @@ class DualOptimizerModule(L.LightningModule):
                     opt.optimizer.step()
                 opt.zero_grad()
 
-            # Step all schedulers
-            for sch in schs:
-                sch.step()
-
-            # Update custom param_group schedules (momentum, etc.)
-            self._update_custom_schedules(opts)
+            # Update schedules via update_optimizer_schedules
+            self._update_schedules(opts)
 
             # Increment step counter
             self._optimizer_step_count += 1
@@ -460,20 +437,20 @@ class DualOptimizerModule(L.LightningModule):
             "train/optimizer_step", float(self._optimizer_step_count), on_step=True
         )
 
-        # Log LRs
+        # Log LRs and momentum
         for i, opt in enumerate(opts):
             lr = get_current_lr(opt)
             self.log(f"train/lr_{i}", lr, on_step=True)
 
             # Log momentum if present
-            momentum = get_param_group_value(opt, "momentum")
+            momentum = get_param_value(opt, "momentum")
             if momentum is not None:
                 self.log(f"train/momentum_{i}", momentum, on_step=True)
 
         return loss
 
-    def _update_custom_schedules(self, optimizers: List[Optimizer]) -> None:
-        """Update custom param_group schedules for all optimizers.
+    def _update_schedules(self, optimizers: List[Optimizer]) -> None:
+        """Update schedules for all optimizers.
 
         Args:
             optimizers: List of optimizers to update.
@@ -500,9 +477,9 @@ class DualOptimizerModule(L.LightningModule):
         # Check Matrix optimizer existence (if matrix params exist)
         if matrix_params:
             if opt_idx < len(optimizers):
-                update_param_group_schedules(
+                update_optimizer_schedules(
                     optimizers[opt_idx],
-                    self.matrix_optimizer_config.scheduler_config,
+                    self.matrix_optimizer_config,
                     step,
                     total_steps,
                 )
@@ -511,9 +488,9 @@ class DualOptimizerModule(L.LightningModule):
         # Check Vector optimizer existence (if vector params exist)
         if vector_params:
             if opt_idx < len(optimizers):
-                update_param_group_schedules(
+                update_optimizer_schedules(
                     optimizers[opt_idx],
-                    self.vector_optimizer_config.scheduler_config,
+                    self.vector_optimizer_config,
                     step,
                     total_steps,
                 )
@@ -531,7 +508,6 @@ class DualOptimizerModule(L.LightningModule):
             The validation loss tensor.
         """
         input_ids = batch["input_ids"]
-        labels = batch.get("labels", input_ids)
 
         with torch.no_grad():
             model_output = self.forward(input_ids)

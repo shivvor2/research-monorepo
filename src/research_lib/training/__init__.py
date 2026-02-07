@@ -13,7 +13,6 @@ Typical usage with Muon + AdamW::
         DualOptimizerModule,
         TrainingConfig,
         OptimizerConfig,
-        SchedulerConfig,
         default_muon_config,
         default_adam_config,
     )
@@ -84,62 +83,12 @@ Note on Logging and Checkpointing:
     preferred systems (WandB, TensorBoard, HuggingFace, etc.) at the Trainer level.
 """
 
-from .configs import (
-    CustomScheduleConfig,
-    MomentumScheduleConfig,
-    OptimizerConfig,
-    SchedulerConfig,
-    TrainingConfig,
-    default_adam_config,
-    default_muon_config,
-)
-from .modules import DualOptimizerModule
-from .param_utils import (
-    ParameterCounts,
-    count_parameters,
-    count_parameters_by_status,
-    partition_parameters,
-    partition_parameters_multi,
-    partition_parameters_multi_with_names,
-    partition_parameters_with_names,
-    select_parameters,
-    select_parameters_with_names,
-    summarize_partition,
-)
-from .scheduling import (
-    get_current_lr,
-    get_param_group_value,
-    update_param_group_schedules,
-    update_single_param_schedule,
-)
+from . import configs, modules, param_utils, scheduling
 
 __all__ = [
     # Configs
-    "TrainingConfig",
-    "SchedulerConfig",
-    "OptimizerConfig",
-    "MomentumScheduleConfig",
-    "CustomScheduleConfig",
-    "default_muon_config",
-    "default_adam_config",
-    # Lightning Modules
-    "DualOptimizerModule",
-    # Parameter utilities - Primitives
-    "select_parameters",
-    "select_parameters_with_names",
-    # Parameter utilities - Convenience functions
-    "partition_parameters",
-    "partition_parameters_with_names",
-    "partition_parameters_multi",
-    "partition_parameters_multi_with_names",
-    # Parameter utilities - Counting and summary
-    "ParameterCounts",
-    "count_parameters",
-    "count_parameters_by_status",
-    "summarize_partition",
-    # Scheduling utilities
-    "update_param_group_schedules",
-    "update_single_param_schedule",
-    "get_current_lr",
-    "get_param_group_value",
+    "configs",
+    "modules",
+    "param_utils",
+    "scheduling",
 ]

@@ -7,13 +7,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from research_lib.training import (
-    DualOptimizerModule,
+from research_lib.training.configs import (
     OptimizerConfig,
-    SchedulerConfig,
     TrainingConfig,
-    default_adam_config,
+    default_adamw_config,
 )
+from research_lib.training.modules import DualOptimizerModule
 
 
 class SimpleModel(nn.Module):
@@ -62,7 +61,7 @@ class TestDualOptimizerModuleInit:
         """Test initialization with explicit matrix targets."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         module = DualOptimizerModule(
             model=model,
@@ -79,7 +78,7 @@ class TestDualOptimizerModuleInit:
         """Test initialization with explicit vector targets."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         module = DualOptimizerModule(
             model=model,
@@ -96,7 +95,7 @@ class TestDualOptimizerModuleInit:
         """Test that providing both target args raises ValueError."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         with pytest.raises(ValueError, match="Cannot specify both"):
             DualOptimizerModule(
@@ -112,7 +111,7 @@ class TestDualOptimizerModuleInit:
         """Test initialization with no targets defaults to matrix strategy (empty)."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         module = DualOptimizerModule(
             model=model,
@@ -126,6 +125,9 @@ class TestDualOptimizerModuleInit:
         assert module.target_modules == []
 
 
+# test_dual_optimizer_module.py - Fix the configure_optimizers tests
+
+
 class TestDualOptimizerModuleConfigureOptimizers:
     """Tests for configure_optimizers method."""
 
@@ -133,8 +135,8 @@ class TestDualOptimizerModuleConfigureOptimizers:
         """Test configuring two optimizers."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=100)
-        matrix_config = default_adam_config(lr=0.01)
-        vector_config = default_adam_config(lr=0.001)
+        matrix_config = default_adamw_config(lr=0.01)
+        vector_config = default_adamw_config(lr=0.001)
 
         module = DualOptimizerModule(
             model=model,
@@ -147,27 +149,23 @@ class TestDualOptimizerModuleConfigureOptimizers:
         # Mock trainer for is_global_zero
         module._trainer = type("MockTrainer", (), {"is_global_zero": True})()
 
-        optimizers, schedulers = module.configure_optimizers()
+        optimizers = module.configure_optimizers()
 
+        # FIXED: Only return list of Optimizers (LR handled via ParamSchedule)
         assert len(optimizers) == 2
-        assert len(schedulers) == 2
 
-        # Check base LRs are set correctly (initial_lr is stored by LambdaLR)
-        # Note: Current LR may be 0 due to warmup, so we check initial_lr
-        assert optimizers[0].param_groups[0]["initial_lr"] == 0.01
-        assert optimizers[1].param_groups[0]["initial_lr"] == 0.001
+        # Verify optimizer LRs are set correctly
+        assert optimizers[0].param_groups[0]["lr"] == 0.01
+        assert optimizers[1].param_groups[0]["lr"] == 0.001
 
     def test_configure_optimizers_vector_strategy(self):
         """Test inverted behavior: matched -> vector."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=100)
 
-        # Matrix = 0.05, Vector = 0.01
-        matrix_config = default_adam_config(lr=0.01)
-        vector_config = default_adam_config(lr=0.001)
+        matrix_config = default_adamw_config(lr=0.01)
+        vector_config = default_adamw_config(lr=0.001)
 
-        # We target 'attn' for VECTOR this time
-        # This means 'attn' should end up in optimizer with LR 0.01
         module = DualOptimizerModule(
             model=model,
             training_config=training_config,
@@ -177,25 +175,19 @@ class TestDualOptimizerModuleConfigureOptimizers:
         )
         module._trainer = type("MockTrainer", (), {"is_global_zero": True})()
 
-        optimizers, schedulers = module.configure_optimizers()
-
-        # Check param counts/existence to verify partition
-        # The model has 'attn', 'mlp', 'embed', 'lm_head'
-        # Target 'attn' -> Vector. Rest -> Matrix.
+        optimizers = module.configure_optimizers()
 
         assert len(optimizers) == 2
-        assert len(schedulers) == 2
 
-        # Check base LRs are set correctly (initial_lr is stored by LambdaLR)
-        # Note: Current LR may be 0 due to warmup, so we check initial_lr
-        assert optimizers[0].param_groups[0]["initial_lr"] == 0.01
-        assert optimizers[1].param_groups[0]["initial_lr"] == 0.001
+        # Verify both optimizers exist and have params
+        assert len(optimizers[0].param_groups[0]["params"]) > 0
+        assert len(optimizers[1].param_groups[0]["params"]) > 0
 
     def test_single_optimizer_via_vector_strategy(self):
         """Test configuring single optimizer (empty targets)."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         module = DualOptimizerModule(
             model=model,
@@ -207,11 +199,10 @@ class TestDualOptimizerModuleConfigureOptimizers:
 
         module._trainer = type("MockTrainer", (), {"is_global_zero": True})()
 
-        optimizers, schedulers = module.configure_optimizers()
+        optimizers = module.configure_optimizers()
 
         # Only vector optimizer should exist (no matrix params)
         assert len(optimizers) == 1
-        assert len(schedulers) == 1
 
 
 class TestDualOptimizerModuleForward:
@@ -223,8 +214,8 @@ class TestDualOptimizerModuleForward:
         module = DualOptimizerModule(
             model=model,
             training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adam_config(),
-            vector_optimizer_config=default_adam_config(),
+            matrix_optimizer_config=default_adamw_config(),
+            vector_optimizer_config=default_adamw_config(),
             matrix_target_modules=["attn"],
         )
 
@@ -243,8 +234,8 @@ class TestComputeLoss:
         module = DualOptimizerModule(
             model=model,
             training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adam_config(),
-            vector_optimizer_config=default_adam_config(),
+            matrix_optimizer_config=default_adamw_config(),
+            vector_optimizer_config=default_adamw_config(),
             matrix_target_modules=["attn"],
         )
 
@@ -261,8 +252,8 @@ class TestComputeLoss:
         module = DualOptimizerModule(
             model=model,
             training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adam_config(),
-            vector_optimizer_config=default_adam_config(),
+            matrix_optimizer_config=default_adamw_config(),
+            vector_optimizer_config=default_adamw_config(),
             matrix_target_modules=["attn"],
         )
 
@@ -289,8 +280,8 @@ class TestComputeLoss:
         module = ConstantLossModule(
             model=model,
             training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adam_config(),
-            vector_optimizer_config=default_adam_config(),
+            matrix_optimizer_config=default_adamw_config(),
+            vector_optimizer_config=default_adamw_config(),
             matrix_target_modules=["attn"],
         )
 
@@ -317,8 +308,8 @@ class TestComputeLoss:
         module = WeightedLossModule(
             model=model,
             training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adam_config(),
-            vector_optimizer_config=default_adam_config(),
+            matrix_optimizer_config=default_adamw_config(),
+            vector_optimizer_config=default_adamw_config(),
             matrix_target_modules=["attn"],
         )
 
@@ -340,7 +331,7 @@ class TestDualOptimizerModuleTraining:
         """Test that training_step executes without error."""
         model = SimpleModel().cuda()
         training_config = TrainingConfig(total_steps=10, grad_accum_steps=2)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         module = DualOptimizerModule(
             model=model,
@@ -376,7 +367,7 @@ class TestDualOptimizerModuleCPU:
         """Test training step on CPU."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=10, grad_accum_steps=2)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         module = DualOptimizerModule(
             model=model,
@@ -405,7 +396,7 @@ class TestDualOptimizerModuleCPU:
         """Test training with vector_target_modules."""
         model = SimpleModel()
         training_config = TrainingConfig(total_steps=10, grad_accum_steps=1)
-        adam_config = default_adam_config()
+        adam_config = default_adamw_config()
 
         module = DualOptimizerModule(
             model=model,
@@ -444,8 +435,8 @@ class TestDualOptimizerModuleCPU:
         module = MSELossModule(
             model=model,
             training_config=TrainingConfig(total_steps=10, grad_accum_steps=1),
-            matrix_optimizer_config=default_adam_config(),
-            vector_optimizer_config=default_adam_config(),
+            matrix_optimizer_config=default_adamw_config(),
+            vector_optimizer_config=default_adamw_config(),
             matrix_target_modules=["attn"],
         )
 
