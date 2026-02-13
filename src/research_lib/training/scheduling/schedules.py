@@ -49,7 +49,7 @@ import logging
 import math
 import pickle
 from dataclasses import dataclass, field
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ class ParamSchedule:
 
     The schedule function signature is::
 
-        f(step: int, total_steps: int) -> float
+        f(step: int, total_steps: int) -> Any
 
     Where:
         - step: Current optimizer step (0-indexed)
@@ -105,19 +105,23 @@ class ParamSchedule:
             )
 
     Note:
-        For tuple parameters like ``betas``, the schedule_fn should return the
-        complete tuple. See Future Extensions in the design doc for helper utilities.
+        ParamSchedule is STATELESS. The same (step, total_steps) inputs must
+        always produce the same output. Do not use:
+        - Lambdas or closures (not picklable)
+        - Stateful callables (violates determinism)
+        - External dependencies like time.time() (violates determinism)
 
     Warning:
-        The schedule_fn must be picklable for checkpointing. Use module-level
-        functions, functools.partial, or callable classes. Lambdas and closures
-        are NOT picklable and will raise ValueError at construction.
+        The schedule_fn must be picklable for checkpointing and distributed
+        training. Use module-level functions, functools.partial, or callable
+        classes. Lambdas and closures are NOT picklable and will raise
+        ValueError at construction.
     """
 
     param_name: str
-    schedule_fn: Callable[[int, int], float]
+    schedule_fn: Callable[[int, int], Any]
 
-    def __call__(self, step: int, total_steps: int) -> float:
+    def __call__(self, step: int, total_steps: int) -> Any:
         """Compute the scheduled value for a given step.
 
         Args:
