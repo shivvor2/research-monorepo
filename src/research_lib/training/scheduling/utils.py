@@ -1,25 +1,25 @@
 """
 Low-level utilities for applying schedules and querying optimizer state.
 
-This module provides functions at the Schedule Layer:
+This module provides functions for direct optimizer manipulation:
     - :func:`apply_schedule_to_param_group` for single schedule application
     - :func:`get_param_value` for reading optimizer parameters
+    - :func:`get_current_lr` for convenience LR access
+
+Note:
+    For most use cases, prefer :class:`ParamScheduler` over these utilities.
+    These functions are primarily for custom scheduling logic or debugging.
 
 Example:
-    Modifying Optimizer params with custom logic::
+    Reading optimizer state::
 
-        from research_lib.training.scheduling import (
-            apply_schedule_to_param_group,
-            get_param_value,
-        )
+        from research_lib.training.scheduling.utils import get_param_value, get_current_lr
 
-        # Apply a schedule to a specific param group
-        apply_schedule_to_param_group(optimizer, schedule, group_idx=0, step=100, total_steps=1000)
-
-        # Read current value
-        current_lr = get_param_value(optimizer, "lr", group_idx=0)
+        current_lr = get_current_lr(optimizer)
+        momentum = get_param_value(optimizer, "momentum")
 
 See Also:
+    - :class:`research_lib.training.scheduling.ParamScheduler` for runtime scheduling
     - :class:`research_lib.training.scheduling.ParamSchedule` for schedule definition
 """
 
@@ -53,6 +53,11 @@ def apply_schedule_to_param_group(
 
     Raises:
         IndexError: If group_idx is out of range.
+
+    Example:
+        >>> apply_schedule_to_param_group(
+        ...     optimizer, lr_schedule, group_idx=0, step=100, total_steps=1000
+        ... )
     """
     if group_idx < 0 or group_idx >= len(optimizer.param_groups):
         raise IndexError(
@@ -71,14 +76,16 @@ def apply_schedule_to_all_groups(
 ) -> None:
     """Apply a schedule to all param groups.
 
-    Convenience function when you want the same schedule for all groups
-    without using OptimizerConfig.
+    Convenience function when you want the same schedule for all groups.
 
     Args:
         optimizer: The optimizer to update.
         schedule: The schedule to apply.
         step: Current training step.
         total_steps: Total training steps.
+
+    Example:
+        >>> apply_schedule_to_all_groups(optimizer, lr_schedule, step=100, total_steps=1000)
     """
     for group_idx in range(len(optimizer.param_groups)):
         apply_schedule_to_param_group(optimizer, schedule, group_idx, step, total_steps)
@@ -135,6 +142,9 @@ def get_param_values(
 
     Raises:
         IndexError: If any group index is out of range.
+
+    Example:
+        >>> lrs = get_param_values(optimizer, "lr", [0, 1])
     """
     return [get_param_value(optimizer, param_name, idx) for idx in group_indices]
 
@@ -154,6 +164,9 @@ def get_current_lr(optimizer: Optimizer, group_idx: int = 0) -> float:
     Raises:
         IndexError: If group_idx is out of range.
         KeyError: If 'lr' is not in the param group.
+
+    Example:
+        >>> lr = get_current_lr(optimizer)
     """
     lr = get_param_value(optimizer, "lr", group_idx)
     if lr is None:

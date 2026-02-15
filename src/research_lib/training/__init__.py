@@ -83,7 +83,7 @@ Note on Logging and Checkpointing:
     preferred systems (WandB, TensorBoard, HuggingFace, etc.) at the Trainer level.
 """
 
-from . import configs, modules, param_utils, scheduling
+from . import configs, modules, param_utils, presets, scheduling
 
 __all__ = [
     # Configs
@@ -91,4 +91,5 @@ __all__ = [
     "modules",
     "param_utils",
     "scheduling",
+    "presets",
 ]

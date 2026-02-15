@@ -5,59 +5,52 @@ This module provides a LightningModule that supports training with two
 optimizers (e.g., Muon for weight matrices, AdamW for embeddings) with
 independent scheduling for each.
 
-Key Features:
-    - Manual optimization for multiple optimizer support
-    - Independent param_group scheduling per optimizer via ParamSchedule
-    - Gradient accumulation with proper loss scaling
-    - Configurable gradient clipping
-    - Automatic param_group value updates (lr, momentum, etc.)
-
 Design Decisions:
     1. Uses manual optimization (self.automatic_optimization = False) because
        Lightning's automatic optimization doesn't support multiple optimizers
        with different stepping patterns.
 
-    2. Optimizer and schedule configs are passed via dependency injection
-       (OptimizerConfig dataclasses) for flexibility and serializability.
+    2. **Trainer is the config surface**: Training loop params (max_steps,
+       gradient_clip_val, accumulate_grad_batches) are read from Trainer at
+       runtime, not from custom config classes.
 
-    3. Parameter partitioning uses name-based patterns (target_modules) rather
-       than shape-based heuristics because embeddings are 2D but shouldn't
-       use Muon.
+    3. **Late binding**: ParamSchedulers are created in on_fit_start() after
+       the Trainer is attached and optimizers exist.
 
-    4. Logging uses Lightning's standard `self.log()` interface, which is
-       logger-agnostic. Users configure their preferred logger (WandB,
-       TensorBoard, etc.) at the Trainer level.
+    4. **Proper checkpointing**: Scheduler state is saved/restored via
+       on_save_checkpoint/on_load_checkpoint hooks.
 
-    5. Checkpointing is handled by Lightning callbacks, not by this module.
-       Users configure checkpointing at the Trainer level.
+    5. GradAccumSchedule optionally overrides trainer.accumulate_grad_batches
+       with warning on conflict.
 
-    6. LR scheduling is handled via ParamSchedule, not LambdaLR. This means
-       `configure_optimizers` returns just a list of optimizers
+    6. Parameter partitioning uses name-based patterns (target_modules) rather
+       than shape-based heuristics.
 
 Example:
     Basic usage::
 
         from research_lib.training import (
             DualOptimizerModule,
-            TrainingConfig,
             default_muon_config,
             default_adamw_config,
         )
 
+        muon_opt, muon_sched = default_muon_config()
+        adamw_opt, adamw_sched = default_adamw_config()
+
         module = DualOptimizerModule(
             model=my_model,
-            training_config=TrainingConfig(total_steps=10000),
-            matrix_optimizer_config=default_muon_config(),
-            vector_optimizer_config=default_adamw_config(),
+            matrix_optimizer_config=muon_opt,
+            vector_optimizer_config=adamw_opt,
+            matrix_schedule_config=muon_sched,
+            vector_schedule_config=adamw_sched,
             matrix_target_modules=["attn", "mlp", "qkv", "c_fc", "c_proj"],
         )
 
-        # Configure logging and checkpointing at Trainer level
-        from lightning.pytorch.loggers import WandbLogger
-        from lightning.pytorch.callbacks import ModelCheckpoint
-
         trainer = L.Trainer(
             max_steps=10000,
+            accumulate_grad_batches=4,
+            gradient_clip_val=1.0,
             logger=WandbLogger(project="my-project"),
             callbacks=[ModelCheckpoint(dirpath="checkpoints/", monitor="val/loss")],
         )
@@ -82,39 +75,47 @@ Example:
                 )
                 return self.alpha * ce_loss + (1 - self.alpha) * kl_loss
 
-Possible Extensions:
-    - Dynamic gradient accumulation scheduling (batch size warmup)
-    - Hooks for custom training logic (e.g., EMA updates)
-    - Integration with learning rate finders
-
 See Also:
-    - :mod:`research_lib.training.configs` for configuration dataclasses
+    - :mod:`research_lib.training.configs` for OptimizerConfig and ScheduleConfig
+    - :mod:`research_lib.training.presets` for default_muon_config, etc.
     - :mod:`research_lib.training.param_utils` for parameter partitioning
-    - :mod:`research_lib.training.scheduling` for param_group scheduling
+    - :mod:`research_lib.training.scheduling` for ParamScheduler
 """
 
-from typing import Any, Dict, List, Optional, Tuple
+from __future__ import annotations
+
+from typing import Any, Dict, List, Optional
 
 import lightning as L
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from lightning.pytorch.utilities.rank_zero import rank_zero_warn
 from torch.optim import Optimizer
 
-from ..configs import OptimizerConfig, TrainingConfig, update_optimizer_schedules
+from ..configs import (
+    GradAccumSchedule,
+    OptimizerConfig,
+    ScheduleConfig,
+    build_optimizer,
+)
 from ..param_utils import partition_parameters, summarize_partition
+from ..scheduling import ParamScheduler
 from ..scheduling.utils import get_current_lr, get_param_value
 
 
 class DualOptimizerModule(L.LightningModule):
     """Lightning module for training with two optimizers.
 
+    Training parameters (max_steps, gradient_clip_val, accumulate_grad_batches)
+    are read from the Trainer at runtime. Do not duplicate them in configs.
+
     This module handles:
         - Parameter partitioning based on target_modules
         - Dual optimizer setup (matrix optimizer + vector optimizer)
-        - Independent scheduling per optimizer via ParamSchedule
-        - Gradient accumulation with proper scaling
-        - Gradient clipping
+        - Independent scheduling per optimizer via ParamScheduler
+        - Gradient accumulation (from Trainer or GradAccumSchedule override)
+        - Gradient clipping (from Trainer)
 
     Partitioning Logic:
         You can specify which parameters belong to which optimizer using EITHER
@@ -126,103 +127,94 @@ class DualOptimizerModule(L.LightningModule):
           remaining params → Matrix Optimizer.
         - If neither is set: All params → Vector Optimizer (single optimizer mode).
 
-    Loss Computation:
-        By Default, the module is model-agnostic and can be used with any nn.Module
-        that accepts input_ids and returns logits (e.g., GPT, BERT, encoder-decoder).
-
-        Override `compute_loss()` for custom loss functions. The default
-        implementation assumes causal language modeling (next-token prediction).
-
     Attributes:
         model: The neural network model to train.
-        training_config: Global training configuration.
         matrix_optimizer_config: Config for the matrix/weight optimizer (e.g., Muon).
         vector_optimizer_config: Config for the vector/embedding optimizer (e.g., AdamW).
-        target_modules: PEFT style patterns for selecting matrix optimizer parameters.
-
-    Note:
-        This module uses manual optimization. The training_step handles:
-        1. Forward pass and loss computation
-        2. Scaled backward pass (for gradient accumulation)
-        3. Gradient clipping (if configured)
-        4. Optimizer stepping (when accumulation is complete)
-        5. Schedule updates via update_optimizer_schedules
-
-    Note:
-        Logging and checkpointing are configured at the Trainer level, not here.
-        This module uses `self.log()` which routes to whatever logger is configured.
+        matrix_schedule_config: Parameter schedules for matrix optimizer.
+        vector_schedule_config: Parameter schedules for vector optimizer.
+        grad_accum_schedule: Optional override for trainer.accumulate_grad_batches.
 
     Note:
         Lightning's ``global_step`` counter increments on each ``optimizer.step()``
         call. With multiple optimizers, this would cause ``max_steps`` to be reached
-        prematurely (e.g., ``max_steps=100`` would stop after 50 logical training
-        steps with 2 optimizers). This module avoids that by stepping secondary
-        optimizers directly, so ``max_steps`` corresponds to actual training steps.
+        prematurely. This module avoids that by stepping secondary optimizers
+        directly, so ``max_steps`` corresponds to actual training steps.
     """
 
     def __init__(
         self,
         model: nn.Module,
-        training_config: TrainingConfig,
         matrix_optimizer_config: OptimizerConfig,
         vector_optimizer_config: OptimizerConfig,
+        matrix_schedule_config: ScheduleConfig,
+        vector_schedule_config: ScheduleConfig,
         matrix_target_modules: Optional[List[str]] = None,
         vector_target_modules: Optional[List[str]] = None,
-    ):
-        """Lightning module for training with two optimizers.
+        grad_accum: Optional[int] = None,
+        grad_accum_schedule: Optional[GradAccumSchedule] = None,
+    ) -> None:
+        """Initialize the dual optimizer module.
 
         Args:
             model: The model to train. Can be any nn.Module with a forward
                 method that returns logits.
-            training_config: Global training parameters (total_steps, grad_accum, etc.)
-            matrix_optimizer_config: Configuration for the optimizer handling
-                parameters matching target_modules (typically Muon).
-            vector_optimizer_config: Configuration for the optimizer handling
-                all other parameters (typically AdamW).
+            matrix_optimizer_config: Optimizer config for matrix params.
+            vector_optimizer_config: Optimizer config for vector params.
+            matrix_schedule_config: Schedule config for matrix optimizer.
+            vector_schedule_config: Schedule config for vector optimizer.
             matrix_target_modules: Patterns for parameters that MUST go to the
                 matrix optimizer. Remainder goes to vector optimizer.
             vector_target_modules: Patterns for parameters that MUST go to the
                 vector optimizer. Remainder goes to matrix optimizer.
+            grad_accum: Constant gradient accumulation factor. Mutually exclusive
+                with grad_accum_schedule. If neither is provided, defaults to 1.
+            grad_accum_schedule: Step-based gradient accumulation schedule.
+                Mutually exclusive with grad_accum.
 
         Raises:
-            ValueError: If both matrix_target_modules and vector_target_modules provided
+            ValueError: If both matrix_target_modules and vector_target_modules provided.
+            ValueError: If both grad_accum and grad_accum_schedule provided.
 
         Example:
-            >>> # Target attention/MLP for matrix optimizer (e.g., Muon)
+            >>> muon_opt, muon_sched = default_muon_config()
+            >>> adamw_opt, adamw_sched = default_adamw_config()
+            >>> # Simple constant accumulation
             >>> module = DualOptimizerModule(
             ...     model=MyModel(),
-            ...     training_config=TrainingConfig(total_steps=10000),
-            ...     matrix_optimizer_config=default_muon_config(),
-            ...     vector_optimizer_config=default_adam_config(),
+            ...     matrix_optimizer_config=muon_opt,
+            ...     vector_optimizer_config=adamw_opt,
+            ...     matrix_schedule_config=muon_sched,
+            ...     vector_schedule_config=adamw_sched,
             ...     matrix_target_modules=["attn", "mlp"],
+            ...     grad_accum=4,
+            ... )
+            >>> # Or with a schedule
+            >>> module = DualOptimizerModule(
+            ...     ...
+            ...     grad_accum_schedule=GradAccumSchedule({0: 1, 1000: 4}),
             ... )
 
-            >>> # Alternatively, target embeddings for vector optimizer
-            >>> module = DualOptimizerModule(
-            ...     model=MyModel(),
-            ...     training_config=TrainingConfig(total_steps=10000),
-            ...     matrix_optimizer_config=default_muon_config(),
-            ...     vector_optimizer_config=default_adam_config(),
-            ...     vector_target_modules=["embed", "norm"],
-            ... )
+        Note:
+            Since this module uses manual optimization (required for multiple
+            optimizers), Lightning's ``Trainer(accumulate_grad_batches=N)`` is
+            NOT supported. Use ``grad_accum`` or ``grad_accum_schedule`` instead.
         """
         super().__init__()
 
         # CRITICAL: Enable manual optimization for multiple optimizers
         self.automatic_optimization = False
 
-        # Store configs (not hyperparameters to avoid serialization issues with classes)
-        self.training_config = training_config
-        self.matrix_optimizer_config = matrix_optimizer_config
-        self.vector_optimizer_config = vector_optimizer_config
-
         # Store model
         self.model = model
 
-        # Track optimization step count (different from global_step with grad accum)
-        self._optimizer_step_count = 0
+        # Store configs (pure data, no runtime dependencies)
+        self.matrix_optimizer_config = matrix_optimizer_config
+        self.vector_optimizer_config = vector_optimizer_config
+        self.matrix_schedule_config = matrix_schedule_config
+        self.vector_schedule_config = vector_schedule_config
 
-        # Handle param partitioning
+        # Validate target module args (mutually exclusive)
         if matrix_target_modules is not None and vector_target_modules is not None:
             raise ValueError(
                 "Cannot specify both `matrix_target_modules` and `vector_target_modules`. "
@@ -239,10 +231,180 @@ class DualOptimizerModule(L.LightningModule):
             )
             self._target_strategy = "matrix"
 
+        # Validate grad accum args (mutually exclusive)
+        if grad_accum is not None and grad_accum_schedule is not None:
+            raise ValueError(
+                "Cannot specify both `grad_accum` and `grad_accum_schedule`. "
+                "Use `grad_accum` for constant accumulation, or "
+                "`grad_accum_schedule` for step-based schedules."
+            )
+
+        # Build grad accum schedule
+        if grad_accum_schedule is not None:
+            self._grad_accum_schedule = grad_accum_schedule
+        elif grad_accum is not None:
+            if grad_accum < 1:
+                raise ValueError(f"grad_accum must be >= 1, got {grad_accum}")
+            self._grad_accum_schedule = GradAccumSchedule({0: grad_accum})
+        else:
+            # Default: no accumulation
+            self._grad_accum_schedule = GradAccumSchedule({0: 1})
+
+        # Runtime state (initialized in on_fit_start)
+        self._optimizer_step_count = 0
+        self._matrix_scheduler: Optional[ParamScheduler] = None
+        self._vector_scheduler: Optional[ParamScheduler] = None
+        self._has_matrix_params = False
+        self._has_vector_params = False
+
+        # Pending scheduler states from checkpoint (loaded in on_fit_start)
+        self._pending_scheduler_states: Optional[Dict[str, Any]] = None
+
         # Save hyperparameters for logging (exclude model and configs with classes)
-        self.save_hyperparameters(
-            ignore=["model", "matrix_optimizer_config", "vector_optimizer_config"]
+        self.save_hyperparameters(ignore=["model"])
+
+    def configure_optimizers(self) -> List[Optimizer]:
+        """Configure optimizers based on parameter partitioning.
+
+        Returns:
+            List of optimizers. May contain 1 or 2 optimizers depending on
+            parameter partitioning.
+        """
+        # Partition parameters
+        matched_params, other_params = partition_parameters(
+            self.model, self.target_modules
         )
+
+        # Route parameters based on strategy
+        if self._target_strategy == "vector":
+            # Matches -> Vector, Others -> Matrix
+            vector_params = matched_params
+            matrix_params = other_params
+        else:
+            # Matches -> Matrix, Others -> Vector (Default)
+            matrix_params = matched_params
+            vector_params = other_params
+
+        self._has_matrix_params = len(matrix_params) > 0
+        self._has_vector_params = len(vector_params) > 0
+
+        # Log partition summary on rank 0
+        if self.trainer is not None:
+            try:
+                if self.trainer.is_global_zero:
+                    summary = summarize_partition(self.model, self.target_modules)
+                    self.print(summary)
+            except AttributeError:
+                # Trainer not fully initialized (e.g., during testing)
+                pass
+
+        # Build optimizers
+        optimizers = []
+
+        if self._has_matrix_params:
+            matrix_opt = build_optimizer(self.matrix_optimizer_config, matrix_params)
+            optimizers.append(matrix_opt)
+
+        if self._has_vector_params:
+            vector_opt = build_optimizer(self.vector_optimizer_config, vector_params)
+            optimizers.append(vector_opt)
+
+        return optimizers
+
+    def on_fit_start(self) -> None:
+        """Initialize ParamSchedulers after trainer is attached.
+
+        This is where late binding happens:
+        - Get total_steps from trainer.estimated_stepping_batches
+        - Create ParamSchedulers for each optimizer
+        - Restore scheduler states if resuming from checkpoint
+        """
+
+        # Get total steps from trainer (this is the key late binding)
+        total_steps = self.trainer.estimated_stepping_batches
+
+        # Get optimizers
+        opts = self.optimizers()
+        if not isinstance(opts, list):
+            opts = [opts]
+
+        # Create ParamSchedulers (binding schedules to optimizers)
+        # Extract schedules from ScheduleConfig and pass to ParamScheduler
+        opt_idx = 0
+
+        if self._has_matrix_params:
+            self._matrix_scheduler = ParamScheduler(
+                optimizer=opts[opt_idx],
+                global_schedules=self.matrix_schedule_config.global_schedules,
+                total_steps=total_steps,
+                group_overrides=self.matrix_schedule_config.group_overrides,
+            )
+            opt_idx += 1
+
+        if self._has_vector_params:
+            self._vector_scheduler = ParamScheduler(
+                optimizer=opts[opt_idx],
+                global_schedules=self.vector_schedule_config.global_schedules,
+                total_steps=total_steps,
+                group_overrides=self.vector_schedule_config.group_overrides,
+            )
+
+        # Restore scheduler states from checkpoint if available
+        if self._pending_scheduler_states is not None:
+            if (
+                self._matrix_scheduler is not None
+                and self._pending_scheduler_states.get("matrix") is not None
+            ):
+                self._matrix_scheduler.load_state_dict(
+                    self._pending_scheduler_states["matrix"]
+                )
+            if (
+                self._vector_scheduler is not None
+                and self._pending_scheduler_states.get("vector") is not None
+            ):
+                self._vector_scheduler.load_state_dict(
+                    self._pending_scheduler_states["vector"]
+                )
+            self._pending_scheduler_states = None
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Save scheduler states to checkpoint.
+
+        Args:
+            checkpoint: The checkpoint dictionary to save state into.
+        """
+        checkpoint["optimizer_step_count"] = self._optimizer_step_count
+        checkpoint["matrix_scheduler_state"] = (
+            self._matrix_scheduler.state_dict() if self._matrix_scheduler else None
+        )
+        checkpoint["vector_scheduler_state"] = (
+            self._vector_scheduler.state_dict() if self._vector_scheduler else None
+        )
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        """Load scheduler states from checkpoint.
+
+        Note:
+            Actual scheduler state restoration happens in on_fit_start()
+            because schedulers don't exist yet at this point.
+
+        Args:
+            checkpoint: The checkpoint dictionary to load state from.
+        """
+        self._optimizer_step_count = checkpoint.get("optimizer_step_count", 0)
+        self._pending_scheduler_states = {
+            "matrix": checkpoint.get("matrix_scheduler_state"),
+            "vector": checkpoint.get("vector_scheduler_state"),
+        }
+
+    def _get_current_grad_accum(self) -> int:
+        """Get current gradient accumulation factor.
+
+        Returns:
+            The gradient accumulation factor for the current step.
+            Uses grad_accum_schedule if provided, otherwise uses Trainer value.
+        """
+        return self._grad_accum_schedule.get_accum(self._optimizer_step_count)
 
     def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
         """Forward pass through the model.
@@ -307,61 +469,6 @@ class DualOptimizerModule(L.LightningModule):
             ignore_index=-100,
         )
 
-    def configure_optimizers(self) -> List[Optimizer]:
-        """Configure optimizers.
-
-        Returns:
-            Tuple of (optimizers_list, empty_list).
-            The scheduler list is empty because LR is handled via ParamSchedule.
-        """
-        # Partition parameters
-        matched_params, other_params = partition_parameters(
-            self.model, self.target_modules
-        )
-
-        # Route parameters based on strategy
-        if self._target_strategy == "vector":
-            # Matches -> Vector, Others -> Matrix
-            vector_params = matched_params
-            matrix_params = other_params
-        else:
-            # Matches -> Matrix, Others -> Vector (Default)
-            matrix_params = matched_params
-            vector_params = other_params
-
-        # Log partition summary
-        if self.trainer is not None:
-            try:
-                if self.trainer.is_global_zero:
-                    summary = summarize_partition(self.model, self.target_modules)
-                    self.print(summary)
-            except AttributeError:
-                # Trainer not fully initialized (e.g., during testing)
-                pass
-
-        # Build optimizers
-        optimizers = []
-
-        # Matrix optimizer (e.g., Muon) - skip if no target params
-        if matrix_params:
-            matrix_opt = self.matrix_optimizer_config.build_optimizer(matrix_params)
-            optimizers.append(matrix_opt)
-        else:
-            optimizers.append(None)
-
-        # Vector optimizer (e.g., AdamW) - skip if no other params
-        if vector_params:
-            vector_opt = self.vector_optimizer_config.build_optimizer(vector_params)
-            optimizers.append(vector_opt)
-        else:
-            optimizers.append(None)
-
-        # Filter out None values
-        optimizers = [o for o in optimizers if o is not None]
-
-        # Return empty scheduler list - LR handled via ParamSchedule
-        return optimizers
-
     def training_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int
     ) -> torch.Tensor:
@@ -379,17 +486,11 @@ class DualOptimizerModule(L.LightningModule):
         """
         # Get optimizers
         opts = self.optimizers()
-
-        # Handle single optimizer case
         if not isinstance(opts, list):
             opts = [opts]
 
         # Determine if we should step this batch
-        # Force strict integer casting
-        grad_accum = int(self.training_config.grad_accum_steps)
-        if grad_accum < 1:
-            grad_accum = 1
-
+        grad_accum = self._get_current_grad_accum()
         should_step = (batch_idx + 1) % grad_accum == 0
 
         # Forward pass
@@ -407,13 +508,15 @@ class DualOptimizerModule(L.LightningModule):
 
         # Step optimizers if accumulation complete
         if should_step:
-            # Gradient clipping
-            if self.training_config.gradient_clip_val > 0:
+            # Gradient clipping via trainer
+            clip_val = self.trainer.gradient_clip_val
+            if clip_val and clip_val > 0:
+                clip_algo = self.trainer.gradient_clip_algorithm or "norm"
                 for opt in opts:
                     self.clip_gradients(
                         opt,
-                        gradient_clip_val=self.training_config.gradient_clip_val,
-                        gradient_clip_algorithm="norm",
+                        gradient_clip_val=clip_val,
+                        gradient_clip_algorithm=clip_algo,
                     )
 
             # Step all optimizers - only first one should increment global_step
@@ -425,14 +528,18 @@ class DualOptimizerModule(L.LightningModule):
                     opt.optimizer.step()
                 opt.zero_grad()
 
-            # Update schedules via update_optimizer_schedules
-            self._update_schedules(opts)
+            # Step param schedulers
+            if self._matrix_scheduler is not None:
+                self._matrix_scheduler.step()
+            if self._vector_scheduler is not None:
+                self._vector_scheduler.step()
 
             # Increment step counter
             self._optimizer_step_count += 1
 
         # Logging
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/grad_accum", float(grad_accum), on_step=True)
         self.log(
             "train/optimizer_step", float(self._optimizer_step_count), on_step=True
         )
@@ -448,52 +555,6 @@ class DualOptimizerModule(L.LightningModule):
                 self.log(f"train/momentum_{i}", momentum, on_step=True)
 
         return loss
-
-    def _update_schedules(self, optimizers: List[Optimizer]) -> None:
-        """Update schedules for all optimizers.
-
-        Args:
-            optimizers: List of optimizers to update.
-        """
-        step = self._optimizer_step_count
-        total_steps = self.training_config.total_steps
-
-        # Partition parameters again to determine which optimizer is which
-        matched_params, other_params = partition_parameters(
-            self.model, self.target_modules
-        )
-
-        # IMPORTANT: Respect strategy when mapping variables
-        if self._target_strategy == "vector":
-            matrix_params = other_params
-            vector_params = matched_params
-        else:
-            matrix_params = matched_params
-            vector_params = other_params
-
-        # Map logic relies on configure_optimizers appending in order [Matrix, Vector]
-        opt_idx = 0
-
-        # Check Matrix optimizer existence (if matrix params exist)
-        if matrix_params:
-            if opt_idx < len(optimizers):
-                update_optimizer_schedules(
-                    optimizers[opt_idx],
-                    self.matrix_optimizer_config,
-                    step,
-                    total_steps,
-                )
-                opt_idx += 1
-
-        # Check Vector optimizer existence (if vector params exist)
-        if vector_params:
-            if opt_idx < len(optimizers):
-                update_optimizer_schedules(
-                    optimizers[opt_idx],
-                    self.vector_optimizer_config,
-                    step,
-                    total_steps,
-                )
 
     def validation_step(
         self, batch: Dict[str, torch.Tensor], batch_idx: int

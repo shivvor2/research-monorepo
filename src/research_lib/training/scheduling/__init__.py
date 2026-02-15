@@ -7,13 +7,9 @@ optimizer parameters (lr, momentum, betas, etc.) during training.
 Architecture:
     The system follows a layered design where users can enter at any level:
 
-    User-Facing Layer:     OptimizerConfig, default_muon_config(), etc.
-                                  ↓
-    Config Layer:          ParamGroupConfig, schedule precedence logic
+    Runtime Layer:         ParamScheduler (binds schedules to optimizer)
                                   ↓
     Schedule Layer:        ParamSchedule, WarmupStableDecaySchedule
-                                  ↓
-    Primitive Layer:       update_optimizer_schedules(), apply_schedule_to_param_group()
                                   ↓
     PyTorch Layer:         optimizer.param_groups[i][param_name] = value
 
@@ -26,6 +22,7 @@ Design Principles:
        are not Optional. Validation happens at construction time where possible.
     4. **Minimal Coupling**: Schedules describe curves, configs describe where
        they apply, optimizer instance only required at application time.
+    5. **Stateful Schedulers**: ParamScheduler tracks step count for checkpointing.
 
 Example:
     Basic usage with ParamSchedule primitive::
@@ -51,34 +48,53 @@ Example:
             decay_type="cosine",
         )
 
-    Applying schedules during training::
+    Using ParamScheduler at runtime::
 
-        from research_lib.training.scheduling import update_optimizer_schedules
+        from research_lib.training.scheduling import ParamScheduler
+
+        scheduler = ParamScheduler(
+            optimizer=optimizer,
+            global_schedules=[lr_schedule, momentum_schedule],
+            total_steps=10000,
+        )
 
         for step in range(total_steps):
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad()
-            update_optimizer_schedules(optimizer, config, step, total_steps)
+            scheduler.step()
+
+    With per-group overrides::
+
+        scheduler = ParamScheduler(
+            optimizer=optimizer,
+            global_schedules=[lr_schedule],
+            group_overrides={
+                1: [slower_lr_schedule],  # Different schedule for group 1
+            },
+            total_steps=10000,
+        )
 
 Submodules:
+    scheduler: Runtime ParamScheduler class
+    schedules: ParamSchedule Primitive and common presets
     utils: Low-level utilities (get_param_value, apply_schedule_to_param_group, etc.)
     validation: Schedule validation (validate_schedule, check_* functions)
     wrappers: Schedule function wrappers (Cyclic, DecayingCyclic, WarmRestarts)
 
 See Also:
-    - :mod:`research_lib.training.configs` for OptimizerConfig and ParamGroupConfig
     - :mod:`research_lib.training.scheduling.wrappers` for cyclic schedule wrappers
     - :mod:`research_lib.training.scheduling.validation` for schedule validation utilities
 """
 
 from . import utils, validation, wrappers
+from .scheduler import ParamScheduler
 from .schedules import ParamSchedule, WarmupStableDecaySchedule
 
 __all__ = [
     # Core classes
     "ParamSchedule",
     "WarmupStableDecaySchedule",
+    "ParamScheduler",
     # Submodules
     "utils",
     "validation",

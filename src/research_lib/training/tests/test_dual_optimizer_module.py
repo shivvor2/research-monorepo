@@ -8,11 +8,17 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
 from research_lib.training.configs import (
+    GradAccumSchedule,
     OptimizerConfig,
-    TrainingConfig,
-    default_adamw_config,
+    ScheduleConfig,
 )
 from research_lib.training.modules import DualOptimizerModule
+from research_lib.training.presets import default_adamw_config
+from research_lib.training.scheduling import WarmupStableDecaySchedule
+
+# =============================================================================
+# Test Fixtures
+# =============================================================================
 
 
 class SimpleModel(nn.Module):
@@ -54,21 +60,40 @@ def create_dummy_dataloader(batch_size=4, seq_len=16, num_batches=10, vocab_size
     return DataLoader(dataset, batch_size=batch_size, collate_fn=collate_fn)
 
 
+def create_simple_configs():
+    """Create simple configs for testing."""
+    opt_config = OptimizerConfig(
+        optimizer_class=torch.optim.AdamW,
+        optimizer_kwargs={"lr": 1e-3},
+    )
+    schedule_config = ScheduleConfig(
+        global_schedules=[
+            WarmupStableDecaySchedule(param_name="lr", max_value=1e-3),
+        ],
+    )
+    return opt_config, schedule_config
+
+
+# =============================================================================
+# Initialization Tests
+# =============================================================================
+
+
 class TestDualOptimizerModuleInit:
-    """Tests for DualOptimizerModule initialization and strategy logic."""
+    """Tests for DualOptimizerModule initialization."""
 
     def test_init_with_matrix_targets(self):
         """Test initialization with explicit matrix targets."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adamw_config()
+        opt_config, schedule_config = create_simple_configs()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
-            matrix_optimizer_config=adam_config,
-            vector_optimizer_config=adam_config,
-            matrix_target_modules=["attn", "mlp"],  # Explicitly setting matrix
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn", "mlp"],
         )
 
         assert module._target_strategy == "matrix"
@@ -77,72 +102,190 @@ class TestDualOptimizerModuleInit:
     def test_init_with_vector_targets(self):
         """Test initialization with explicit vector targets."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adamw_config()
+        opt_config, schedule_config = create_simple_configs()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
-            matrix_optimizer_config=adam_config,
-            vector_optimizer_config=adam_config,
-            vector_target_modules=["embed"],  # Explicitly setting vector
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            vector_target_modules=["embed"],
         )
 
         assert module._target_strategy == "vector"
         assert module.target_modules == ["embed"]
 
-    def test_init_conflict(self):
+    def test_init_conflict_raises(self):
         """Test that providing both target args raises ValueError."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adamw_config()
+        opt_config, schedule_config = create_simple_configs()
 
         with pytest.raises(ValueError, match="Cannot specify both"):
             DualOptimizerModule(
                 model=model,
-                training_config=training_config,
-                matrix_optimizer_config=adam_config,
-                vector_optimizer_config=adam_config,
+                matrix_optimizer_config=opt_config,
+                vector_optimizer_config=opt_config,
+                matrix_schedule_config=schedule_config,
+                vector_schedule_config=schedule_config,
                 matrix_target_modules=["attn"],
                 vector_target_modules=["embed"],
             )
 
     def test_init_defaults(self):
-        """Test initialization with no targets defaults to matrix strategy (empty)."""
+        """Test initialization with no targets defaults to matrix strategy."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adamw_config()
+        opt_config, schedule_config = create_simple_configs()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
-            matrix_optimizer_config=adam_config,
-            vector_optimizer_config=adam_config,
-            # Both None
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
         )
 
         assert module._target_strategy == "matrix"
         assert module.target_modules == []
 
+    def test_training_with_grad_accum_constant(self):
+        """Test training with constant gradient accumulation via grad_accum."""
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
 
-# test_dual_optimizer_module.py - Fix the configure_optimizers tests
+        module = DualOptimizerModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn"],
+            grad_accum=2,  # Constant accumulation
+        )
+
+        trainer = L.Trainer(
+            accelerator="cpu",
+            max_steps=4,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+        )
+
+        dataloader = create_dummy_dataloader(batch_size=2, num_batches=20)
+
+        trainer.fit(module, dataloader)
+
+        # With accum=2, we need 8 batches for 4 optimizer steps
+        assert module._optimizer_step_count == 4
+
+    def test_training_with_grad_accum_schedule(self):
+        """Test training with step-based gradient accumulation schedule."""
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+        grad_accum = GradAccumSchedule({0: 2})
+
+        module = DualOptimizerModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn"],
+            grad_accum_schedule=grad_accum,
+        )
+
+        trainer = L.Trainer(
+            accelerator="cpu",
+            max_steps=4,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+        )
+
+        dataloader = create_dummy_dataloader(batch_size=2, num_batches=20)
+
+        trainer.fit(module, dataloader)
+
+        # With accum=2, we need 8 batches for 4 optimizer steps
+        assert module._optimizer_step_count == 4
+
+    def test_grad_accum_mutual_exclusivity(self):
+        """Test that providing both grad_accum and grad_accum_schedule raises."""
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
+        with pytest.raises(ValueError, match="Cannot specify both"):
+            DualOptimizerModule(
+                model=model,
+                matrix_optimizer_config=opt_config,
+                vector_optimizer_config=opt_config,
+                matrix_schedule_config=schedule_config,
+                vector_schedule_config=schedule_config,
+                grad_accum=2,
+                grad_accum_schedule=GradAccumSchedule({0: 4}),
+            )
+
+    def test_grad_accum_validation(self):
+        """Test that invalid grad_accum raises."""
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
+        with pytest.raises(ValueError, match="grad_accum must be >= 1"):
+            DualOptimizerModule(
+                model=model,
+                matrix_optimizer_config=opt_config,
+                vector_optimizer_config=opt_config,
+                matrix_schedule_config=schedule_config,
+                vector_schedule_config=schedule_config,
+                grad_accum=0,
+            )
+
+    def test_grad_accum_default(self):
+        """Test that default grad_accum is 1 (no accumulation)."""
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
+        module = DualOptimizerModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn"],
+            # No grad_accum or grad_accum_schedule specified
+        )
+
+        # Should default to 1
+        assert module._get_current_grad_accum() == 1
+
+
+# =============================================================================
+# configure_optimizers Tests
+# =============================================================================
 
 
 class TestDualOptimizerModuleConfigureOptimizers:
     """Tests for configure_optimizers method."""
 
     def test_configure_optimizers_matrix_strategy(self):
-        """Test configuring two optimizers."""
+        """Test configuring two optimizers with matrix strategy."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=100)
-        matrix_config = default_adamw_config(lr=0.01)
-        vector_config = default_adamw_config(lr=0.001)
+        matrix_config = OptimizerConfig(
+            optimizer_class=torch.optim.AdamW,
+            optimizer_kwargs={"lr": 0.01},
+        )
+        vector_config = OptimizerConfig(
+            optimizer_class=torch.optim.AdamW,
+            optimizer_kwargs={"lr": 0.001},
+        )
+        schedule_config = ScheduleConfig()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
             matrix_optimizer_config=matrix_config,
             vector_optimizer_config=vector_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             matrix_target_modules=["attn", "mlp"],
         )
 
@@ -151,26 +294,21 @@ class TestDualOptimizerModuleConfigureOptimizers:
 
         optimizers = module.configure_optimizers()
 
-        # FIXED: Only return list of Optimizers (LR handled via ParamSchedule)
         assert len(optimizers) == 2
-
-        # Verify optimizer LRs are set correctly
-        assert optimizers[0].param_groups[0]["lr"] == 0.01
-        assert optimizers[1].param_groups[0]["lr"] == 0.001
+        assert optimizers[0].defaults["lr"] == 0.01
+        assert optimizers[1].defaults["lr"] == 0.001
 
     def test_configure_optimizers_vector_strategy(self):
-        """Test inverted behavior: matched -> vector."""
+        """Test configuring optimizers with vector strategy."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=100)
-
-        matrix_config = default_adamw_config(lr=0.01)
-        vector_config = default_adamw_config(lr=0.001)
+        opt_config, schedule_config = create_simple_configs()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
-            matrix_optimizer_config=matrix_config,
-            vector_optimizer_config=vector_config,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             vector_target_modules=["attn"],
         )
         module._trainer = type("MockTrainer", (), {"is_global_zero": True})()
@@ -178,25 +316,23 @@ class TestDualOptimizerModuleConfigureOptimizers:
         optimizers = module.configure_optimizers()
 
         assert len(optimizers) == 2
-
-        # Verify both optimizers exist and have params
+        # Both optimizers should have params
         assert len(optimizers[0].param_groups[0]["params"]) > 0
         assert len(optimizers[1].param_groups[0]["params"]) > 0
 
-    def test_single_optimizer_via_vector_strategy(self):
-        """Test configuring single optimizer (empty targets)."""
+    def test_single_optimizer_when_no_targets(self):
+        """Test single optimizer when target matches nothing."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=100)
-        adam_config = default_adamw_config()
+        opt_config, schedule_config = create_simple_configs()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
-            matrix_optimizer_config=adam_config,
-            vector_optimizer_config=adam_config,
-            vector_target_modules=[""],
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["nonexistent"],
         )
-
         module._trainer = type("MockTrainer", (), {"is_global_zero": True})()
 
         optimizers = module.configure_optimizers()
@@ -205,17 +341,25 @@ class TestDualOptimizerModuleConfigureOptimizers:
         assert len(optimizers) == 1
 
 
+# =============================================================================
+# Forward and Loss Tests
+# =============================================================================
+
+
 class TestDualOptimizerModuleForward:
     """Tests for forward pass."""
 
     def test_forward(self):
         """Test forward pass returns correct shape."""
         model = SimpleModel(vocab_size=100, dim=32)
+        opt_config, schedule_config = create_simple_configs()
+
         module = DualOptimizerModule(
             model=model,
-            training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adamw_config(),
-            vector_optimizer_config=default_adamw_config(),
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             matrix_target_modules=["attn"],
         )
 
@@ -231,11 +375,14 @@ class TestComputeLoss:
     def test_default_loss_causal_lm(self):
         """Test default loss computes causal LM cross-entropy."""
         model = SimpleModel(vocab_size=100, dim=32)
+        opt_config, schedule_config = create_simple_configs()
+
         module = DualOptimizerModule(
             model=model,
-            training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adamw_config(),
-            vector_optimizer_config=default_adamw_config(),
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             matrix_target_modules=["attn"],
         )
 
@@ -249,11 +396,14 @@ class TestComputeLoss:
     def test_default_loss_with_labels(self):
         """Test default loss uses labels when provided."""
         model = SimpleModel(vocab_size=100, dim=32)
+        opt_config, schedule_config = create_simple_configs()
+
         module = DualOptimizerModule(
             model=model,
-            training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adamw_config(),
-            vector_optimizer_config=default_adamw_config(),
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             matrix_target_modules=["attn"],
         )
 
@@ -277,11 +427,14 @@ class TestComputeLoss:
                 return torch.tensor(1.0, requires_grad=True)
 
         model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
         module = ConstantLossModule(
             model=model,
-            training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adamw_config(),
-            vector_optimizer_config=default_adamw_config(),
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             matrix_target_modules=["attn"],
         )
 
@@ -291,89 +444,26 @@ class TestComputeLoss:
 
         assert loss.item() == 1.0
 
-    def test_custom_loss_with_auxiliary_data(self):
-        """Test custom loss can access arbitrary batch keys."""
 
-        class WeightedLossModule(DualOptimizerModule):
-            """Module that uses sample weights from batch."""
-
-            def compute_loss(self, model_output, batch):
-                base_loss = super().compute_loss(model_output, batch)
-                weights = batch.get("weights", None)
-                if weights is not None:
-                    return base_loss * weights.mean()
-                return base_loss
-
-        model = SimpleModel()
-        module = WeightedLossModule(
-            model=model,
-            training_config=TrainingConfig(total_steps=100),
-            matrix_optimizer_config=default_adamw_config(),
-            vector_optimizer_config=default_adamw_config(),
-            matrix_target_modules=["attn"],
-        )
-
-        batch = {
-            "input_ids": torch.randint(0, 100, (2, 16)),
-            "weights": torch.tensor([0.5, 1.5]),
-        }
-        logits = module.forward(batch["input_ids"])
-        loss = module.compute_loss(logits, batch)
-
-        assert loss.shape == ()
+# =============================================================================
+# Training Tests (CPU)
+# =============================================================================
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-class TestDualOptimizerModuleTraining:
-    """Integration tests for training (requires CUDA for full test)."""
-
-    def test_training_step_runs(self):
-        """Test that training_step executes without error."""
-        model = SimpleModel().cuda()
-        training_config = TrainingConfig(total_steps=10, grad_accum_steps=2)
-        adam_config = default_adamw_config()
-
-        module = DualOptimizerModule(
-            model=model,
-            training_config=training_config,
-            matrix_optimizer_config=adam_config,
-            vector_optimizer_config=adam_config,
-            matrix_target_modules=["attn", "mlp"],
-        ).cuda()
-
-        # Create trainer for short run
-        trainer = L.Trainer(
-            accelerator="gpu",
-            devices=1,
-            max_steps=4,
-            enable_checkpointing=False,
-            logger=False,
-            enable_progress_bar=False,
-        )
-
-        dataloader = create_dummy_dataloader(batch_size=2, num_batches=10)
-
-        # Should complete without error
-        trainer.fit(module, dataloader)
-
-        # Check that steps were taken
-        assert module._optimizer_step_count == 4  # Can load all 4 steps
-
-
-class TestDualOptimizerModuleCPU:
-    """Tests that can run on CPU."""
+class TestDualOptimizerModuleTrainingCPU:
+    """Tests that run on CPU."""
 
     def test_training_step_cpu(self):
         """Test training step on CPU."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=10, grad_accum_steps=2)
-        adam_config = default_adamw_config()
+        opt_config, schedule_config = create_simple_configs()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
-            matrix_optimizer_config=adam_config,
-            vector_optimizer_config=adam_config,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             matrix_target_modules=["attn", "mlp"],
         )
 
@@ -395,14 +485,14 @@ class TestDualOptimizerModuleCPU:
     def test_training_with_vector_targeting(self):
         """Test training with vector_target_modules."""
         model = SimpleModel()
-        training_config = TrainingConfig(total_steps=10, grad_accum_steps=1)
-        adam_config = default_adamw_config()
+        opt_config, schedule_config = create_simple_configs()
 
         module = DualOptimizerModule(
             model=model,
-            training_config=training_config,
-            matrix_optimizer_config=adam_config,
-            vector_optimizer_config=adam_config,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             vector_target_modules=["embed"],
         )
 
@@ -420,23 +510,56 @@ class TestDualOptimizerModuleCPU:
 
         assert module._optimizer_step_count == 4
 
+    def test_training_with_grad_accum_schedule_override(self):
+        """Test training with GradAccumSchedule override."""
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+        grad_accum = GradAccumSchedule({0: 2})
+
+        module = DualOptimizerModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn"],
+            grad_accum_schedule=grad_accum,
+        )
+
+        trainer = L.Trainer(
+            accelerator="cpu",
+            max_steps=4,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+        )
+
+        dataloader = create_dummy_dataloader(batch_size=2, num_batches=20)
+
+        trainer.fit(module, dataloader)
+
+        # With accum=2, we need 8 batches for 4 optimizer steps
+        assert module._optimizer_step_count == 4
+
     def test_training_with_custom_loss(self):
         """Test training with overridden compute_loss."""
 
         class MSELossModule(DualOptimizerModule):
-            """Use MSE loss instead of cross-entropy (nonsensical but tests override)."""
+            """Use MSE loss instead of cross-entropy."""
 
             def compute_loss(self, model_output, batch):
-                # Just compute MSE between logits and some target
                 target = torch.zeros_like(model_output)
                 return F.mse_loss(model_output, target)
 
         model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
         module = MSELossModule(
             model=model,
-            training_config=TrainingConfig(total_steps=10, grad_accum_steps=1),
-            matrix_optimizer_config=default_adamw_config(),
-            vector_optimizer_config=default_adamw_config(),
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
             matrix_target_modules=["attn"],
         )
 
@@ -450,6 +573,110 @@ class TestDualOptimizerModuleCPU:
 
         dataloader = create_dummy_dataloader(batch_size=2, num_batches=10)
 
-        # Should complete without error
         trainer.fit(module, dataloader)
+        assert module._optimizer_step_count == 4
+
+
+# =============================================================================
+# Checkpointing Tests
+# =============================================================================
+
+
+class TestDualOptimizerModuleCheckpointing:
+    """Tests for checkpoint save/load."""
+
+    def test_checkpoint_roundtrip(self, tmp_path):
+        """Test that checkpoint save/load works correctly."""
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
+        module = DualOptimizerModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn"],
+        )
+
+        # Train for a few steps
+        trainer = L.Trainer(
+            accelerator="cpu",
+            max_steps=4,
+            default_root_dir=str(tmp_path),
+            enable_checkpointing=True,
+            logger=False,
+            enable_progress_bar=False,
+        )
+
+        dataloader = create_dummy_dataloader(batch_size=2, num_batches=10)
+        trainer.fit(module, dataloader)
+
+        # Save checkpoint
+        checkpoint = {
+            "optimizer_step_count": module._optimizer_step_count,
+            "matrix_scheduler_state": (
+                module._matrix_scheduler.state_dict()
+                if module._matrix_scheduler
+                else None
+            ),
+            "vector_scheduler_state": (
+                module._vector_scheduler.state_dict()
+                if module._vector_scheduler
+                else None
+            ),
+        }
+
+        # Create new module and load checkpoint
+        new_module = DualOptimizerModule(
+            model=SimpleModel(),
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn"],
+        )
+
+        new_module.on_load_checkpoint(checkpoint)
+
+        assert new_module._optimizer_step_count == 4
+        assert new_module._pending_scheduler_states is not None
+
+
+# =============================================================================
+# GPU Tests (Optional)
+# =============================================================================
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+class TestDualOptimizerModuleGPU:
+    """Integration tests requiring CUDA."""
+
+    def test_training_step_gpu(self):
+        """Test that training_step executes on GPU without error."""
+        model = SimpleModel().cuda()
+        opt_config, schedule_config = create_simple_configs()
+
+        module = DualOptimizerModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn", "mlp"],
+        ).cuda()
+
+        trainer = L.Trainer(
+            accelerator="gpu",
+            devices=1,
+            max_steps=4,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+        )
+
+        dataloader = create_dummy_dataloader(batch_size=2, num_batches=10)
+
+        trainer.fit(module, dataloader)
+
         assert module._optimizer_step_count == 4

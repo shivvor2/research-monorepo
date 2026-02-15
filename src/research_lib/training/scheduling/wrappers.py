@@ -4,19 +4,18 @@ Schedule function wrappers for cyclic and other complex patterns.
 These are callable classes that transform a base schedule function.
 Use them as the schedule_fn argument to ParamSchedule.
 
-All wrappers are picklable (required for checkpointing).
+All wrappers are picklable (required for checkpointing and distributed training).
 
 Example:
     Basic cyclic schedule::
 
-        from research_lib.training.scheduling import ParamSchedule, wrappers as sw
+        from research_lib.training.scheduling import ParamSchedule, WarmupStableDecaySchedule
+        from research_lib.training.scheduling import wrappers as sw
 
         base_schedule = WarmupStableDecaySchedule(
-            warmup_steps=100,
-            cooldown_frac=1.0,
-            min_value=0.0,
-            max_value=1.0,
-            decay_type="cosine",
+            peak=1.0,
+            warmup_frac=0.0,
+            stable_frac=0.0,  # Pure decay
         )
 
         schedule = ParamSchedule(
@@ -29,7 +28,7 @@ Example:
         schedule = ParamSchedule(
             param_name="lr",
             schedule_fn=sw.DecayingCyclic(
-                base_schedule_fn=cosine_fn,
+                base_schedule_fn=base_fn,
                 cycle_steps=1000,
                 decay_factor=0.8,
             ),
@@ -40,7 +39,7 @@ Example:
         schedule = ParamSchedule(
             param_name="lr",
             schedule_fn=sw.WarmRestarts(
-                base_schedule_fn=cosine_fn,
+                base_schedule_fn=base_fn,
                 initial_cycle_steps=1000,
                 cycle_mult=2.0,
             ),
@@ -74,11 +73,9 @@ class Cyclic:
         Cosine annealing with restarts (skip warmup after first cycle)::
 
             base_fn = WarmupStableDecaySchedule(
-                warmup_steps=100,
-                cooldown_frac=1.0,  # Entire schedule is decay
-                min_value=0.0,
-                max_value=1.0,
-                decay_type="cosine",
+                peak=1.0,
+                warmup_frac=0.1,
+                stable_frac=0.0,  # Warmup then decay
             )
 
             cyclic = Cyclic(

@@ -1,211 +1,253 @@
-"""Tests for training configuration dataclasses."""
+"""Tests for configuration dataclasses."""
+
+import pickle
 
 import pytest
 import torch
-from torch.optim import SGD, AdamW
 
 from research_lib.training.configs import (
+    GradAccumSchedule,
     OptimizerConfig,
-    ParamGroupConfig,
-    TrainingConfig,
-    default_adamw_config,
-    default_muon_config,
+    ScheduleConfig,
+    build_optimizer,
 )
-from research_lib.training.scheduling import WarmupStableDecaySchedule
+from research_lib.training.scheduling import ParamSchedule, WarmupStableDecaySchedule
+
+# =============================================================================
+# Helper Functions for Tests
+# =============================================================================
 
 
-class TestTrainingConfig:
-    """Tests for TrainingConfig dataclass."""
-
-    def test_valid_config(self):
-        """Test creating valid TrainingConfig."""
-        config = TrainingConfig(
-            total_steps=1000,
-            grad_accum_steps=4,
-            gradient_clip_val=1.0,
-        )
-        assert config.total_steps == 1000
-        assert config.grad_accum_steps == 4
-        assert config.gradient_clip_val == 1.0
-
-    def test_defaults(self):
-        """Test TrainingConfig defaults."""
-        config = TrainingConfig(total_steps=1000)
-        assert config.grad_accum_steps == 1
-        assert config.gradient_clip_val == 1.0
-
-    def test_invalid_total_steps(self):
-        """Test that zero/negative total_steps raises ValueError."""
-        with pytest.raises(ValueError, match="total_steps must be positive"):
-            TrainingConfig(total_steps=0)
-
-        with pytest.raises(ValueError, match="total_steps must be positive"):
-            TrainingConfig(total_steps=-10)
-
-    def test_invalid_grad_accum(self):
-        """Test that zero/negative grad_accum raises ValueError."""
-        with pytest.raises(ValueError, match="grad_accum_steps must be positive"):
-            TrainingConfig(total_steps=1000, grad_accum_steps=0)
-
-    def test_invalid_gradient_clip(self):
-        """Test that negative gradient_clip raises ValueError."""
-        with pytest.raises(ValueError, match="gradient_clip_val must be non-negative"):
-            TrainingConfig(total_steps=1000, gradient_clip_val=-0.5)
+def constant_schedule_fn(step: int, total_steps: int) -> float:
+    """Simple constant schedule for testing."""
+    return 0.1
 
 
-class TestParamGroupConfig:
-    """Tests for ParamGroupConfig dataclass."""
+def linear_decay_fn(step: int, total_steps: int) -> float:
+    """Linear decay schedule for testing."""
+    if total_steps <= 0:
+        return 1.0
+    return 1.0 - step / total_steps
 
-    def test_valid_config(self):
-        """Test creating valid ParamGroupConfig."""
-        schedule = WarmupStableDecaySchedule(param_name="lr", warmup_steps=100)
-        config = ParamGroupConfig(
-            group_index=0,
-            schedules=[schedule],
-            param_group_kwargs={"lr": 0.001},
-        )
-        assert config.group_index == 0
-        assert len(config.schedules) == 1
-        assert config.param_group_kwargs == {"lr": 0.001}
 
-    def test_defaults(self):
-        """Test ParamGroupConfig defaults."""
-        config = ParamGroupConfig(group_index=0)
-        assert config.schedules == []
-        assert config.param_group_kwargs is None
-
-    def test_invalid_group_index(self):
-        """Test that negative group_index raises ValueError."""
-        with pytest.raises(ValueError, match="group_index must be non-negative"):
-            ParamGroupConfig(group_index=-1)
+# =============================================================================
+# OptimizerConfig Tests
+# =============================================================================
 
 
 class TestOptimizerConfig:
     """Tests for OptimizerConfig dataclass."""
 
-    def test_missing_lr_raises(self):
-        """Test that missing lr in kwargs raises ValueError."""
-        with pytest.raises(ValueError, match="must include 'lr'"):
-            OptimizerConfig(
-                optimizer_class=AdamW,
-                optimizer_kwargs={"weight_decay": 0.1},  # No lr!
-            )
-
-    def test_build_optimizer(self):
-        """Test building an optimizer from config."""
+    def test_basic_creation(self):
+        """Should create config with required fields."""
         config = OptimizerConfig(
-            optimizer_class=AdamW,
-            optimizer_kwargs={"lr": 0.001, "weight_decay": 0.1},
+            optimizer_class=torch.optim.AdamW,
+            optimizer_kwargs={"lr": 1e-3},
         )
-
-        model = torch.nn.Linear(10, 10)
-        opt = config.build_optimizer(model.parameters())
-
-        assert isinstance(opt, AdamW)
-        assert opt.param_groups[0]["lr"] == 0.001
-        assert opt.param_groups[0]["weight_decay"] == 0.1
-
-    def test_build_optimizer_with_param_group_config(self):
-        """Test building optimizer with ParamGroupConfig overrides."""
-        config = OptimizerConfig(
-            optimizer_class=SGD,
-            optimizer_kwargs={"lr": 0.1},
-            param_group_configs=[
-                ParamGroupConfig(
-                    group_index=0,
-                    param_group_kwargs={"lr": 0.01},  # Override
-                ),
-            ],
-        )
-
-        model = torch.nn.Linear(10, 10)
-        opt = config.build_optimizer(model.parameters())
-
-        # lr should be overridden
-        assert opt.param_groups[0]["lr"] == 0.01
-
-    def test_build_optimizer_invalid_group_index(self):
-        """Test that invalid group_index in ParamGroupConfig raises IndexError."""
-        config = OptimizerConfig(
-            optimizer_class=SGD,
-            optimizer_kwargs={"lr": 0.1},
-            param_group_configs=[
-                ParamGroupConfig(group_index=5),  # Invalid
-            ],
-        )
-
-        model = torch.nn.Linear(10, 10)
-        with pytest.raises(IndexError, match="exceeds optimizer param group count"):
-            config.build_optimizer(model.parameters())
-
-    def test_get_schedules_for_group_global(self):
-        """Test get_schedules_for_group returns global schedules by default."""
-        global_schedule = WarmupStableDecaySchedule(param_name="lr")
-        config = OptimizerConfig(
-            optimizer_class=SGD,
-            optimizer_kwargs={"lr": 0.1},
-            schedules=[global_schedule],
-        )
-
-        schedules = config.get_schedules_for_group(0)
-        assert len(schedules) == 1
-        assert schedules[0] is global_schedule
-
-    def test_get_schedules_for_group_override(self):
-        """Test get_schedules_for_group returns per-group schedules when present."""
-        global_schedule = WarmupStableDecaySchedule(param_name="lr", warmup_steps=100)
-        group_schedule = WarmupStableDecaySchedule(param_name="lr", warmup_steps=50)
-
-        config = OptimizerConfig(
-            optimizer_class=SGD,
-            optimizer_kwargs={"lr": 0.1},
-            schedules=[global_schedule],
-            param_group_configs=[
-                ParamGroupConfig(group_index=0, schedules=[group_schedule]),
-            ],
-        )
-
-        schedules = config.get_schedules_for_group(0)
-        assert len(schedules) == 1
-        assert schedules[0] is group_schedule
-
-        # Group 1 should return global schedules
-        schedules = config.get_schedules_for_group(1)
-        assert len(schedules) == 1
-        assert schedules[0] is global_schedule
-
-
-class TestFactoryFunctions:
-    """Tests for default config factory functions."""
-
-    def test_default_muon_config(self):
-        """Test default_muon_config creates valid config."""
-        config = default_muon_config()
-
-        assert config.optimizer_class == torch.optim.Muon
-        assert config.optimizer_kwargs["lr"] == 0.02
-        assert config.optimizer_kwargs["momentum"] == 0.95
-        assert len(config.schedules) == 2  # lr and momentum
-
-    def test_default_muon_config_custom_values(self):
-        """Test default_muon_config with custom values."""
-        config = default_muon_config(lr=0.05, momentum=0.9)
-
-        assert config.optimizer_kwargs["lr"] == 0.05
-        assert config.optimizer_kwargs["momentum"] == 0.9
-
-    def test_default_adam_config(self):
-        """Test default_adam_config creates valid config."""
-        config = default_adamw_config()
-
         assert config.optimizer_class == torch.optim.AdamW
-        assert config.optimizer_kwargs["lr"] == 0.001
-        assert config.optimizer_kwargs["betas"] == (0.9, 0.95)
-        assert len(config.schedules) == 1  # lr only
+        assert config.optimizer_kwargs == {"lr": 1e-3}
 
-    def test_default_adam_config_custom_values(self):
-        """Test default_adam_config with custom values."""
-        config = default_adamw_config(lr=0.0005, betas=(0.9, 0.999))
+    def test_default_kwargs(self):
+        """Should default kwargs to empty dict."""
+        config = OptimizerConfig(optimizer_class=torch.optim.SGD)
+        assert config.optimizer_kwargs == {}
 
-        assert config.optimizer_kwargs["lr"] == 0.0005
-        assert config.optimizer_kwargs["betas"] == (0.9, 0.999)
+    def test_picklable(self):
+        """Should be picklable for distributed training."""
+        config = OptimizerConfig(
+            optimizer_class=torch.optim.AdamW,
+            optimizer_kwargs={"lr": 1e-3, "betas": (0.9, 0.95)},
+        )
+        restored = pickle.loads(pickle.dumps(config))
+        assert restored.optimizer_class == config.optimizer_class
+        assert restored.optimizer_kwargs == config.optimizer_kwargs
+
+
+# =============================================================================
+# ScheduleConfig Tests
+# =============================================================================
+
+
+class TestScheduleConfig:
+    """Tests for ScheduleConfig dataclass."""
+
+    def test_basic_creation(self):
+        """Should create config with schedules."""
+        schedule = ParamSchedule("lr", constant_schedule_fn)
+        config = ScheduleConfig(global_schedules=[schedule])
+        assert len(config.global_schedules) == 1
+        assert config.group_overrides == {}
+
+    def test_default_empty(self):
+        """Should default to empty schedules."""
+        config = ScheduleConfig()
+        assert config.global_schedules == []
+        assert config.group_overrides == {}
+
+    def test_with_group_overrides(self):
+        """Should store group overrides."""
+        schedule1 = ParamSchedule("lr", constant_schedule_fn)
+        schedule2 = WarmupStableDecaySchedule(param_name="lr", max_value=0.01)
+
+        config = ScheduleConfig(
+            global_schedules=[schedule1],
+            group_overrides={1: [schedule2]},
+        )
+
+        assert len(config.global_schedules) == 1
+        assert 1 in config.group_overrides
+        assert len(config.group_overrides[1]) == 1
+
+    def test_multiple_schedules(self):
+        """Should handle multiple schedules per group."""
+        lr_schedule = WarmupStableDecaySchedule(param_name="lr", max_value=0.1)
+        momentum_schedule = WarmupStableDecaySchedule(
+            param_name="momentum", max_value=0.95
+        )
+
+        config = ScheduleConfig(
+            global_schedules=[lr_schedule, momentum_schedule],
+        )
+
+        assert len(config.global_schedules) == 2
+        param_names = [s.param_name for s in config.global_schedules]
+        assert "lr" in param_names
+        assert "momentum" in param_names
+
+
+# =============================================================================
+# GradAccumSchedule Tests
+# =============================================================================
+
+
+class TestGradAccumSchedule:
+    """Tests for GradAccumSchedule dataclass."""
+
+    def test_basic_creation(self):
+        """Should create schedule with dict."""
+        schedule = GradAccumSchedule({0: 1, 1000: 2, 5000: 4})
+        assert schedule.get_accum(0) == 1
+        assert schedule.get_accum(999) == 1
+        assert schedule.get_accum(1000) == 2
+        assert schedule.get_accum(4999) == 2
+        assert schedule.get_accum(5000) == 4
+        assert schedule.get_accum(10000) == 4
+
+    def test_constant_schedule(self):
+        """Should work for constant accumulation."""
+        schedule = GradAccumSchedule({0: 4})
+        assert schedule.get_accum(0) == 4
+        assert schedule.get_accum(100) == 4
+        assert schedule.get_accum(10000) == 4
+
+    def test_auto_adds_step_zero(self):
+        """Should add step 0 with accum=1 if not specified."""
+        schedule = GradAccumSchedule({1000: 4})
+        assert schedule.get_accum(0) == 1
+        assert schedule.get_accum(999) == 1
+        assert schedule.get_accum(1000) == 4
+
+    def test_empty_schedule_raises(self):
+        """Should raise on empty schedule."""
+        with pytest.raises(ValueError, match="cannot be empty"):
+            GradAccumSchedule({})
+
+    def test_negative_step_raises(self):
+        """Should raise on negative step."""
+        with pytest.raises(ValueError, match="non-negative int"):
+            GradAccumSchedule({-1: 4})
+
+    def test_zero_accum_raises(self):
+        """Should raise on accumulation < 1."""
+        with pytest.raises(ValueError, match=">= 1"):
+            GradAccumSchedule({0: 0})
+
+    def test_negative_accum_raises(self):
+        """Should raise on negative accumulation."""
+        with pytest.raises(ValueError, match=">= 1"):
+            GradAccumSchedule({0: -1})
+
+    def test_picklable(self):
+        """Should be picklable for checkpointing."""
+        schedule = GradAccumSchedule({0: 1, 1000: 4})
+        restored = pickle.loads(pickle.dumps(schedule))
+        assert restored.get_accum(0) == 1
+        assert restored.get_accum(1000) == 4
+
+    def test_boundary_values(self):
+        """Should handle boundary values correctly."""
+        schedule = GradAccumSchedule({0: 1, 100: 2, 200: 4})
+
+        # At exact boundaries
+        assert schedule.get_accum(100) == 2
+        assert schedule.get_accum(200) == 4
+
+        # Just before boundaries
+        assert schedule.get_accum(99) == 1
+        assert schedule.get_accum(199) == 2
+
+        # Just after boundaries
+        assert schedule.get_accum(101) == 2
+        assert schedule.get_accum(201) == 4
+
+
+# =============================================================================
+# build_optimizer Tests
+# =============================================================================
+
+
+class TestBuildOptimizer:
+    """Tests for build_optimizer function."""
+
+    def test_builds_adamw(self):
+        """Should build AdamW optimizer."""
+        config = OptimizerConfig(
+            optimizer_class=torch.optim.AdamW,
+            optimizer_kwargs={"lr": 1e-3},
+        )
+        model = torch.nn.Linear(10, 10)
+        optimizer = build_optimizer(config, model.parameters())
+
+        assert isinstance(optimizer, torch.optim.AdamW)
+        assert optimizer.defaults["lr"] == 1e-3
+
+    def test_builds_sgd(self):
+        """Should build SGD optimizer."""
+        config = OptimizerConfig(
+            optimizer_class=torch.optim.SGD,
+            optimizer_kwargs={"lr": 0.1, "momentum": 0.9},
+        )
+        model = torch.nn.Linear(10, 10)
+        optimizer = build_optimizer(config, model.parameters())
+
+        assert isinstance(optimizer, torch.optim.SGD)
+        assert optimizer.defaults["lr"] == 0.1
+        assert optimizer.defaults["momentum"] == 0.9
+
+    def test_with_param_groups(self):
+        """Should work with param groups."""
+        config = OptimizerConfig(
+            optimizer_class=torch.optim.AdamW,
+            optimizer_kwargs={"lr": 1e-3},
+        )
+        model = torch.nn.Linear(10, 10)
+        param_groups = [
+            {"params": [model.weight], "lr": 1e-2},
+            {"params": [model.bias], "lr": 1e-4},
+        ]
+        optimizer = build_optimizer(config, param_groups)
+
+        assert len(optimizer.param_groups) == 2
+        assert optimizer.param_groups[0]["lr"] == 1e-2
+        assert optimizer.param_groups[1]["lr"] == 1e-4
+
+    def test_builds_with_weight_decay(self):
+        """Should pass weight_decay to optimizer."""
+        config = OptimizerConfig(
+            optimizer_class=torch.optim.AdamW,
+            optimizer_kwargs={"lr": 1e-3, "weight_decay": 0.1},
+        )
+        model = torch.nn.Linear(10, 10)
+        optimizer = build_optimizer(config, model.parameters())
+
+        assert optimizer.defaults["weight_decay"] == 0.1

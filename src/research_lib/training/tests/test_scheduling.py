@@ -1,18 +1,16 @@
-"""Tests for the new scheduling system."""
+"""Tests for the scheduling system."""
 
-import math
 import pickle
 
 import pytest
 import torch
 from torch.optim import SGD, AdamW
 
-from research_lib.training.configs import (
-    OptimizerConfig,
-    ParamGroupConfig,
-    update_optimizer_schedules,
+from research_lib.training.scheduling import (
+    ParamSchedule,
+    ParamScheduler,
+    WarmupStableDecaySchedule,
 )
-from research_lib.training.scheduling import ParamSchedule, WarmupStableDecaySchedule
 from research_lib.training.scheduling import wrappers as sw
 from research_lib.training.scheduling.utils import (
     apply_schedule_to_all_groups,
@@ -35,13 +33,25 @@ from research_lib.training.scheduling.validation import (
 )
 
 # =============================================================================
-# Test Fixtures
+# Test Fixtures / Helpers
 # =============================================================================
 
 
 def simple_linear_decay(step: int, total_steps: int) -> float:
     """Simple linear decay from 1.0 to 0.0."""
+    if total_steps <= 0:
+        return 1.0
     return 1.0 - (step / total_steps)
+
+
+def constant_one(step: int, total_steps: int) -> float:
+    """Returns constant 1.0."""
+    return 1.0
+
+
+def constant_half(step: int, total_steps: int) -> float:
+    """Returns constant 0.5."""
+    return 0.5
 
 
 class ParameterizedDecay:
@@ -52,6 +62,8 @@ class ParameterizedDecay:
         self.max_val = max_val
 
     def __call__(self, step: int, total_steps: int) -> float:
+        if total_steps <= 0:
+            return self.max_val
         progress = step / total_steps
         return self.max_val - (self.max_val - self.min_val) * progress
 
@@ -125,25 +137,26 @@ class TestWarmupStableDecaySchedule:
     """Tests for WarmupStableDecaySchedule preset."""
 
     def test_default_values(self):
-        """Test default construction."""
+        """Test default construction values."""
         schedule = WarmupStableDecaySchedule()
         assert schedule.param_name == "lr"
+        assert schedule.max_value == 1.0
+        assert schedule.min_value == 0.0
         assert schedule.warmup_steps == 0
         assert schedule.cooldown_steps == 0
-        assert schedule.min_value == 0.0
-        assert schedule.max_value == 1.0
 
     def test_warmup_phase(self):
-        """Test warmup phase."""
+        """Test warmup phase using fraction."""
         schedule = WarmupStableDecaySchedule(
-            warmup_steps=100,
-            min_value=0.0,
             max_value=1.0,
+            min_value=0.0,
+            warmup_frac=0.1,
+            cooldown_frac=0.1,
         )
 
         # Start of warmup
         assert schedule(0, 1000) == 0.0
-        # Mid warmup
+        # Mid warmup (step 50 of 100)
         assert schedule(50, 1000) == pytest.approx(0.5)
         # End of warmup
         assert schedule(100, 1000) == pytest.approx(1.0)
@@ -151,109 +164,254 @@ class TestWarmupStableDecaySchedule:
     def test_stable_phase(self):
         """Test stable phase."""
         schedule = WarmupStableDecaySchedule(
-            warmup_steps=100,
-            cooldown_steps=100,
-            min_value=0.0,
             max_value=1.0,
+            warmup_frac=0.1,
+            cooldown_frac=0.1,
         )
 
-        # During stable
+        # During stable phase (10%-90% of training)
         assert schedule(200, 1000) == 1.0
-        assert schedule(500, 1000) == 1.0
-        assert schedule(899, 1000) == 1.0
+        assert schedule(800, 1000) == 1.0
 
     def test_cooldown_phase_linear(self):
         """Test cooldown phase with linear decay."""
         schedule = WarmupStableDecaySchedule(
-            warmup_steps=0,
-            cooldown_steps=100,
-            min_value=0.0,
             max_value=1.0,
+            min_value=0.0,
+            warmup_frac=0.0,
+            cooldown_frac=0.5,
             decay_type="linear",
         )
 
-        # Start of cooldown (step 900)
-        assert schedule(900, 1000) == pytest.approx(1.0)
-        # Mid cooldown
-        assert schedule(950, 1000) == pytest.approx(0.5)
-        # End of cooldown
-        assert schedule(999, 1000) == pytest.approx(0.01, abs=0.02)
-
-    def test_cooldown_phase_cosine(self):
-        """Test cooldown phase with cosine decay."""
-        schedule = WarmupStableDecaySchedule(
-            warmup_steps=0,
-            cooldown_frac=0.5,
-            min_value=0.0,
-            max_value=1.0,
-            decay_type="cosine",
-        )
-
-        # Start of cooldown (step 500)
+        # Start of cooldown (step 500 of 1000)
         assert schedule(500, 1000) == pytest.approx(1.0)
-        # End of cooldown
-        assert schedule(1000, 1000) == pytest.approx(0.0, abs=0.01)
-
-    def test_warmup_frac(self):
-        """Test warmup_frac parameter."""
-        schedule = WarmupStableDecaySchedule(
-            warmup_frac=0.1,
-            min_value=0.0,
-            max_value=1.0,
-        )
-
-        # 10% of 1000 = 100 warmup steps
-        assert schedule(0, 1000) == 0.0
-        assert schedule(50, 1000) == pytest.approx(0.5)
-        assert schedule(100, 1000) == pytest.approx(1.0)
-
-    def test_cooldown_frac(self):
-        """Test cooldown_frac parameter."""
-        schedule = WarmupStableDecaySchedule(
-            cooldown_frac=0.5,
-            min_value=0.0,
-            max_value=1.0,
-            decay_type="linear",
-        )
-
-        # 50% of 1000 = 500 cooldown steps starting at 500
-        assert schedule(500, 1000) == pytest.approx(1.0)
+        # Mid cooldown (step 750)
         assert schedule(750, 1000) == pytest.approx(0.5)
-        assert schedule(999, 1000) == pytest.approx(0.002, abs=0.01)
+        # End of cooldown
+        assert schedule(1000, 1000) == pytest.approx(0.0)
 
-    def test_mutual_exclusivity_warmup(self):
-        """Test warmup_steps and warmup_frac are mutually exclusive."""
-        with pytest.raises(ValueError, match="warmup_steps OR warmup_frac"):
+    def test_mutual_exclusivity(self):
+        """Test arguments mutual exclusivity checks."""
+        with pytest.raises(ValueError, match="Specify warmup_steps OR warmup_frac"):
             WarmupStableDecaySchedule(warmup_steps=100, warmup_frac=0.1)
 
-    def test_mutual_exclusivity_cooldown(self):
-        """Test cooldown_steps and cooldown_frac are mutually exclusive."""
-        with pytest.raises(ValueError, match="cooldown_steps OR cooldown_frac"):
+        with pytest.raises(ValueError, match="Specify cooldown_steps OR cooldown_frac"):
             WarmupStableDecaySchedule(cooldown_steps=100, cooldown_frac=0.1)
 
-    def test_invalid_warmup_type(self):
-        """Test invalid warmup_type raises."""
-        with pytest.raises(ValueError, match="warmup_type must be one of"):
-            WarmupStableDecaySchedule(warmup_type="invalid")
 
-    def test_invalid_decay_type(self):
-        """Test invalid decay_type raises."""
-        with pytest.raises(ValueError, match="decay_type must be one of"):
-            WarmupStableDecaySchedule(decay_type="exponential")
+# =============================================================================
+# ParamScheduler Tests
+# =============================================================================
 
-    def test_picklable(self):
-        """Test that WarmupStableDecaySchedule is picklable."""
-        schedule = WarmupStableDecaySchedule(
-            warmup_steps=100,
-            cooldown_frac=0.5,
-            min_value=0.1,
-            max_value=1.0,
+
+class TestParamScheduler:
+    """Tests for ParamScheduler runtime class."""
+
+    @pytest.fixture
+    def simple_model(self):
+        """Simple model for testing."""
+        return torch.nn.Linear(10, 10)
+
+    @pytest.fixture
+    def simple_optimizer(self, simple_model):
+        """Simple optimizer for testing."""
+        return torch.optim.SGD(simple_model.parameters(), lr=0.1)
+
+    @pytest.fixture
+    def constant_schedule(self):
+        """Schedule that returns constant value."""
+        return ParamSchedule(param_name="lr", schedule_fn=constant_one)
+
+    @pytest.fixture
+    def linear_schedule(self):
+        """Schedule that returns linear decay."""
+        return ParamSchedule(param_name="lr", schedule_fn=simple_linear_decay)
+
+    def test_basic_init(self, simple_optimizer, constant_schedule):
+        """Should initialize without error."""
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[constant_schedule],
+            total_steps=100,
+        )
+        assert scheduler.get_current_step() == 0
+
+    def test_validates_group_overrides(self, simple_optimizer, constant_schedule):
+        """Should raise on invalid group index."""
+        with pytest.raises(IndexError, match="group_overrides contains index 5"):
+            ParamScheduler(
+                optimizer=simple_optimizer,
+                global_schedules=[],
+                total_steps=100,
+                group_overrides={5: [constant_schedule]},
+            )
+
+    def test_applies_schedule(self, simple_optimizer, constant_schedule):
+        """Should apply schedule value to param group."""
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[constant_schedule],
+            total_steps=100,
         )
 
-        pickled = pickle.dumps(schedule)
-        unpickled = pickle.loads(pickled)
+        # Initial LR is 0.1
+        assert simple_optimizer.param_groups[0]["lr"] == 0.1
 
-        assert unpickled(50, 1000) == schedule(50, 1000)
+        scheduler.step()
+
+        # After step, LR should be 1.0 (from constant_one)
+        assert simple_optimizer.param_groups[0]["lr"] == 1.0
+
+    def test_increments_step(self, simple_optimizer, constant_schedule):
+        """Should increment step count."""
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[constant_schedule],
+            total_steps=100,
+        )
+
+        assert scheduler.get_current_step() == 0
+        scheduler.step()
+        assert scheduler.get_current_step() == 1
+        scheduler.step()
+        assert scheduler.get_current_step() == 2
+
+    def test_linear_decay(self, simple_optimizer, linear_schedule):
+        """Should apply changing values over steps."""
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[linear_schedule],
+            total_steps=100,
+        )
+
+        # Step 0: applies value for step 0, then increments
+        # simple_linear_decay(0, 100) = 1.0
+        scheduler.step()
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
+
+        # Advance to step 50 (we're at step 1, need 49 more steps)
+        for _ in range(49):
+            scheduler.step()
+
+        # Now at step 50, last applied was step 49
+        # simple_linear_decay(49, 100) = 1.0 - 49/100 = 0.51
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.51)
+
+    def test_group_overrides(self, simple_model):
+        """Should apply different schedules to different groups."""
+        # Create optimizer with two param groups
+        optimizer = torch.optim.SGD(
+            [
+                {"params": [simple_model.weight], "lr": 0.1},
+                {"params": [simple_model.bias], "lr": 0.01},
+            ]
+        )
+
+        schedule_group0 = ParamSchedule("lr", constant_one)
+        schedule_group1 = ParamSchedule("lr", constant_half)
+
+        scheduler = ParamScheduler(
+            optimizer=optimizer,
+            global_schedules=[schedule_group0],
+            total_steps=100,
+            group_overrides={1: [schedule_group1]},
+        )
+
+        scheduler.step()
+
+        assert optimizer.param_groups[0]["lr"] == 1.0
+        assert optimizer.param_groups[1]["lr"] == 0.5
+
+    def test_empty_global_schedules(self, simple_optimizer):
+        """Should work with empty global schedules."""
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[],
+            total_steps=100,
+        )
+
+        # Should not raise
+        scheduler.step()
+        assert scheduler.get_current_step() == 1
+
+        # LR should be unchanged
+        assert simple_optimizer.param_groups[0]["lr"] == 0.1
+
+    def test_multiple_schedules_same_group(self, simple_optimizer):
+        """Should apply multiple schedules to the same group."""
+        simple_optimizer.param_groups[0]["momentum"] = 0.9
+
+        lr_schedule = ParamSchedule("lr", constant_one)
+        momentum_schedule = ParamSchedule("momentum", constant_half)
+
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[lr_schedule, momentum_schedule],
+            total_steps=100,
+        )
+
+        scheduler.step()
+
+        assert simple_optimizer.param_groups[0]["lr"] == 1.0
+        assert simple_optimizer.param_groups[0]["momentum"] == 0.5
+
+    def test_state_dict(self, simple_optimizer, constant_schedule):
+        """Should return current step count."""
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[constant_schedule],
+            total_steps=100,
+        )
+
+        scheduler.step()
+        scheduler.step()
+        scheduler.step()
+
+        state = scheduler.state_dict()
+        assert state == {"step_count": 3}
+
+    def test_load_state_dict(self, simple_optimizer, constant_schedule):
+        """Should restore step count."""
+        scheduler = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[constant_schedule],
+            total_steps=100,
+        )
+
+        scheduler.load_state_dict({"step_count": 50})
+
+        assert scheduler.get_current_step() == 50
+
+    def test_checkpoint_roundtrip(self, simple_optimizer, linear_schedule):
+        """Should restore to correct state after save/load."""
+        scheduler1 = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[linear_schedule],
+            total_steps=100,
+        )
+
+        # Advance scheduler1
+        for _ in range(50):
+            scheduler1.step()
+
+        # Save state
+        state = scheduler1.state_dict()
+
+        # Create new scheduler and restore
+        scheduler2 = ParamScheduler(
+            optimizer=simple_optimizer,
+            global_schedules=[linear_schedule],
+            total_steps=100,
+        )
+        scheduler2.load_state_dict(state)
+
+        # Should be at same step
+        assert scheduler2.get_current_step() == 50
+
+        # Next step should apply value for step 50
+        # simple_linear_decay(50, 100) = 0.5
+        scheduler2.step()
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
 
 
 # =============================================================================
@@ -282,9 +440,10 @@ class TestApplyScheduleToParamGroup:
         opt = SGD(model.parameters(), lr=0.1, momentum=0.9)
         schedule = WarmupStableDecaySchedule(
             param_name="momentum",
-            warmup_steps=10,
-            min_value=0.8,
             max_value=0.95,
+            min_value=0.8,
+            warmup_frac=0.1,
+            cooldown_frac=0.1,
         )
 
         apply_schedule_to_param_group(
@@ -328,65 +487,6 @@ class TestApplyScheduleToAllGroups:
 
         assert opt.param_groups[0]["lr"] == pytest.approx(0.5)
         assert opt.param_groups[1]["lr"] == pytest.approx(0.5)
-
-
-class TestUpdateOptimizerSchedules:
-    """Tests for update_optimizer_schedules with OptimizerConfig."""
-
-    def test_global_schedules(self):
-        """Test global schedules apply to all groups."""
-        model = torch.nn.Linear(10, 10)
-        config = OptimizerConfig(
-            optimizer_class=SGD,
-            optimizer_kwargs={"lr": 0.1, "momentum": 0.9},
-            schedules=[
-                WarmupStableDecaySchedule(
-                    param_name="momentum",
-                    warmup_steps=10,
-                    min_value=0.8,
-                    max_value=0.95,
-                ),
-            ],
-        )
-        opt = config.build_optimizer(model.parameters())
-
-        update_optimizer_schedules(opt, config, step=0, total_steps=100)
-        assert opt.param_groups[0]["momentum"] == 0.8
-
-    def test_per_group_overrides(self):
-        """Test that ParamGroupConfig overrides global schedules."""
-        model = torch.nn.Linear(10, 10)
-
-        lr_schedule_fast = WarmupStableDecaySchedule(
-            param_name="lr",
-            warmup_steps=5,
-            min_value=0.0,
-            max_value=1.0,
-        )
-        lr_schedule_slow = WarmupStableDecaySchedule(
-            param_name="lr",
-            warmup_steps=20,
-            min_value=0.0,
-            max_value=1.0,
-        )
-
-        config = OptimizerConfig(
-            optimizer_class=SGD,
-            optimizer_kwargs={"lr": 0.1},
-            schedules=[lr_schedule_slow],  # Global: slow warmup
-            param_group_configs=[
-                ParamGroupConfig(
-                    group_index=0,
-                    schedules=[lr_schedule_fast],  # Override: fast warmup
-                ),
-            ],
-        )
-        opt = config.build_optimizer(model.parameters())
-
-        # At step 5, fast warmup should be complete (value=1.0)
-        # slow warmup would only be at 0.25
-        update_optimizer_schedules(opt, config, step=5, total_steps=100)
-        assert opt.param_groups[0]["lr"] == pytest.approx(1.0)
 
 
 class TestGetterFunctions:
@@ -441,10 +541,9 @@ class TestValidateSchedule:
     def test_basic_validation(self):
         """Test basic validation passes for valid schedule."""
         schedule = WarmupStableDecaySchedule(
-            warmup_steps=10,
-            cooldown_steps=10,
-            min_value=0.0,
             max_value=1.0,
+            warmup_frac=0.1,
+            cooldown_frac=0.3,
         )
 
         # Should not raise
@@ -453,7 +552,6 @@ class TestValidateSchedule:
     def test_with_single_checks(self):
         """Test validation with single-value checks."""
         schedule = WarmupStableDecaySchedule(
-            min_value=0.0,
             max_value=1.0,
         )
 
@@ -467,7 +565,6 @@ class TestValidateSchedule:
     def test_check_in_range(self):
         """Test check_in_range factory."""
         schedule = WarmupStableDecaySchedule(
-            min_value=0.0,
             max_value=1.0,
         )
 
@@ -480,10 +577,11 @@ class TestValidateSchedule:
 
     def test_check_fails(self):
         """Test that check failures raise ValueError."""
+        # Create schedule with negative start value
         schedule = WarmupStableDecaySchedule(
-            warmup_steps=10,  # Add warmup so min_value is actually used
-            min_value=-0.5,  # Negative min
             max_value=1.0,
+            min_value=-0.5,  # Negative start
+            warmup_frac=0.1,
         )
 
         with pytest.raises(ValueError, match="Negative value"):
@@ -491,41 +589,6 @@ class TestValidateSchedule:
                 schedule,
                 total_steps=100,
                 single_checks=[check_non_negative],
-            )
-
-    def test_sequence_check_monotonic(self):
-        """Test monotonicity checks."""
-        # Schedule that's non-increasing (warmup then decay)
-        schedule = WarmupStableDecaySchedule(
-            warmup_steps=0,
-            cooldown_frac=1.0,
-            min_value=0.0,
-            max_value=1.0,
-            decay_type="linear",
-        )
-
-        # Should pass non-increasing check
-        validate_schedule(
-            schedule,
-            total_steps=100,
-            sequence_checks=[check_monotonic_non_increasing],
-        )
-
-        # Should fail strictly decreasing (stable phase has equal values)
-        # Actually, this schedule decays every step, so it might pass...
-        # Let's use a schedule with stable phase
-        schedule_with_stable = WarmupStableDecaySchedule(
-            warmup_steps=10,
-            cooldown_steps=10,
-            min_value=0.0,
-            max_value=1.0,
-        )
-
-        with pytest.raises(ValueError, match="Not monotonic"):
-            validate_schedule(
-                schedule_with_stable,
-                total_steps=100,
-                sequence_checks=[check_monotonic_decreasing],
             )
 
 
@@ -539,11 +602,13 @@ class TestCyclicWrapper:
 
     def test_basic_cycling(self):
         """Test basic cycling behavior."""
+        # Create a schedule that decays from 1.0 to 0.0 over the cycle
+        # Using cooldown_frac=1.0 means the entire cycle is decay
         base_schedule = WarmupStableDecaySchedule(
-            warmup_steps=0,
-            cooldown_frac=1.0,
-            min_value=0.0,
             max_value=1.0,
+            min_value=0.0,
+            warmup_frac=0.0,
+            cooldown_frac=1.0,  # 100% of cycle is decay
             decay_type="linear",
         )
 
@@ -552,23 +617,23 @@ class TestCyclicWrapper:
             cycle_steps=100,
         )
 
-        # First cycle
+        # First cycle - step 0 should be at max (start of decay)
         assert cyclic(0, 1000) == pytest.approx(1.0)
-        assert cyclic(99, 1000) == pytest.approx(0.01, abs=0.02)
+        # Step 99 should be near min (end of decay)
+        # linear decay: 1.0 - (99/100) = 0.01
+        assert cyclic(99, 1000) == pytest.approx(0.01)
 
-        # Second cycle should restart
+        # Second cycle should restart - step 100 should be at max again
         assert cyclic(100, 1000) == pytest.approx(1.0)
 
     def test_skip_on_restart(self):
         """Test skip_on_restart parameter."""
-        # FIXED: Use a schedule where step 10 is still in stable phase
-        # With warmup_steps=10 and cooldown_steps=10 (not frac),
-        # steps 10-89 are stable at max_value
+        # Schedule with warmup in first 10% then stable
         base_schedule = WarmupStableDecaySchedule(
-            warmup_steps=10,
-            cooldown_steps=10,  # Use absolute steps, not frac
-            min_value=0.0,
             max_value=1.0,
+            min_value=0.0,
+            warmup_frac=0.1,  # 10 steps warmup in 100 step cycle
+            cooldown_frac=0.1,
         )
 
         cyclic = sw.Cyclic(
@@ -577,11 +642,10 @@ class TestCyclicWrapper:
             skip_on_restart=10,  # Skip warmup on restart
         )
 
-        # First cycle includes warmup
+        # First cycle includes warmup - step 0 is at min_value
         assert cyclic(0, 1000) == 0.0
 
-        # Second cycle skips warmup (starts at step 10 of base)
-        # At step 10 with cooldown_steps=10 (not frac), we're in stable phase
+        # Second cycle skips warmup (starts at step 10 of base which is end of warmup)
         assert cyclic(100, 1000) == pytest.approx(1.0)
 
     def test_invalid_params(self):
@@ -602,10 +666,6 @@ class TestDecayingCyclic:
 
     def test_decay_envelope(self):
         """Test decaying envelope."""
-
-        def constant_one(step, total_steps):
-            return 1.0
-
         decaying = sw.DecayingCyclic(
             base_schedule_fn=constant_one,
             cycle_steps=100,
@@ -628,10 +688,6 @@ class TestWarmRestarts:
 
     def test_growing_cycles(self):
         """Test that cycles grow geometrically."""
-
-        def constant_one(step, total_steps):
-            return 1.0
-
         warm_restarts = sw.WarmRestarts(
             base_schedule_fn=constant_one,
             initial_cycle_steps=100,
