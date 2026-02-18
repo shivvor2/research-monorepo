@@ -1,0 +1,41 @@
+# =============================================================================
+# Quick Sanity Check Config
+# =============================================================================
+# Usage:
+#   python 02_pretrain.py --config-name=test
+#   python 02_pretrain.py --config-name=test training.max_steps=50
+# =============================================================================
+
+defaults:
+  - config  # Inherit from main config, then override below
+
+experiment:
+  name: nanogpt_base_test
+
+checkpoint:
+  resume_from: auto  # Don't auto-resume tests by default
+
+# Override for quick testing
+training:
+  max_steps: 100
+  grad_accum: 2          # Smaller accumulation for speed
+  val_check_interval: 25
+  log_every_n_steps: 5
+  checkpoint_every_n_steps: 50
+  save_top_k: 1
+
+data:
+  batch_size: 2          # Smaller batch for memory safety
+  num_workers: 0         # Avoid multiprocessing issues in tests
+
+logging:
+  wandb:
+    enabled: false       # Don't pollute WandB with test runs
+  csv:
+    enabled: true
+    save_dir: logs/test_csv
+
+# Use test output directory
+hydra:
+  run:
+    dir: outputs/test/${now:%H-%M-%S}
