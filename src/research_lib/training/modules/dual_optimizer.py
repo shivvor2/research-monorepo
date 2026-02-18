@@ -457,7 +457,14 @@ class DualOptimizerModule(L.LightningModule):
                         return self.alpha * ce_loss + (1 - self.alpha) * kl_loss
         """
         logits = model_output
-        labels = batch.get("labels", batch["input_ids"])
+
+        # Prefer Labels keys, fallback to input_ids (auto_regressive)
+        if "labels" in batch:
+            labels = batch["labels"]
+        elif "input_ids" in batch:
+            labels = batch["input_ids"]
+        else:
+            raise KeyError("Batch must contain 'labels' or 'input_ids' for Causal LM")
 
         # Causal LM: predict next token (shift by 1)
         shift_logits = logits[..., :-1, :].contiguous()
@@ -494,8 +501,7 @@ class DualOptimizerModule(L.LightningModule):
         should_step = (batch_idx + 1) % grad_accum == 0
 
         # Forward pass
-        input_ids = batch["input_ids"]
-        model_output = self.forward(input_ids)
+        model_output = self.forward(**batch)
 
         # Compute loss via (overridable) method
         loss = self.compute_loss(model_output, batch)
