@@ -149,7 +149,7 @@ class ShardedTokenDataset(IterableDataset):
                 chunk = tokens[i : i + effective_seq_len]
                 yield {
                     "input_ids": chunk[:-1],  # (seq_len,)
-                    "labels": chunk[1:],  # (seq_len,) shifted
+                    # "labels": chunk[1:],  # (seq_len,) shifted
                 }
 
 
