@@ -28,6 +28,7 @@ dependencies = [
 
     # Pytorch lightning (trainer) and ecosystem
     "lightning",
+    "rich", # required for RichProgressBar
 
     # Model Optimization
     "bitsandbytes",
