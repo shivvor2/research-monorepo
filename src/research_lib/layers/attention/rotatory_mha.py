@@ -2,7 +2,7 @@
 Drop-in replacement for nn.MultiheadAttention with Rotary Position Embeddings.
 """
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
@@ -37,6 +37,11 @@ class RotaryMultiheadAttention(nn.Module):
         xpos_scale_base: Base scale for xPos decay. Default: 512.
         interpolate_factor: Factor for NTK-aware interpolation to extend context length.
                             Default: 1.0 (no interpolation).
+        qk_norm: Normalization layer applied to query and key projections before
+                 applying rotary embeddings. This stabilizes training by decoupling
+                 vector magnitude from the attention mechanism (Q-K Norm).
+                 Accepts a class (e.g., nn.LayerNorm), a factory callable taking head_dim
+                 as input, or None to disable. Default: nn.RMSNorm.
 
     Examples:
         >>> # Basic usage
@@ -70,9 +75,14 @@ class RotaryMultiheadAttention(nn.Module):
         # RoPE-specific arguments (lucidrains implementation)
         rotary_dim: Optional[int] = None,
         rotary_base: float = 10000.0,
-        use_xpos: bool = False,  # NEW: length extrapolation
-        xpos_scale_base: int = 512,  # NEW: xpos scale base
-        interpolate_factor: float = 1.0,  # NEW: context extension (NTK-aware)
+        use_xpos: bool = False,  # length extrapolation
+        xpos_scale_base: int = 512,  # xpos scale base
+        interpolate_factor: float = 1.0,  # context extension (NTK-aware)
+        qk_norm: Union[  # Same norm type for both q and k duh
+            Type[nn.Module],
+            Callable[[int], nn.Module],  # Factory: head_dim -> Module
+            None,
+        ] = nn.RMSNorm,
     ) -> None:
         super().__init__()
 
@@ -157,6 +167,8 @@ class RotaryMultiheadAttention(nn.Module):
         )
         self.use_xpos = use_xpos
 
+        self._setup_qk_norm(qk_norm, device, dtype)
+
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
@@ -210,6 +222,41 @@ class RotaryMultiheadAttention(nn.Module):
             )
 
         return q, k
+
+    def _setup_qk_norm(
+        self,
+        qk_norm: Union[Type[nn.Module], Callable[[int], nn.Module], None],
+        device: Optional[torch.device],
+        dtype: Optional[torch.dtype],
+    ) -> None:
+        """Initialize QK-norm layers applied before rotary embeddings."""
+
+        # None case
+        if qk_norm is None:
+            self.q_norm = nn.Identity()
+            self.k_norm = nn.Identity()
+            self.qk_norm_str = "None"
+            return
+
+        # Main init logic
+        if isinstance(qk_norm, type) and issubclass(qk_norm, nn.Module):
+            try:
+                self.q_norm = qk_norm(self.head_dim, device=device, dtype=dtype)
+                self.k_norm = qk_norm(self.head_dim, device=device, dtype=dtype)
+            except TypeError:
+                self.q_norm = qk_norm(self.head_dim)
+                self.k_norm = qk_norm(self.head_dim)
+        elif callable(qk_norm):
+            self.q_norm = qk_norm(self.head_dim)
+            self.k_norm = qk_norm(self.head_dim)
+        else:
+            raise TypeError(
+                f"qk_norm must be None, Type[nn.Module], or Callable[[int], nn.Module]. "
+                f"Got {type(qk_norm)}"
+            )
+
+        # String representation (q and k norm have same type)
+        self.qk_norm_str = self.q_norm.__class__.__name__
 
     def forward(
         self,
@@ -309,6 +356,10 @@ class RotaryMultiheadAttention(nn.Module):
             v = v.view(batch_size, src_len, self.num_heads, self.head_dim).transpose(
                 1, 2
             )
+
+        # Apply QK Norm
+        q = self.q_norm(q)
+        k = self.k_norm(k)
 
         # Apply rotary embeddings to Q and K
         q, k = self._apply_rotary(q, k, seq_dim=-2, offset=seqlen_offset)
@@ -450,4 +501,5 @@ class RotaryMultiheadAttention(nn.Module):
             f"head_dim={self.head_dim}, "
             f"kdim={self.kdim}, "
             f"vdim={self.vdim})"
+            f"qk_norm={self.qk_norm_str})"
         )

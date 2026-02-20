@@ -388,6 +388,249 @@ class TestRotaryMultiheadAttention:
         assert torch.allclose(output_sdpa, output_manual, atol=1e-4, rtol=1e-4)
 
 
+class TestQKNorm:
+    """Test suite for QK-Norm functionality."""
+
+    @pytest.fixture
+    def default_config(self):
+        return {
+            "embed_dim": 256,
+            "num_heads": 8,
+            "dropout": 0.0,
+            "bias": True,
+            "batch_first": True,
+        }
+
+    @pytest.fixture
+    def sample_input(self):
+        batch_size = 4
+        seq_len = 32
+        embed_dim = 256
+        return torch.randn(batch_size, seq_len, embed_dim)
+
+    # =========================================================================
+    # Initialization Tests
+    # =========================================================================
+
+    def test_default_qk_norm_is_rmsnorm(self, default_config):
+        """Test that default qk_norm is nn.RMSNorm."""
+        attn = RotaryMultiheadAttention(**default_config)
+
+        assert attn.q_norm is not None
+        assert attn.k_norm is not None
+        assert isinstance(attn.q_norm, nn.RMSNorm)
+        assert isinstance(attn.k_norm, nn.RMSNorm)
+
+    def test_qk_norm_none_disables(self, default_config):
+        """Test that qk_norm=None uses Identity layers."""
+        config = {**default_config, "qk_norm": None}
+        attn = RotaryMultiheadAttention(**config)
+
+        # Change: Expect Identity, not None
+        assert isinstance(attn.q_norm, nn.Identity)
+        assert isinstance(attn.k_norm, nn.Identity)
+        assert attn.qk_norm_str == "None"
+
+    def test_qk_norm_layernorm(self, default_config):
+        """Test using nn.LayerNorm for QK-norm."""
+        config = {**default_config, "qk_norm": nn.LayerNorm}
+        attn = RotaryMultiheadAttention(**config)
+
+        assert isinstance(attn.q_norm, nn.LayerNorm)
+        assert isinstance(attn.k_norm, nn.LayerNorm)
+        assert attn.q_norm.normalized_shape == (attn.head_dim,)
+
+    def test_qk_norm_factory_callable(self, default_config):
+        """Test using a factory callable for custom norm initialization."""
+        custom_eps = 1e-5
+        config = {
+            **default_config,
+            "qk_norm": lambda dim: nn.LayerNorm(
+                dim, eps=custom_eps, elementwise_affine=False
+            ),
+        }
+        attn = RotaryMultiheadAttention(**config)
+
+        assert isinstance(attn.q_norm, nn.LayerNorm)
+        assert isinstance(attn.k_norm, nn.LayerNorm)
+        assert attn.q_norm.eps == custom_eps
+        assert attn.q_norm.elementwise_affine is False
+
+    def test_qk_norm_separate_parameters(self, default_config):
+        """Test that Q and K norms have separate learnable parameters."""
+        attn = RotaryMultiheadAttention(**default_config)
+
+        # They should be different module instances
+        assert attn.q_norm is not attn.k_norm
+
+        # Modify one, check the other is unchanged
+        if hasattr(attn.q_norm, "weight") and attn.q_norm.weight is not None:
+            original_k_weight = attn.k_norm.weight.clone()
+            attn.q_norm.weight.data.fill_(999.0)
+            assert torch.allclose(attn.k_norm.weight, original_k_weight)
+
+    def test_qk_norm_correct_shape(self, default_config):
+        """Test that QK-norm is initialized with head_dim, not embed_dim."""
+        attn = RotaryMultiheadAttention(**default_config)
+        head_dim = default_config["embed_dim"] // default_config["num_heads"]
+
+        # RMSNorm stores normalized_shape
+        assert attn.q_norm.normalized_shape == (head_dim,)
+        assert attn.k_norm.normalized_shape == (head_dim,)
+
+    def test_qk_norm_invalid_type_raises(self, default_config):
+        """Test that invalid qk_norm type raises TypeError."""
+        config = {**default_config, "qk_norm": "invalid"}
+
+        with pytest.raises(TypeError, match="qk_norm must be"):
+            RotaryMultiheadAttention(**config)
+
+    # =========================================================================
+    # Forward Pass Tests
+    # =========================================================================
+
+    def test_forward_with_qk_norm(self, default_config, sample_input):
+        """Test forward pass with QK-norm enabled."""
+        attn = RotaryMultiheadAttention(**default_config)
+        x = sample_input
+
+        output, weights = attn(x, x, x, need_weights=True)
+
+        assert output.shape == x.shape
+        assert weights is not None
+
+    def test_forward_without_qk_norm(self, default_config, sample_input):
+        """Test forward pass with QK-norm disabled."""
+        config = {**default_config, "qk_norm": None}
+        attn = RotaryMultiheadAttention(**config)
+        x = sample_input
+
+        output, weights = attn(x, x, x, need_weights=True)
+
+        assert output.shape == x.shape
+
+    def test_qk_norm_affects_output(self, default_config, sample_input):
+        """Test that QK-norm actually changes the output."""
+        torch.manual_seed(42)
+        attn_with_norm = RotaryMultiheadAttention(**default_config)
+
+        torch.manual_seed(42)
+        config_no_norm = {**default_config, "qk_norm": None}
+        attn_without_norm = RotaryMultiheadAttention(**config_no_norm)
+
+        x = sample_input
+
+        with torch.no_grad():
+            output_with, _ = attn_with_norm(x, x, x, need_weights=False)
+            output_without, _ = attn_without_norm(x, x, x, need_weights=False)
+
+        # Outputs should differ due to normalization
+        assert not torch.allclose(output_with, output_without, atol=1e-5)
+
+    def test_qk_norm_applied_before_rope(self, default_config, sample_input):
+        """Test that QK-norm is applied before rotary embeddings."""
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+        x = sample_input
+
+        # Track call order
+        call_order = []
+
+        # 1. Wrap q_norm in a tracking Module (must be nn.Module to satisfy PyTorch assignment)
+        original_q_norm = attn.q_norm
+
+        class MockNorm(nn.Module):
+            def forward(self, x):
+                call_order.append("qk_norm")
+                return original_q_norm(x)
+
+        attn.q_norm = MockNorm()
+
+        # 2. Monkey patch _apply_rotary (This is a method, not a submodule, so function assignment is fine)
+        original_apply_rotary = attn._apply_rotary
+
+        def tracked_rotary(q, k, **kwargs):
+            call_order.append("rotary")
+            return original_apply_rotary(q, k, **kwargs)
+
+        attn._apply_rotary = tracked_rotary
+
+        with torch.no_grad():
+            attn(x, x, x, need_weights=False)
+
+        # Verify order
+        assert "qk_norm" in call_order
+        assert "rotary" in call_order
+        # Ensure qk_norm happened before rotary
+        assert call_order.index("qk_norm") < call_order.index("rotary")
+
+    # =========================================================================
+    # Gradient Tests
+    # =========================================================================
+
+    def test_qk_norm_gradients_flow(self, default_config, sample_input):
+        """Test that gradients flow through QK-norm parameters."""
+        attn = RotaryMultiheadAttention(**default_config)
+        x = sample_input.requires_grad_(True)
+
+        output, _ = attn(x, x, x, need_weights=False, is_causal=True)
+        loss = output.sum()
+        loss.backward()
+
+        # Check that norm parameters received gradients
+        assert attn.q_norm.weight.grad is not None
+        assert attn.k_norm.weight.grad is not None
+        assert not torch.all(attn.q_norm.weight.grad == 0)
+
+    def test_qk_norm_parameters_in_module(self, default_config):
+        """Test that QK-norm parameters are registered in the module."""
+        attn = RotaryMultiheadAttention(**default_config)
+
+        param_names = [name for name, _ in attn.named_parameters()]
+
+        assert any("q_norm" in name for name in param_names)
+        assert any("k_norm" in name for name in param_names)
+
+    # =========================================================================
+    # Device and Dtype Tests
+    # =========================================================================
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_qk_norm_cuda(self, default_config, sample_input):
+        """Test QK-norm works on CUDA."""
+        attn = RotaryMultiheadAttention(**default_config).cuda()
+        x = sample_input.cuda()
+
+        output, _ = attn(x, x, x, need_weights=False)
+
+        assert output.device.type == "cuda"
+        assert attn.q_norm.weight.device.type == "cuda"
+
+    def test_qk_norm_dtype_propagation(self, default_config):
+        """Test that QK-norm respects dtype parameter."""
+        config = {**default_config, "dtype": torch.float64}
+        attn = RotaryMultiheadAttention(**config)
+
+        assert attn.q_norm.weight.dtype == torch.float64
+        assert attn.k_norm.weight.dtype == torch.float64
+
+    # =========================================================================
+    # Repr Test
+    # =========================================================================
+
+    def test_repr_includes_qk_norm(self, default_config):
+        """Test that __repr__ includes QK-norm information."""
+        attn = RotaryMultiheadAttention(**default_config)
+        repr_str = repr(attn)
+
+        assert "qk_norm=RMSNorm" in repr_str
+
+        attn_no_norm = RotaryMultiheadAttention(**{**default_config, "qk_norm": None})
+        repr_str_no_norm = repr(attn_no_norm)
+
+        assert "qk_norm=None" in repr_str_no_norm
+
+
 class TestRotaryMultiheadAttentionIntegration:
     """Integration tests with TransformerBlock-like usage."""
 
