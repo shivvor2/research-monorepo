@@ -453,6 +453,88 @@ class TestComputeLoss:
 class TestDualOptimizerModuleTrainingCPU:
     """Tests that run on CPU."""
 
+    def test_grad_clipping_called_for_each_optimizer(self):
+        """clip_gradients should run once per optimizer when enabled."""
+
+        class CountingClipModule(DualOptimizerModule):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.clip_calls = []
+
+            def clip_gradients(
+                self, optimizer, gradient_clip_val, gradient_clip_algorithm
+            ):
+                # Record the call; no need to delegate to super() for this test.
+                self.clip_calls.append(
+                    (gradient_clip_val, gradient_clip_algorithm, optimizer)
+                )
+
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
+        module = CountingClipModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn", "mlp"],
+            grad_clip_val=0.5,
+            grad_clip_algo="norm",
+        )
+
+        trainer = L.Trainer(
+            accelerator="cpu",
+            max_steps=2,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+        )
+        dataloader = create_dummy_dataloader(batch_size=2, num_batches=10)
+        trainer.fit(module, dataloader)
+
+        num_opts = int(module._has_matrix_params) + int(module._has_vector_params)
+        assert module._optimizer_step_count == 2
+        assert len(module.clip_calls) == module._optimizer_step_count * num_opts
+        assert all(val == 0.5 for val, _, _ in module.clip_calls)
+        assert all(algo == "norm" for _, algo, _ in module.clip_calls)
+
+    def test_grad_clipping_not_called_when_disabled(self):
+        """clip_gradients must not run if grad_clip_val is None."""
+
+        class FailingClipModule(DualOptimizerModule):
+            def clip_gradients(
+                self, optimizer, gradient_clip_val, gradient_clip_algorithm
+            ):
+                raise AssertionError(
+                    "clip_gradients should not be called when disabled"
+                )
+
+        model = SimpleModel()
+        opt_config, schedule_config = create_simple_configs()
+
+        module = FailingClipModule(
+            model=model,
+            matrix_optimizer_config=opt_config,
+            vector_optimizer_config=opt_config,
+            matrix_schedule_config=schedule_config,
+            vector_schedule_config=schedule_config,
+            matrix_target_modules=["attn", "mlp"],
+            grad_clip_val=None,
+        )
+
+        trainer = L.Trainer(
+            accelerator="cpu",
+            max_steps=2,
+            enable_checkpointing=False,
+            logger=False,
+            enable_progress_bar=False,
+        )
+        dataloader = create_dummy_dataloader(batch_size=2, num_batches=10)
+
+        trainer.fit(module, dataloader)
+        assert module._optimizer_step_count == 2
+
     def test_training_step_cpu(self):
         """Test training step on CPU."""
         model = SimpleModel()

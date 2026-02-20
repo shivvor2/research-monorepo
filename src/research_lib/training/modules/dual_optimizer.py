@@ -11,8 +11,9 @@ Design Decisions:
        with different stepping patterns.
 
     2. **Trainer is the config surface**: Training loop params (max_steps,
-       gradient_clip_val, accumulate_grad_batches) are read from Trainer at
-       runtime, not from custom config classes.
+       accumulate_grad_batches) are read from Trainer at runtime, not from
+       custom config classes. Gradient clipping is the exception because
+       Lightning disables it when manual optimization happens
 
     3. **Late binding**: ParamSchedulers are created in on_fit_start() after
        the Trainer is attached and optimizers exist.
@@ -84,7 +85,7 @@ See Also:
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import lightning as L
 import torch
@@ -107,8 +108,12 @@ from ..scheduling.utils import get_current_lr, get_param_value
 class DualOptimizerModule(L.LightningModule):
     """Lightning module for training with two optimizers.
 
-    Training parameters (max_steps, gradient_clip_val, accumulate_grad_batches)
-    are read from the Trainer at runtime. Do not duplicate them in configs.
+    Training parameters (max_steps, accumulate_grad_batches) are read from the
+    Trainer at runtime. Do not duplicate them in configs.
+
+    Gradient clipping must be configured on this
+    module because Lightning disables automatic clipping when manual
+    optimization is enabled.
 
     This module handles:
         - Parameter partitioning based on target_modules
@@ -134,6 +139,9 @@ class DualOptimizerModule(L.LightningModule):
         matrix_schedule_config: Parameter schedules for matrix optimizer.
         vector_schedule_config: Parameter schedules for vector optimizer.
         grad_accum_schedule: Optional override for trainer.accumulate_grad_batches.
+        gradient
+        grad_clip_val: Value in which the gradient is clipped
+        grad_clip_algo: Algorithm used for clipping, either "norm" or "value"
 
     Note:
         Lightning's ``global_step`` counter increments on each ``optimizer.step()``
@@ -153,6 +161,8 @@ class DualOptimizerModule(L.LightningModule):
         vector_target_modules: Optional[List[str]] = None,
         grad_accum: Optional[int] = None,
         grad_accum_schedule: Optional[GradAccumSchedule] = None,
+        grad_clip_val: Optional[Union[int, float]] = None,
+        grad_clip_algo: str = "norm",
     ) -> None:
         """Initialize the dual optimizer module.
 
@@ -171,6 +181,8 @@ class DualOptimizerModule(L.LightningModule):
                 with grad_accum_schedule. If neither is provided, defaults to 1.
             grad_accum_schedule: Step-based gradient accumulation schedule.
                 Mutually exclusive with grad_accum.
+            grad_clip_val: Optional gradient-clipping value. Default: None.
+            grad_clip_algo: "norm" or "value". Default: "norm".
 
         Raises:
             ValueError: If both matrix_target_modules and vector_target_modules provided.
@@ -259,6 +271,10 @@ class DualOptimizerModule(L.LightningModule):
 
         # Pending scheduler states from checkpoint (loaded in on_fit_start)
         self._pending_scheduler_states: Optional[Dict[str, Any]] = None
+
+        # Gradient clipping
+        self.gradient_clip_value = grad_clip_val
+        self.gradient_clip_algorithm = grad_clip_algo
 
         # Save hyperparameters for logging (exclude model and configs with classes)
         self.save_hyperparameters(ignore=["model"])
@@ -515,14 +531,12 @@ class DualOptimizerModule(L.LightningModule):
         # Step optimizers if accumulation complete
         if should_step:
             # Gradient clipping via trainer
-            clip_val = self.trainer.gradient_clip_val
-            if clip_val and clip_val > 0:
-                clip_algo = self.trainer.gradient_clip_algorithm or "norm"
+            if self.gradient_clip_value is not None and self.gradient_clip_value > 0:
                 for opt in opts:
                     self.clip_gradients(
-                        opt,
-                        gradient_clip_val=clip_val,
-                        gradient_clip_algorithm=clip_algo,
+                        opt,  # lightning supports passing list of optimizers
+                        gradient_clip_val=self.gradient_clip_value,
+                        gradient_clip_algorithm=self.gradient_clip_algorithm,
                     )
 
             # Step all optimizers - only first one should increment global_step
