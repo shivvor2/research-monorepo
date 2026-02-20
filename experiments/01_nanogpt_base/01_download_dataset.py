@@ -5,7 +5,7 @@ This script downloads GPT-2 tokenized shards of FineWeb-Edu from HuggingFace.
 Data is cached in ~/.cache/huggingface/hub/ (no duplicates across projects).
 
 Usage:
-    python 01_download_dataset.py [num_shards]
+    python path/to/01_download_dataset.py [num_shards]
 
     num_shards: Number of training shards to download (1-99).
                 Each shard is ~100M tokens.
@@ -13,10 +13,10 @@ Usage:
 
 Examples:
     # Download full dataset (~10B tokens)
-    python 01_download_dataset.py
+    python path/to/01_download_dataset.py
 
     # Download 10 shards (~1B tokens) for testing
-    python 01_download_dataset.py 10
+    python path/to/01_download_dataset.py 10
 
 Requirements:
     - HF_TOKEN in .env file (optional, dataset is public)

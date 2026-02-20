@@ -41,6 +41,12 @@ from research_lib.training.modules import DualOptimizerModule
 from research_lib.training.scheduling import WarmupStableDecaySchedule
 
 # =============================================================================
+# Torch Flags
+# =============================================================================
+
+torch.set_float32_matmul_precision("high")
+
+# =============================================================================
 # Parameter Targeting
 # =============================================================================
 
@@ -52,6 +58,8 @@ VECTOR_TARGET_MODULES: List[str] = [
     "norm_1",  # Post-attention RMSNorm
     "norm_2",  # Post-FFN RMSNorm
     "norm_f",  # Final RMSNorm
+    "q_norm",  # QK-Norm query normalization (1D)
+    "k_norm",  # QK-Norm key normalization (1D)
 ]
 
 
@@ -283,6 +291,7 @@ def create_training_module(
         vector_schedule_config=vector_schedule_config,
         vector_target_modules=VECTOR_TARGET_MODULES,
         grad_accum=cfg.training.grad_accum,
+        grad_clip_val=cfg.training.grad_clip_val,
     )
 
     return module
@@ -295,7 +304,7 @@ def create_callbacks(cfg: DictConfig) -> List:
         ExperimentStateCallback(cfg.experiment.name),
         # Standard Checkpointing
         ModelCheckpoint(
-            dirpath=cfg.training.checkpoint_dir,
+            dirpath=cfg.checkpoint.dir,
             filename="step_{step:06d}",
             save_top_k=cfg.training.save_top_k,
             monitor="val/loss",
@@ -377,6 +386,7 @@ def main(cfg: DictConfig) -> None:
 
     print("\n[3/4] Creating data module...")
     datamodule = FineWebDataModule(
+        num_train_shards=cfg.training.get("num_train_shards", 99),
         seq_len=cfg.data.seq_len,
         batch_size=cfg.data.batch_size,
         num_workers=cfg.data.num_workers,
@@ -390,9 +400,9 @@ def main(cfg: DictConfig) -> None:
     # Create trainer
     trainer = L.Trainer(
         max_steps=cfg.training.max_steps,
+        limit_val_batches=cfg.training.get("limit_val_batches", 1.0),
         val_check_interval=cfg.training.val_check_interval,
         precision=cfg.training.precision,
-        gradient_clip_val=cfg.training.gradient_clip_val,
         callbacks=callbacks,
         logger=loggers,
         accelerator="auto",

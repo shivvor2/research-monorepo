@@ -48,7 +48,7 @@ model:
 # -----------------------------------------------------------------------------
 data:
   seq_len: 1024
-  batch_size: 4          # Physical batch (limited by 12GB VRAM)
+  batch_size: 8          # Physical batch (limited by 12GB VRAM)
   num_workers: 4
 
 # -----------------------------------------------------------------------------
@@ -58,16 +58,23 @@ training:
   # Steps calculated for full FineWeb-10B:
   # 10B tokens / (4 * 1024 * 16) ≈ 150,000 steps
   max_steps: 150000
-  grad_accum: 16         # Effective batch = 4 * 16 * 1024 = 65,536 tokens
-  gradient_clip_val: 1.0
+  grad_accum: 16        # Effective batch = 4 * 16 * 1024 = 65,536 tokens
+  grad_clip_val: 1.0
   precision: bf16-mixed
 
   val_check_interval: 1000
+  limit_val_batches: 100
   log_every_n_steps: 10
 
   # Checkpoint frequency (writing to checkpoint.dir)
   checkpoint_every_n_steps: 1000
   save_top_k: 3
+
+  # Number of training shards for fineweb dataset
+  num_train_shards: 99 # All (99) shards
+
+  # Limit validation steps
+
 
 # -----------------------------------------------------------------------------
 # Logging
@@ -75,7 +82,7 @@ training:
 logging:
   # WandB (set project_name to null to disable)
   wandb:
-    enabled: true
+    enabled: false
     project: nanogpt-baseline
     name: null           # Auto-generated if null
 
@@ -98,17 +105,15 @@ optimizer:
     schedule:
       lr:
         warmup_frac: 0.01
-        stable_frac: 0.79
         cooldown_frac: 0.20
         min_value: 0.0
-        max_value: ${..lr}
+        max_value: ${optimizer.matrix.lr}
         decay_type: cosine
       momentum:
         warmup_frac: 0.01
-        stable_frac: 0.79
         cooldown_frac: 0.20
         min_value: 0.85
-        max_value: ${..momentum}
+        max_value: ${optimizer.matrix.momentum}
         decay_type: linear
 
 # -----------------------------------------------------------------------------
@@ -123,10 +128,9 @@ optimizer:
     schedule:
       lr:
         warmup_frac: 0.01
-        stable_frac: 0.79
         cooldown_frac: 0.20
         min_value: 0.0
-        max_value: ${..lr}
+        max_value: ${optimizer.vector.lr}
         decay_type: cosine
 
 # -----------------------------------------------------------------------------
