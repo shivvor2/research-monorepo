@@ -6,6 +6,7 @@ This suite is designed for PyTorch optimizers, it should be stateless where poss
 
 Everything here is well-tested via `tests/test_scheduling.py`.
 
+
 ## Directory Structure
 
 ```
@@ -137,5 +138,11 @@ validate_schedule(
     sequence_checks=[check_monotonic_non_increasing],
 )
 ```
+
+### Checkpointing
+
+When loading checkpoints containing schedule objects, use `weights_only=False` in `torch.load()` or `trainer.fit()`.
+
+---
 
 For more details, see docstrings in `__init__.py`, `schedules.py`, etc.
