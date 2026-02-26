@@ -713,8 +713,8 @@ def summarize_partition(
         └── Frozen: 3,345,678 (21.8%)
 
         Trainable Parameters by Optimizer:
-        ├── Matrix optimizer (target): 9,500,000 (79.2% of trainable)
-        └── Vector optimizer (other): 2,500,000 (20.8% of trainable)
+        ├── Targetted Parameters: 9,500,000 (79.2% of trainable)
+        └── Other Parameters: 2,500,000 (20.8% of trainable)
         ...
     """
     # Get overall counts
@@ -754,14 +754,14 @@ def summarize_partition(
         f"└── Frozen: {counts.frozen:,} ({frozen_pct:.1f}%)",
         "",
         "Trainable Parameters by Optimizer:",
-        f"├── Matrix optimizer (target): {target_count:,} ({target_pct:.1f}% of trainable)",
-        f"└── Vector optimizer (other): {other_count:,} ({other_pct:.1f}% of trainable)",
+        f"├── Targetted Parameters: {target_count:,} ({target_pct:.1f}% of trainable)",
+        f"└── Other Parameters: {other_count:,} ({other_pct:.1f}% of trainable)",
     ]
 
     # Add target parameter samples
     if target_named:
         lines.append("")
-        lines.append("Target parameters (matrix optimizer):")
+        lines.append("Targetted parameters:")
         for name, param in target_named[:max_params_to_show]:
             lines.append(f"  {name}: {tuple(param.shape)}")
         if len(target_named) > max_params_to_show:
@@ -770,7 +770,7 @@ def summarize_partition(
     # Add other parameter samples
     if other_named:
         lines.append("")
-        lines.append("Other parameters (vector optimizer):")
+        lines.append("Other parameters:")
         for name, param in other_named[:max_params_to_show]:
             lines.append(f"  {name}: {tuple(param.shape)}")
         if len(other_named) > max_params_to_show:
