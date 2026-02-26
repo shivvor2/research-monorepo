@@ -1,7 +1,14 @@
+# Experiment state files (auto-resume pointers)
+.latest_run_*.txt
+.latest_run_*.completed.txt
+
+# Hydra outputs
+**/outputs/
+
 # Keep Logging/ checkpointing local
 logs/*
 checkpoints/*
-outputs/
+
 
 # Training Data
 data/*

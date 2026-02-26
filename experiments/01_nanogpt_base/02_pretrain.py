@@ -39,6 +39,7 @@ from research_lib.optimizers import CautiousAdamW, NorMuon
 from research_lib.training.configs import OptimizerConfig, ScheduleConfig
 from research_lib.training.modules import DualOptimizerModule
 from research_lib.training.scheduling import WarmupStableDecaySchedule
+from research_lib.utils.secrets import check_auth
 
 # =============================================================================
 # Torch Flags
@@ -167,6 +168,15 @@ class ExperimentStateCallback(Callback):
             state_file.write_text(str(rel_path))
         except ValueError:
             state_file.write_text(str(current_run_dir))
+
+    def on_train_end(self, trainer, pl_module):
+        """Clear the latest run pointer when training completes successfully."""
+        if trainer.state.status == "finished":
+            state_file = get_state_file_path(self.experiment_name)
+            # Rename to indicate completion
+            completed_file = state_file.with_suffix(".completed.txt")
+            if state_file.exists():
+                state_file.rename(completed_file)
 
 
 def update_latest_run_pointer(cfg: DictConfig):
@@ -305,12 +315,14 @@ def create_callbacks(cfg: DictConfig) -> List:
         # Standard Checkpointing
         ModelCheckpoint(
             dirpath=cfg.checkpoint.dir,
-            filename="step_{step:06d}",
+            filename="step_{train/optimizer_step}",
             save_top_k=cfg.training.save_top_k,
+            auto_insert_metric_name=False,
             monitor="val/loss",
             mode="min",
             every_n_train_steps=cfg.training.checkpoint_every_n_steps,
             save_last=True,
+            save_on_train_epoch_end=True,
         ),
         # LR logging
         LearningRateMonitor(logging_interval="step"),
@@ -355,6 +367,11 @@ def create_loggers(cfg: DictConfig) -> Optional[List]:
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
     """Main training function."""
+
+    print("=" * 80)
+    check_auth()
+    print("Checking auth")
+    print("=" * 80)
 
     # Print resolved config
     print("=" * 80)
@@ -430,7 +447,7 @@ def main(cfg: DictConfig) -> None:
     print("Starting training...")
     print("=" * 80 + "\n")
 
-    trainer.fit(module, datamodule=datamodule, ckpt_path=ckpt_path)
+    trainer.fit(module, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
 
     print("\n" + "=" * 80)
     print("Training complete!")

@@ -48,7 +48,7 @@ model:
 # -----------------------------------------------------------------------------
 data:
   seq_len: 1024
-  batch_size: 8          # Physical batch (limited by 12GB VRAM)
+  batch_size: 4          # Physical batch (limited by 12GB VRAM)
   num_workers: 4
 
 # -----------------------------------------------------------------------------
@@ -82,7 +82,7 @@ training:
 logging:
   # WandB (set project_name to null to disable)
   wandb:
-    enabled: false
+    enabled: true
     project: nanogpt-baseline
     name: null           # Auto-generated if null
 

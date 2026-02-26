@@ -41,12 +41,13 @@ experiments/01_nanogpt_base/
 ├── conf/
 │   ├── config.yaml       # MAIN config (Model, Optimizer, Schedule, Training)
 │   └── test.yaml         # FAST config (Small steps, no WandB)
+├── outputs/              # Hydra output (Logs, CSVs, Checkpoints)
+│   └── 2026-02-18/
+│       └── 12-00-00/
+│           └── checkpoints/  # Actual model weights
 ├── 02_pretrain.py        # Main training script (Hydra + Lightning)
 ├── context_state_files/  # (Implicit) .latest_run_*.txt files appear in project root
-└── outputs/              # Hydra output (Logs, CSVs, Checkpoints)
-    └── 2026-02-18/
-        └── 12-00-00/
-            └── checkpoints/  # Actual model weights
+
 ```
 
 ---
