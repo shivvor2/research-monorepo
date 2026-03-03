@@ -25,6 +25,7 @@ dependencies = [
     "peft",
     "evaluate",
     "trl",
+    "gradio",
 
     # Pytorch lightning (trainer) and ecosystem
     "lightning",
