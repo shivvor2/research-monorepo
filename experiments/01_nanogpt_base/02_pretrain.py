@@ -15,6 +15,7 @@ Usage:
     python 02_pretrain.py ckpt_path=checkpoints/last.ckpt
 """
 
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -134,7 +135,7 @@ def resolve_checkpoint_path(cfg: DictConfig, model: torch.nn.Module) -> Optional
 
         try:
             # We load on CPU just to check shapes
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
+            checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
             state_dict = checkpoint["state_dict"]
             # Strict load to catch architecture changes
             model.load_state_dict(state_dict, strict=True)
@@ -386,9 +387,11 @@ def main(cfg: DictConfig) -> None:
     else:
         print("No seed set - training will be non-deterministic.")
 
-    # 1. Create Model
+    # 1. Create (and compile) Model
     print("\n[1/4] Creating model...")
     model = create_model(cfg)
+    # No-one runs torch code on native windows, RIGHT?
+    model = torch.compile(model, mode="max-autotune-no-cudagraphs")
 
     # 2. Count and report parameters
     num_params = sum(p.numel() for p in model.parameters())

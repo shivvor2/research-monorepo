@@ -28,6 +28,8 @@ checkpoint:
   # - /path/to/ckpt: Resume explicitly from this path.
   resume_from: auto
 
+# For validation and usage
+checkpoint_path: null
 
 # -----------------------------------------------------------------------------
 # Model Architecture (GPT-2 Small, 124M params)
@@ -49,7 +51,7 @@ model:
 data:
   seq_len: 1024
   batch_size: 4          # Physical batch (limited by 12GB VRAM)
-  num_workers: 4
+  num_workers: 2
 
 # -----------------------------------------------------------------------------
 # Training Loop
