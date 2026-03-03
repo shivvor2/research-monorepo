@@ -220,11 +220,12 @@ class DualOptimizerModule(L.LightningModule):
         # Store model
         self.model = model
 
-        # Store configs (pure data, no runtime dependencies)
-        self.matrix_optimizer_config = matrix_optimizer_config
-        self.vector_optimizer_config = vector_optimizer_config
-        self.matrix_schedule_config = matrix_schedule_config
-        self.vector_schedule_config = vector_schedule_config
+        # Don't Store configs (because we want to change them on the fly)
+        # For backwards compatibility, store them as INSTANCE ATTRIBUTES
+        self._matrix_optimizer_config = matrix_optimizer_config
+        self._vector_optimizer_config = vector_optimizer_config
+        self._matrix_schedule_config = matrix_schedule_config
+        self._vector_schedule_config = vector_schedule_config
 
         # Validate target module args (mutually exclusive)
         if matrix_target_modules is not None and vector_target_modules is not None:
@@ -277,7 +278,13 @@ class DualOptimizerModule(L.LightningModule):
         self.gradient_clip_algorithm = grad_clip_algo
 
         # Save hyperparameters for logging (exclude model and configs with classes)
-        self.save_hyperparameters(ignore=["model"])
+        self.save_hyperparameters(
+            ignore=[
+                "model",
+                "matrix_schedule_config",
+                "vector_schedule_config",
+            ]
+        )
 
     def configure_optimizers(self) -> List[Optimizer]:
         """Configure optimizers based on parameter partitioning.
@@ -318,11 +325,11 @@ class DualOptimizerModule(L.LightningModule):
         optimizers = []
 
         if self._has_matrix_params:
-            matrix_opt = build_optimizer(self.matrix_optimizer_config, matrix_params)
+            matrix_opt = build_optimizer(self._matrix_optimizer_config, matrix_params)
             optimizers.append(matrix_opt)
 
         if self._has_vector_params:
-            vector_opt = build_optimizer(self.vector_optimizer_config, vector_params)
+            vector_opt = build_optimizer(self._vector_optimizer_config, vector_params)
             optimizers.append(vector_opt)
 
         return optimizers
@@ -351,18 +358,18 @@ class DualOptimizerModule(L.LightningModule):
         if self._has_matrix_params:
             self._matrix_scheduler = ParamScheduler(
                 optimizer=opts[opt_idx],
-                global_schedules=self.matrix_schedule_config.global_schedules,
+                global_schedules=self._matrix_schedule_config.global_schedules,
                 total_steps=total_steps,
-                group_overrides=self.matrix_schedule_config.group_overrides,
+                group_overrides=self._matrix_schedule_config.group_overrides,
             )
             opt_idx += 1
 
         if self._has_vector_params:
             self._vector_scheduler = ParamScheduler(
                 optimizer=opts[opt_idx],
-                global_schedules=self.vector_schedule_config.global_schedules,
+                global_schedules=self._vector_schedule_config.global_schedules,
                 total_steps=total_steps,
-                group_overrides=self.vector_schedule_config.group_overrides,
+                group_overrides=self._vector_schedule_config.group_overrides,
             )
 
         # Restore scheduler states from checkpoint if available
@@ -507,6 +514,7 @@ class DualOptimizerModule(L.LightningModule):
         Returns:
             The unscaled loss tensor for logging.
         """
+
         # Get optimizers
         opts = self.optimizers()
         if not isinstance(opts, list):
