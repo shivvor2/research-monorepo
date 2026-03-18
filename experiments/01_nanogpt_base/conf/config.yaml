@@ -46,6 +46,12 @@ model:
   padding_idx: 50256
 
 # -----------------------------------------------------------------------------
+# Torch compile settings
+# -----------------------------------------------------------------------------
+
+
+
+# -----------------------------------------------------------------------------
 # Data
 # -----------------------------------------------------------------------------
 data:
@@ -75,7 +81,8 @@ training:
   # Number of training shards for fineweb dataset
   num_train_shards: 99 # All (99) shards
 
-  # Limit validation steps
+  # Promote to own subgroup in the future
+  compile_mode: "max-autotune-no-cudagraphs"
 
 
 # -----------------------------------------------------------------------------
