@@ -3,6 +3,18 @@
 
 **Goal:** Train a 124M param (GPT-2 Small) model on FineWeb-Edu 10B, with reference to [`KellerJordan/modded-nanogpt`](https://github.com/KellerJordan/modded-nanogpt)
 
+Results (3/3/26):
+```
+================================================================================
+VALIDATION RESULTS
+================================================================================
+  Loss:       3.2266
+  Perplexity: 25.19
+  Tokens:     99,803,880
+  Batches:    24,390
+================================================================================
+```
+
 ## Quick Start
 
 ### 1. Run Training (Production)
