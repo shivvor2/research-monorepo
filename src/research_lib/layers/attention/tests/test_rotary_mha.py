@@ -631,6 +631,106 @@ class TestQKNorm:
         assert "qk_norm=None" in repr_str_no_norm
 
 
+class TestExclusiveSelfAttention:
+    """Test suite specifically targeting the XSA implementation."""
+
+    @pytest.fixture
+    def default_config(self):
+        return {
+            "embed_dim": 256,
+            "num_heads": 8,
+            "use_xsa": True,
+            "batch_first": True,
+            "bias": False,  # Bias off to simplify math tests
+        }
+
+    def test_xsa_orthogonality(self, default_config):
+        """
+        Core Mathematical Property Test:
+        The pre-projection output z_i must be fully orthogonal to the self-value v_i.
+        """
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+
+        batch_size, seq_len, embed_dim = 2, 8, 256
+        x = torch.randn(batch_size, seq_len, embed_dim)
+
+        with torch.no_grad():
+            # Grab V using exact logic from the module
+            qkv = F.linear(x, attn.in_proj_weight)
+            qkv = qkv.view(batch_size, seq_len, 3, attn.num_heads, attn.head_dim)
+            _, _, v = qkv.unbind(dim=2)
+            v = v.transpose(1, 2)  # (B, H, L, D) -> Target self-value
+
+            # Forward pass to intercept attn_output BEFORE out_proj
+            # We mock out_proj temporarily to act as identity to verify pre-projection output
+            original_out_proj = attn.out_proj
+            attn.out_proj = nn.Identity()
+
+            output, _ = attn(x, x, x, need_weights=False, is_causal=True)
+
+            # Reshape output back to head structure
+            output_heads = output.view(
+                batch_size, seq_len, attn.num_heads, attn.head_dim
+            ).transpose(1, 2)
+
+            # Compute cosine similarity per head. It must be exactly 0 (within float variance).
+            v_norm = F.normalize(v, dim=-1)
+            projection_magnitude = (output_heads * v_norm).sum(dim=-1)
+
+            # Verify orthogonality via dot product (Z · V_norm == 0) rather than cosine similarity.
+            # In causal attention, token 0 only attends to itself, meaning y_0 = v_0 and
+            # the theoretical XSA output is z_0 = 0.
+            # Applying F.normalize to z_0 is numerically unstable and amplifies floating-point
+            # noise into a random unit vector, causing false test failures.
+            assert torch.allclose(
+                projection_magnitude, torch.zeros_like(projection_magnitude), atol=1e-5
+            ), "XSA output is not completely orthogonal to the value vector."
+
+            # Restore
+            attn.out_proj = original_out_proj
+
+    def test_xsa_alters_output(self, default_config):
+        """Ensure activating XSA actually changes the output vs Standard Attention."""
+        torch.manual_seed(42)
+        attn_xsa = RotaryMultiheadAttention(**default_config)
+
+        torch.manual_seed(42)  # Same seed to match parameter initialization
+        config_standard = {**default_config, "use_xsa": False}
+        attn_standard = RotaryMultiheadAttention(**config_standard)
+
+        x = torch.randn(4, 16, 256)
+
+        out_xsa, _ = attn_xsa(x, x, x, need_weights=False)
+        out_std, _ = attn_standard(x, x, x, need_weights=False)
+
+        assert not torch.allclose(
+            out_xsa, out_std
+        ), "XSA output identically matched standard SA output."
+
+    def test_xsa_kv_cache_shape_handling(self, default_config):
+        """
+        Verify XSA gracefully handles autoregressive step shapes (tgt_len=1, src_len=S).
+        This will crash if the temporal slicing bug is unpatched.
+        """
+        attn = RotaryMultiheadAttention(**default_config)
+
+        # Simulating decoding step: Query length 1, KV cache length 16.
+        q = torch.randn(4, 1, 256)
+        k = torch.randn(4, 16, 256)
+        v = torch.randn(4, 16, 256)
+
+        try:
+            output, _ = attn(q, k, v, need_weights=False)
+            assert (
+                output.shape == q.shape
+            ), "Output shape corrupted during KV-cache forward."
+        except Exception as e:
+            pytest.fail(
+                f"XSA failed during irregular sequence length integration: {str(e)}"
+            )
+
+
 class TestRotaryMultiheadAttentionIntegration:
     """Integration tests with TransformerBlock-like usage."""
 

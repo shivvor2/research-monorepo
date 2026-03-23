@@ -21,7 +21,7 @@ A monorepo containing:
 - [Modded NanoGPT (Base)](src/research_lib/architectures/modded_nanogpt_base.py): Transformer blocks with MHA and pre-norm (RMSNorm).
 
 **Attention Layers:**
-- [Multi-Head Attention](src/research_lib/layers/attention/rotary_mha.py): With RoPE embeddings and QK-Norm.
+- [Multi-Head Attention](src/research_lib/layers/attention/rotary_mha.py): With RoPE embeddings, QK-Norm, and [XSA](https://arxiv.org/pdf/2603.09078).
 
 **Optimizers:**
 - [CautiousAdamW](src/research_lib/optimizers/cautious_adamw.py): Patched AdamW optimizer with cautious stepping ([paper](https://arxiv.org/abs/2510.12402)).

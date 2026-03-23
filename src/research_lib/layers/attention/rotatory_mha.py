@@ -42,6 +42,11 @@ class RotaryMultiheadAttention(nn.Module):
                  vector magnitude from the attention mechanism (Q-K Norm).
                  Accepts a class (e.g., nn.LayerNorm), a factory callable taking head_dim
                  as input, or None to disable. Default: nn.RMSNorm.
+        use_xsa: If True, applies Exclusive Self Attention (XSA). Orthogonalizes the
+                 attention output locally by subtracting its projection onto the
+                 corresponding value vector (v). Prevents attention similarity bias
+                 as detailed in [arXiv:2603.09078](https://arxiv.org/abs/2603.09078).
+                 Designed for self-attention.
 
     Examples:
         >>> # Basic usage
@@ -78,11 +83,13 @@ class RotaryMultiheadAttention(nn.Module):
         use_xpos: bool = False,  # length extrapolation
         xpos_scale_base: int = 512,  # xpos scale base
         interpolate_factor: float = 1.0,  # context extension (NTK-aware)
+        # RoPE-specific arguments end
         qk_norm: Union[  # Same norm type for both q and k duh
             Type[nn.Module],
             Callable[[int], nn.Module],  # Factory: head_dim -> Module
             None,
         ] = nn.RMSNorm,
+        use_xsa: bool = False,
     ) -> None:
         super().__init__()
 
@@ -168,6 +175,8 @@ class RotaryMultiheadAttention(nn.Module):
         self.use_xpos = use_xpos
 
         self._setup_qk_norm(qk_norm, device, dtype)
+
+        self.use_xsa = use_xsa
 
         self._reset_parameters()
 
@@ -388,6 +397,20 @@ class RotaryMultiheadAttention(nn.Module):
             )
             attn_weights = None
 
+        # XSA path, see https://arxiv.org/pdf/2603.09078
+        if self.use_xsa:
+            # Ensure we only extract the 'self' value vectors corresponding to the queries.
+            # This handles KV-cache decoding where tgt_len (usually 1) < src_len.
+            if tgt_len != src_len:
+                v_self = v[:, :, -tgt_len:, :]
+            else:
+                v_self = v
+
+            v_norm = F.normalize(v_self, dim=-1)
+            # No torch.dot because of existance of batch dimension?
+            proj_scalar = (attn_output * v_norm).sum(dim=-1, keepdim=True)
+            attn_output = attn_output - (proj_scalar * v_norm)
+
         # Reshape: (B, num_heads, L, head_dim) -> (B, L, embed_dim)
         attn_output = (
             attn_output.transpose(1, 2)
@@ -502,4 +525,5 @@ class RotaryMultiheadAttention(nn.Module):
             f"kdim={self.kdim}, "
             f"vdim={self.vdim})"
             f"qk_norm={self.qk_norm_str})"
+            f"use_xsa={self.use_xsa})"
         )
