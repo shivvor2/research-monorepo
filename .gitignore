@@ -1,6 +1,11 @@
+# Pi Coding agent
+.pi-lens
+/rules
+
 # Experiment state files (auto-resume pointers)
 .latest_run_*.txt
 .latest_run_*.completed.txt
+results
 
 # Hydra outputs
 **/outputs/
