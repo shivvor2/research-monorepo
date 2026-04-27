@@ -15,16 +15,15 @@ Usage:
     python 02_pretrain.py ckpt_path=checkpoints/last.ckpt
 """
 
-import os
+import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import List, Optional
 
 import hydra
 import lightning as L
 import torch
-from hydra.utils import get_original_cwd, to_absolute_path
+from hydra.utils import get_original_cwd
 from lightning.pytorch.callbacks import (
-    Callback,
     LearningRateMonitor,
     ModelCheckpoint,
     RichProgressBar,
@@ -45,6 +44,8 @@ from research_lib.training.configs import OptimizerConfig, ScheduleConfig
 from research_lib.training.modules import DualOptimizerModule
 from research_lib.training.scheduling import WarmupStableDecaySchedule
 from research_lib.utils.secrets import check_auth
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Torch Flags
@@ -216,7 +217,7 @@ def create_loggers(cfg: DictConfig) -> Optional[List]:
             name="metrics",
         )
         loggers.append(csv_logger)
-        print(f"CSV logging enabled: {cfg.logging.csv.save_dir}")
+        logger.info(f"CSV logging enabled: {cfg.logging.csv.save_dir}")
 
     # WandB logger
     if cfg.logging.wandb.enabled:
@@ -227,7 +228,7 @@ def create_loggers(cfg: DictConfig) -> Optional[List]:
             log_model=False,
         )
         loggers.append(wandb_logger)
-        print(f"WandB logging enabled: project={cfg.logging.wandb.project}")
+        logger.info(f"WandB logging enabled: project={cfg.logging.wandb.project}")
 
     return loggers if loggers else None
 
@@ -241,36 +242,38 @@ def create_loggers(cfg: DictConfig) -> Optional[List]:
 def main(cfg: DictConfig) -> None:
     """Main training function."""
 
-    print("=" * 80)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    logger.info("=" * 80)
     check_auth()
-    print("Checking auth")
-    print("=" * 80)
+    logger.info("Checking auth")
+    logger.info("=" * 80)
 
     # Print resolved config
-    print("=" * 80)
-    print("Resolved Configuration:")
-    print("=" * 80)
-    print(OmegaConf.to_yaml(cfg))
-    print("=" * 80)
+    logger.info("=" * 80)
+    logger.info("Resolved Configuration:")
+    logger.info("=" * 80)
+    logger.info(OmegaConf.to_yaml(cfg))
+    logger.info("=" * 80)
 
     # Seed for reproducibility
     if cfg.seed is not None:
         L.seed_everything(cfg.seed)
     else:
-        print("No seed set - training will be non-deterministic.")
+        logger.info("No seed set - training will be non-deterministic.")
 
     # 1. Create (and compile) Model
-    print("\n[1/4] Creating model...")
+    logger.info("\n[1/4] Creating model...")
     model = create_model(cfg)
     # No-one runs torch code on native windows, RIGHT?
     model = torch.compile(model, mode=cfg.training.compile_mode)
 
     # 2. Count and report parameters
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"  Model has {num_params:,} parameters ({num_params/1e6:.1f}M)")
+    logger.info(f"  Model has {num_params:,} parameters ({num_params / 1e6:.1f}M)")
 
     # 2. Resolve Checkpoint
-    print("\n[Checkpoint] Resolving auto-resume status...")
+    logger.info("\n[Checkpoint] Resolving auto-resume status...")
     ckpt_path = resolve_checkpoint_path(
         resume_from=cfg.checkpoint.resume_from,
         experiment_name=cfg.experiment.name,
@@ -278,10 +281,10 @@ def main(cfg: DictConfig) -> None:
         checkpoint_subdir=cfg.checkpoint.dir,
     )
 
-    print("\n[2/4] Creating training module...")
+    logger.info("\n[2/4] Creating training module...")
     module = create_training_module(model, cfg)
 
-    print("\n[3/4] Creating data module...")
+    logger.info("\n[3/4] Creating data module...")
     datamodule = FineWebDataModule(
         num_train_shards=cfg.training.get("num_train_shards", 99),
         seq_len=cfg.data.seq_len,
@@ -290,7 +293,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # Create callbacks and loggers
-    print("\n[4/4] Setting up trainer...")
+    logger.info("\n[4/4] Setting up trainer...")
     callbacks = create_callbacks(cfg)
     loggers = create_loggers(cfg)
 
@@ -312,26 +315,26 @@ def main(cfg: DictConfig) -> None:
     # Calculate and print training info
     tokens_per_step = cfg.data.batch_size * cfg.data.seq_len * cfg.training.grad_accum
     total_tokens = cfg.training.max_steps * tokens_per_step
-    print(f"\nTraining info:")
-    print(f"  Physical batch size: {cfg.data.batch_size}")
-    print(f"  Gradient accumulation: {cfg.training.grad_accum}")
-    print(
+    logger.info("\nTraining info:")
+    logger.info(f"  Physical batch size: {cfg.data.batch_size}")
+    logger.info(f"  Gradient accumulation: {cfg.training.grad_accum}")
+    logger.info(
         f"  Effective batch size: {cfg.data.batch_size * cfg.training.grad_accum} sequences"
     )
-    print(f"  Tokens per step: {tokens_per_step:,}")
-    print(f"  Total steps: {cfg.training.max_steps:,}")
-    print(f"  Total tokens: {total_tokens:,} ({total_tokens/1e9:.2f}B)")
+    logger.info(f"  Tokens per step: {tokens_per_step:,}")
+    logger.info(f"  Total steps: {cfg.training.max_steps:,}")
+    logger.info(f"  Total tokens: {total_tokens:,} ({total_tokens / 1e9:.2f}B)")
 
     # Train!
-    print("\n" + "=" * 80)
-    print("Starting training...")
-    print("=" * 80 + "\n")
+    logger.info("\n" + "=" * 80)
+    logger.info("Starting training...")
+    logger.info("=" * 80 + "\n")
 
     trainer.fit(module, datamodule=datamodule, ckpt_path=ckpt_path, weights_only=False)
 
-    print("\n" + "=" * 80)
-    print("Training complete!")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("Training complete!")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":

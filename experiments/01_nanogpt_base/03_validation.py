@@ -12,14 +12,14 @@ Usage:
     python 03_validation.py --config-name=test
 """
 
+import logging
 from pathlib import Path
 from typing import Optional
 
 import hydra
-import lightning as L
 import torch
 from hydra.utils import get_original_cwd, to_absolute_path
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from tqdm import tqdm
 
 from research_lib.architectures.config import NanoGPTConfig
@@ -30,6 +30,8 @@ from research_lib.utils.secrets import check_auth
 # =============================================================================
 # Torch Flags
 # =============================================================================
+
+logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision("high")
 
@@ -90,7 +92,7 @@ def load_checkpoint(model: ModdedNanoGPT, ckpt_path: str) -> ModdedNanoGPT:
     Note: Model should be compiled with torch.compile() BEFORE calling this
     function if the checkpoint was saved from a compiled model.
     """
-    print(f"Loading checkpoint from: {ckpt_path}")
+    logger.info(f"Loading checkpoint from: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     # Lightning stores model state under "state_dict" with "model." prefix
@@ -105,7 +107,7 @@ def load_checkpoint(model: ModdedNanoGPT, ckpt_path: str) -> ModdedNanoGPT:
             cleaned_state_dict[k] = v
 
     model.load_state_dict(cleaned_state_dict, strict=True)
-    print("Checkpoint loaded successfully!")
+    logger.info("Checkpoint loaded successfully!")
     return model
 
 
@@ -180,22 +182,26 @@ def validate(
 def main(cfg: DictConfig) -> None:
     """Main validation function."""
 
-    print("=" * 80)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    logger.info("=" * 80)
     check_auth()
-    print("=" * 80)
+    logger.info("=" * 80)
 
     # Print config
-    print("Validation Configuration:")
-    print("=" * 80)
-    print(f"Model: {cfg.model.n_layer}L, {cfg.model.n_embd}D, {cfg.model.n_head}H")
-    print(f"Vocab size: {cfg.model.vocab_size}")
-    print(f"Block size: {cfg.model.block_size}")
-    print("=" * 80)
+    logger.info("Validation Configuration:")
+    logger.info("=" * 80)
+    logger.info(
+        f"Model: {cfg.model.n_layer}L, {cfg.model.n_embd}D, {cfg.model.n_head}H"
+    )
+    logger.info(f"Vocab size: {cfg.model.vocab_size}")
+    logger.info(f"Block size: {cfg.model.block_size}")
+    logger.info("=" * 80)
 
     # Resolve checkpoint path
     ckpt_path = cfg.get("checkpoint_path", None)
     if ckpt_path is None:
-        print("No checkpoint_path provided, searching for latest...")
+        logger.info("No checkpoint_path provided, searching for latest...")
         ckpt_path = find_latest_checkpoint(cfg)
         if ckpt_path is None:
             raise FileNotFoundError(
@@ -207,19 +213,19 @@ def main(cfg: DictConfig) -> None:
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    print(f"Using checkpoint: {ckpt_path}")
+    logger.info(f"Using checkpoint: {ckpt_path}")
 
     # Setup device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    logger.info(f"Using device: {device}")
 
     # Create model
-    print("\n[1/3] Creating model...")
+    logger.info("\n[1/3] Creating model...")
     model = create_model(cfg)
 
     # Compile BEFORE loading (to match training setup)
     if device.type == "cuda":
-        print("Compiling model...")
+        logger.info("Compiling model...")
         model = torch.compile(model, mode="reduce-overhead")
 
     # Now load checkpoint (keys will match)
@@ -227,10 +233,10 @@ def main(cfg: DictConfig) -> None:
     model = model.to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
-    print(f"Model has {num_params:,} parameters ({num_params/1e6:.1f}M)")
+    logger.info(f"Model has {num_params:,} parameters ({num_params / 1e6:.1f}M)")
 
     # Create datamodule
-    print("\n[2/3] Setting up data...")
+    logger.info("\n[2/3] Setting up data...")
     datamodule = FineWebDataModule(
         num_train_shards=1,  # Not used for validation
         seq_len=cfg.data.seq_len,
@@ -243,21 +249,21 @@ def main(cfg: DictConfig) -> None:
     val_dataloader = datamodule.val_dataloader()
 
     # Run validation
-    print("\n[3/3] Running validation on full validation set...")
-    print("-" * 40)
+    logger.info("\n[3/3] Running validation on full validation set...")
+    logger.info("-" * 40)
 
     use_amp = "bf16" in cfg.training.precision or "16" in cfg.training.precision
     metrics = validate(model, val_dataloader, device, use_amp=use_amp)
 
     # Print results
-    print("\n" + "=" * 80)
-    print("VALIDATION RESULTS")
-    print("=" * 80)
-    print(f"  Loss:       {metrics['loss']:.4f}")
-    print(f"  Perplexity: {metrics['perplexity']:.2f}")
-    print(f"  Tokens:     {metrics['total_tokens']:,}")
-    print(f"  Batches:    {metrics['num_batches']:,}")
-    print("=" * 80)
+    logger.info("\n" + "=" * 80)
+    logger.info("VALIDATION RESULTS")
+    logger.info("=" * 80)
+    logger.info(f"  Loss:       {metrics['loss']:.4f}")
+    logger.info(f"  Perplexity: {metrics['perplexity']:.2f}")
+    logger.info(f"  Tokens:     {metrics['total_tokens']:,}")
+    logger.info(f"  Batches:    {metrics['num_batches']:,}")
+    logger.info("=" * 80)
 
 
 if __name__ == "__main__":

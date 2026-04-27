@@ -18,6 +18,7 @@ Note:
     and decoding.
 """
 
+import logging
 from pathlib import Path
 from typing import Generator, Optional
 
@@ -35,6 +36,8 @@ from research_lib.utils.secrets import check_auth
 # =============================================================================
 # Torch Flags
 # =============================================================================
+
+logger = logging.getLogger(__name__)
 
 torch.set_float32_matmul_precision("high")
 
@@ -98,7 +101,7 @@ def load_checkpoint(model: ModdedNanoGPT, ckpt_path: str) -> ModdedNanoGPT:
     Note: Model should be compiled with torch.compile() BEFORE calling this
     function if the checkpoint was saved from a compiled model.
     """
-    print(f"Loading checkpoint from: {ckpt_path}")
+    logger.info(f"Loading checkpoint from: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
     # Lightning stores model state under "state_dict" with "model." prefix
@@ -113,7 +116,7 @@ def load_checkpoint(model: ModdedNanoGPT, ckpt_path: str) -> ModdedNanoGPT:
             cleaned_state_dict[k] = v
 
     model.load_state_dict(cleaned_state_dict, strict=True)
-    print("Checkpoint loaded successfully!")
+    logger.info("Checkpoint loaded successfully!")
     return model
 
 
@@ -356,14 +359,16 @@ def main(cfg: DictConfig) -> None:
     """Main demo function."""
     global _MODEL, _TOKENIZER, _DEVICE, _BLOCK_SIZE
 
-    print("=" * 80)
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    logger.info("=" * 80)
     check_auth()
-    print("=" * 80)
+    logger.info("=" * 80)
 
     # Resolve checkpoint path
     ckpt_path = cfg.get("checkpoint_path", None)
     if ckpt_path is None:
-        print("No checkpoint_path provided, searching for latest...")
+        logger.info("No checkpoint_path provided, searching for latest...")
         ckpt_path = find_latest_checkpoint(cfg)
         if ckpt_path is None:
             raise FileNotFoundError(
@@ -375,22 +380,22 @@ def main(cfg: DictConfig) -> None:
         if not Path(ckpt_path).exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
-    print(f"Using checkpoint: {ckpt_path}")
+    logger.info(f"Using checkpoint: {ckpt_path}")
 
     # Setup device
     _DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {_DEVICE}")
+    logger.info(f"Using device: {_DEVICE}")
 
     # Store block size
     _BLOCK_SIZE = cfg.model.block_size
 
     # Load tokenizer (GPT-2)
-    print("\n[1/3] Loading tokenizer...")
+    logger.info("\n[1/3] Loading tokenizer...")
     _TOKENIZER = GPT2TokenizerFast.from_pretrained("gpt2")
-    print(f"Tokenizer loaded: vocab_size={_TOKENIZER.vocab_size}")
+    logger.info(f"Tokenizer loaded: vocab_size={_TOKENIZER.vocab_size}")
 
     # Create and load model
-    print("\n[2/3] Loading model...")
+    logger.info("\n[2/3] Loading model...")
     _MODEL = create_model(cfg)
 
     # NOTE: We intentionally do NOT compile the model for inference.
@@ -401,7 +406,7 @@ def main(cfg: DictConfig) -> None:
     # However, the checkpoint was saved with a compiled model (model._orig_mod.*),
     # so we still need to compile before loading to match the state dict keys.
     if _DEVICE.type == "cuda":
-        print("Compiling model (for checkpoint compatibility)...")
+        logger.info("Compiling model (for checkpoint compatibility)...")
         _MODEL = torch.compile(_MODEL, mode="reduce-overhead")
 
     _MODEL = load_checkpoint(_MODEL, ckpt_path)
@@ -409,10 +414,10 @@ def main(cfg: DictConfig) -> None:
     _MODEL.eval()
 
     num_params = sum(p.numel() for p in _MODEL.parameters())
-    print(f"Model loaded: {num_params:,} parameters ({num_params/1e6:.1f}M)")
+    logger.info(f"Model loaded: {num_params:,} parameters ({num_params / 1e6:.1f}M)")
 
     # Create and launch Gradio interface
-    print("\n[3/3] Starting Gradio interface...")
+    logger.info("\n[3/3] Starting Gradio interface...")
     demo = create_gradio_interface()
 
     # Get server settings from config
@@ -420,8 +425,8 @@ def main(cfg: DictConfig) -> None:
     server_name = cfg.get("server_name", "0.0.0.0")
     share = cfg.get("share", False)
 
-    print(f"\nLaunching demo on http://{server_name}:{server_port}")
-    print("Press Ctrl+C to stop the server.\n")
+    logger.info(f"\nLaunching demo on http://{server_name}:{server_port}")
+    logger.info("Press Ctrl+C to stop the server.\n")
 
     demo.launch(
         server_name=server_name,

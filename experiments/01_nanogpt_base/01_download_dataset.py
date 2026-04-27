@@ -22,6 +22,7 @@ Requirements:
     - HF_TOKEN in .env file (optional, dataset is public)
 """
 
+import logging
 import sys
 
 from research_lib.data.fineweb_datamodule import FineWebDataModule
@@ -29,8 +30,11 @@ from research_lib.data.fineweb_datamodule import FineWebDataModule
 # Ensure secrets are loaded (HF_TOKEN)
 from research_lib.utils.secrets import check_auth
 
+logger = logging.getLogger(__name__)
+
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
 
     # Check existance of local data
     check_auth()
@@ -40,15 +44,15 @@ def main():
     if len(sys.argv) >= 2:
         num_shards = int(sys.argv[1])
         if not 1 <= num_shards <= 99:
-            print("Error: num_shards must be between 1 and 99")
+            logger.info("Error: num_shards must be between 1 and 99")
             sys.exit(1)
 
-    print(f"FineWeb-Edu Download Script")
-    print(f"=" * 40)
-    print(f"Training shards: {num_shards}")
-    print(f"Estimated size: ~{num_shards * 200}MB")  # ~200MB per shard
-    print(f"Estimated tokens: ~{num_shards * 100}M")
-    print()
+    logger.info("FineWeb-Edu Download Script")
+    logger.info("=" * 40)
+    logger.info(f"Training shards: {num_shards}")
+    logger.info(f"Estimated size: ~{num_shards * 200}MB")  # ~200MB per shard
+    logger.info(f"Estimated tokens: ~{num_shards * 100}M")
+    logger.info("")
 
     # Create datamodule and download
     dm = FineWebDataModule(
@@ -58,8 +62,8 @@ def main():
 
     dm.prepare_data()
 
-    print()
-    print("Download complete! Data cached in ~/.cache/huggingface/hub/")
+    logger.info("")
+    logger.info("Download complete! Data cached in ~/.cache/huggingface/hub/")
 
 
 if __name__ == "__main__":
