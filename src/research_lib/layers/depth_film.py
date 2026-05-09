@@ -74,9 +74,6 @@ class DepthFiLM(nn.Module):
         nn.init.zeros_(self.mlp[-1].weight)
         nn.init.zeros_(self.mlp[-1].bias)
 
-        # Pre-allocate index buffer to avoid creating a new tensor every call.
-        self.register_buffer("_idx", torch.zeros(1, dtype=torch.long), persistent=False)
-
     def forward(self, x: torch.Tensor, loop_t: int) -> torch.Tensor:
         r"""Depth-condition the input tensor.
 
@@ -88,7 +85,6 @@ class DepthFiLM(nn.Module):
             Tensor: Modulated feature map, same shape as ``x``.
         """
         t_idx = min(loop_t, self.max_loops - 1)
-        self._idx.fill_(t_idx)
-        d = self.depth_emb(self._idx)
+        d = self.depth_emb.weight[t_idx : t_idx + 1]
         scale, shift = self.mlp(d).chunk(2, dim=-1)
         return x * (1 + scale) + shift
