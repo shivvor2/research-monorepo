@@ -306,7 +306,9 @@ def loop_index_embedding(
         h (Tensor): Hidden state of shape :math:`(B, T, C)`.
         loop_t (int): Current loop index :math:`t`.
         loop_dim (int, optional): Number of leading channels to perturb.
-            If ``None``, defaults to ``h.size(-1) // 8``.
+            If ``None``, defaults to ``max(2, h.size(-1) // 8)``.
+            Clamped to a minimum of ``2`` to ensure at least one
+            sin/cos pair is produced.
         theta (float, optional): Base frequency. Default: ``10000.0``.
 
     Returns:
@@ -323,11 +325,10 @@ def loop_index_embedding(
         >>> h = loop_index_embedding(h, loop_t=3)
 
     References:
-        * Vaswani et al., "Attention Is All You Need", NeurIPS 2017.
         * Su et al., "RoFormer: Enhanced Transformer with Rotary Position
           Embedding", arXiv:2104.09864, 2021.
     """
-    loop_dim = loop_dim or h.shape[-1] // 8
+    loop_dim = loop_dim or max(2, h.shape[-1] // 8)
     freqs = 1.0 / (
         theta
         ** (torch.arange(0, loop_dim, 2, device=h.device, dtype=h.dtype) / loop_dim)
@@ -663,6 +664,11 @@ class RecurrentBlock(nn.Module):
         """
         n_loops = n_loops if n_loops is not None else self.max_loop_iters
         B, T, D = h.shape
+
+        # kv_cache should never appear in kwargs
+        # Since Someone could subclass or wrap the call differently,
+        # apply this fix defensively
+        kwargs.pop("kv_cache", None)
 
         # ACT bookkeeping
         halted = torch.zeros(B, T, device=h.device, dtype=torch.bool)
