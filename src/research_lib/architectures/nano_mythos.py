@@ -278,7 +278,7 @@ class _KDAWrapper(nn.Module):
     """Wraps KimiDeltaAttention to accept a single input tensor x.
 
     KDA's forward expects (hidden_states, attention_mask, past_key_values, ...).
-    This wrapper calls it as self-attention  andpasses through any keyword
+    This wrapper calls it as self-attention and passes through any keyword
     arguments so that padding masks, cache flags, etc., reach the underlying layer.
     """
 
@@ -533,7 +533,7 @@ class NanoMythosAttnRes(nn.Module):
         # --- Final AttnRes readout ---
         final_out, _ = phase_1_batched_attention_triton_op(
             torch.stack(blocks, dim=0),
-            self.pseudo_queries[-1:],
+            self.readout_query,
             eps,
         )
         x = final_out.squeeze(0).to(blocks[0].dtype)

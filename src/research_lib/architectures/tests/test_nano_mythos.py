@@ -394,6 +394,51 @@ class TestNanoMythosAttnResForward(TestNanoMythos):
         ), "Sanity check failed: changing input did not change output."
 
     @CUDA_ONLY
+    def test_key_padding_mask_semantics(self, tiny_config):
+        """Padded tokens must not affect logits of non-padded tokens.
+
+        We create two inputs that differ only at padded positions, pass an
+        explicit key_padding_mask (True=pad), and assert that logits at
+        non-padded positions are identical. This exercises both the KDA
+        attention_mask inversion and the MHA key_padding_mask plumbing.
+        """
+        model = self._make_cuda_model(tiny_config)
+        model.eval()
+        B, T = 2, 12
+        # Positions 0-5 are real, positions 6-11 are padded
+        real_len = 6
+        x1 = torch.randint(0, tiny_config.vocab_size, (B, T), device="cuda")
+        x2 = x1.clone()
+        # Change token IDs only at padded positions
+        x2[:, real_len:] = (x2[:, real_len:] + 1) % tiny_config.vocab_size
+
+        # PyTorch convention: True = pad, False = real token
+        key_padding_mask = torch.zeros((B, T), dtype=torch.bool, device="cuda")
+        key_padding_mask[:, real_len:] = True
+
+        with torch.no_grad():
+            out1 = model(x1, key_padding_mask=key_padding_mask)
+            out2 = model(x2, key_padding_mask=key_padding_mask)
+
+        # Non-padded positions should see identical logits regardless of
+        # what token sits at padded positions, because the mask prevents
+        # attention to those keys in both MHA and KDA paths.
+        assert torch.allclose(
+            out1[:, :real_len, :],
+            out2[:, :real_len, :],
+            atol=1e-5,
+        ), "key_padding_mask failed: padded tokens leaked into non-padded logits."
+
+        # Sanity check: padded positions themselves can differ because their
+        # own input embeddings changed (even if they cannot attend to padded
+        # keys, their query embedding is different).
+        assert not torch.allclose(
+            out1[:, real_len:, :],
+            out2[:, real_len:, :],
+            atol=1e-5,
+        ), "Sanity check: changing padded tokens had no effect anywhere."
+
+    @CUDA_ONLY
     def test_logit_clipping(self, tiny_config):
         model = self._make_cuda_model(tiny_config)
         with torch.no_grad():
