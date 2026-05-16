@@ -14,6 +14,10 @@ dependencies = [
     # Pytorch native external dependencies
     "rotary-embedding-torch",
 
+    # Efficient implementation of Mechanisms
+    "flash-linear-attention",
+    "flash_attn_res",
+
     # Hugging Face Ecosystem
     "huggingface_hub",
     "transformers",

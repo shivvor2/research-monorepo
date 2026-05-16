@@ -1,7 +1,8 @@
 """Configuration for NanoMythos architecture (AttnRes + Recurrent + Hybrid Attention)."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -53,7 +54,8 @@ class NanoMythosConfig:
     film_hidden: int = 64
 
     # --- AttnRes settings ---
-    attnres_block_size: Optional[int] = None
+    attnres_block_size: int | None = None
+    attnres_rmsnorm_eps: float = 1e-6
 
     # --- KDA-specific settings ---
     kda_head_dim: int = 128

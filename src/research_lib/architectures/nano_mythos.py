@@ -31,7 +31,8 @@ Dependencies:
 
 from __future__ import annotations
 
-from typing import List, Optional
+from enum import Enum
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -51,7 +52,10 @@ from ..layers.recurrent_block import (
 )
 from .config import NanoMythosConfig
 
-EPS = 1e-6
+
+class AttentionType(str, Enum):
+    KDA = "kda"
+    MHA = "mha"
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +63,9 @@ EPS = 1e-6
 # ---------------------------------------------------------------------------
 
 
-def build_attention_pattern(n_blocks: int, linear_to_full_ratio: int) -> List[str]:
+def build_attention_pattern(
+    n_blocks: int, linear_to_full_ratio: int
+) -> list[AttentionType]:
     """Generate the attention type sequence for a phase.
 
     Args:
@@ -68,17 +74,17 @@ def build_attention_pattern(n_blocks: int, linear_to_full_ratio: int) -> List[st
             The repeating unit is [KDA]*ratio + [MHA].
 
     Returns:
-        List of 'kda' or 'mha' strings, length n_blocks.
+        List of AttentionType values, length n_blocks.
         Edge case: if n_blocks is not a multiple of (ratio + 1),
         the final block is forced to MHA.
 
     Examples:
         >>> build_attention_pattern(6, 2)
-        ['kda', 'kda', 'mha', 'kda', 'kda', 'mha']
+        [AttentionType.KDA, AttentionType.KDA, AttentionType.MHA, AttentionType.KDA, AttentionType.KDA, AttentionType.MHA]
         >>> build_attention_pattern(5, 2)
-        ['kda', 'kda', 'mha', 'kda', 'mha']
+        [AttentionType.KDA, AttentionType.KDA, AttentionType.MHA, AttentionType.KDA, AttentionType.MHA]
         >>> build_attention_pattern(4, 1)
-        ['kda', 'mha', 'kda', 'mha']
+        [AttentionType.KDA, AttentionType.MHA, AttentionType.KDA, AttentionType.MHA]
     """
     if n_blocks == 0:
         return []
@@ -88,13 +94,13 @@ def build_attention_pattern(n_blocks: int, linear_to_full_ratio: int) -> List[st
     for i in range(n_blocks):
         pos_in_period = i % period
         if pos_in_period < linear_to_full_ratio:
-            pattern.append("kda")
+            pattern.append(AttentionType.KDA)
         else:
-            pattern.append("mha")
+            pattern.append(AttentionType.MHA)
 
     # Edge case: force last block to MHA if phase doesn't end cleanly
     if n_blocks % period != 0:
-        pattern[-1] = "mha"
+        pattern[-1] = AttentionType.MHA
 
     return pattern
 
@@ -104,7 +110,7 @@ def build_attention_pattern(n_blocks: int, linear_to_full_ratio: int) -> List[st
 # ---------------------------------------------------------------------------
 
 
-class KDASublayer(nn.Module):
+class _KDASublayer(nn.Module):
     """Residual-free KDA attention sublayer for AttnRes.
 
     Wraps fla's KimiDeltaAttention. Applies RMSNorm before attention.
@@ -127,11 +133,11 @@ class KDASublayer(nn.Module):
 
     def forward(self, h: torch.Tensor, **kwargs) -> torch.Tensor:
         normed = self.norm(h)
-        out, _, _ = self.attn(normed)
+        out, _, _ = self.attn(normed, **kwargs)
         return out
 
 
-class MHASublayer(nn.Module):
+class _MHASublayer(nn.Module):
     """Residual-free MHA (full attention) sublayer for AttnRes.
 
     Wraps RotaryMultiheadAttention with RMSNorm pre-norm.
@@ -156,15 +162,15 @@ class MHASublayer(nn.Module):
             normed,
             normed,
             normed,
-            key_padding_mask=None,
-            attn_mask=kwargs.get("attn_mask", None),
+            key_padding_mask=kwargs.get("key_padding_mask", None),
+            attn_mask=None,
             need_weights=False,
             is_causal=True,
         )
         return out
 
 
-class MLPSublayer(nn.Module):
+class _MLPSublayer(nn.Module):
     """Residual-free MLP sublayer for AttnRes."""
 
     def __init__(self, config: NanoMythosConfig):
@@ -189,7 +195,7 @@ class MLPSublayer(nn.Module):
 
 def _build_recurrent_block(
     config: NanoMythosConfig,
-    attn_type: str,
+    attn_type: AttentionType,
     layer_idx: int,
 ) -> RecurrentBlock:
     """Build a single RecurrentBlock with the specified attention type.
@@ -200,14 +206,20 @@ def _build_recurrent_block(
 
     Args:
         config: Model config.
-        attn_type: 'kda' or 'mha'.
+        attn_type: AttentionType.KDA or AttentionType.MHA.
         layer_idx: Layer index for KDA cache keying.
 
     Returns:
         A RecurrentBlock instance.
     """
+    if not isinstance(attn_type, AttentionType):
+        raise ValueError(
+            f"Invalid attention type {attn_type!r}. "
+            f"Expected AttentionType.KDA or AttentionType.MHA."
+        )
+
     # Build the attention module
-    if attn_type == "kda":
+    if attn_type is AttentionType.KDA:
         attention = KimiDeltaAttention(
             hidden_size=config.n_embd,
             expand_v=config.kda_expand_v,
@@ -266,8 +278,8 @@ class _KDAWrapper(nn.Module):
     """Wraps KimiDeltaAttention to accept a single input tensor x.
 
     KDA's forward expects (hidden_states, attention_mask, past_key_values, ...).
-    This wrapper calls it as self-attention with the appropriate signature so
-    it can be used inside RecurrentTransformerBlock.
+    This wrapper calls it as self-attention  andpasses through any keyword
+    arguments so that padding masks, cache flags, etc., reach the underlying layer.
     """
 
     def __init__(self, kda: KimiDeltaAttention):
@@ -275,7 +287,7 @@ class _KDAWrapper(nn.Module):
         self.kda = kda
 
     def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
-        out, _, _ = self.kda(x)
+        out, _, _ = self.kda(x, **kwargs)
         return out
 
 
@@ -327,32 +339,35 @@ class NanoMythosAttnRes(nn.Module):
         # --- Prelude sublayers (residual-free, AttnRes-managed) ---
         # Each block contributes 2 sublayers: attn + MLP
         self.prelude_layers = nn.ModuleList()
-        layer_idx = 0
+        kda_layer_idx = 0
         for attn_type in prelude_pattern:
-            if attn_type == "kda":
-                self.prelude_layers.append(KDASublayer(config, layer_idx=layer_idx))
+            if attn_type is AttentionType.KDA:
+                self.prelude_layers.append(
+                    _KDASublayer(config, layer_idx=kda_layer_idx)
+                )
+                kda_layer_idx += 1
             else:
-                self.prelude_layers.append(MHASublayer(config))
-            self.prelude_layers.append(MLPSublayer(config))
-            layer_idx += 1
+                self.prelude_layers.append(_MHASublayer(config))
+            self.prelude_layers.append(_MLPSublayer(config))
 
         # --- Loop phase (RecurrentBlocks, each = 1 AttnRes depth layer) ---
         self.loop_blocks = nn.ModuleList()
         for attn_type in loop_pattern:
             self.loop_blocks.append(
-                _build_recurrent_block(config, attn_type, layer_idx)
+                _build_recurrent_block(config, attn_type, kda_layer_idx)
             )
-            layer_idx += 1
+            if attn_type is AttentionType.KDA:
+                kda_layer_idx += 1
 
         # --- Coda sublayers (residual-free, AttnRes-managed) ---
         self.coda_layers = nn.ModuleList()
         for attn_type in coda_pattern:
-            if attn_type == "kda":
-                self.coda_layers.append(KDASublayer(config, layer_idx=layer_idx))
+            if attn_type is AttentionType.KDA:
+                self.coda_layers.append(_KDASublayer(config, layer_idx=kda_layer_idx))
+                kda_layer_idx += 1
             else:
-                self.coda_layers.append(MHASublayer(config))
-            self.coda_layers.append(MLPSublayer(config))
-            layer_idx += 1
+                self.coda_layers.append(_MHASublayer(config))
+            self.coda_layers.append(_MLPSublayer(config))
 
         # --- Output head ---
         self.norm_f = nn.RMSNorm(config.n_embd)
@@ -375,20 +390,27 @@ class NanoMythosAttnRes(nn.Module):
             torch.zeros(n_total_depth_layers, config.n_embd)
         )
 
+        # 1 more query vector for final readout, since pseudo_queries[n-1] was
+        # already used for inside the last iteration of the block loop as part of
+        # the bq slice
+        self.readout_query = nn.Parameter(torch.zeros(1, config.n_embd))
+
         # AttnRes block size for checkpointing
         self.block_size = config.effective_attnres_block_size
 
     def forward(
         self,
         x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
         n_loops: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward pass.
 
         Args:
             x: Input token IDs [B, T].
-            attn_mask: Optional attention mask for MHA sublayers.
+            key_padding_mask: Optional padding mask [B, T]. True = pad (ignore),
+                False = real token. Follows PyTorch convention. Internally
+                inverted for KDA which expects 1=real, 0=pad.
             n_loops: Override number of recurrent iterations (for inference
                 depth extrapolation). Defaults to config.max_loop_iters.
 
@@ -397,54 +419,73 @@ class NanoMythosAttnRes(nn.Module):
         """
         x = self.embedding(x)  # [B, T, D] — b0 in AttnRes paper
 
-        eps = EPS
+        eps = self.config.attnres_rmsnorm_eps
         block_size = self.block_size
-        kwargs = {"attn_mask": attn_mask, "is_causal": True}
 
         n_prelude = self._n_prelude_sublayers
         n_loop = self._n_loop_layers
         n_coda = self._n_coda_sublayers
         n_loops_actual = n_loops if n_loops is not None else self.config.max_loop_iters
 
-        # All depth layers are processed through a unified AttnRes loop.
-        # We build one flat list of "layer functions" that the AttnRes block
-        # loop iterates over.
+        # --- Mask routing ---
+        # MHA: key_padding_mask [B, T], True=pad (PyTorch convention)
+        # KDA: attention_mask [B, T], 1=real, 0=pad (HuggingFace convention)
+        if key_padding_mask is not None:
+            kda_attention_mask = (~key_padding_mask).to(torch.int32)
+        else:
+            kda_attention_mask = None
 
-        blocks = [x]  # b0 = embedding output
+        kda_kwargs = {"attention_mask": kda_attention_mask}
+        mha_kwargs = {"key_padding_mask": key_padding_mask, "is_causal": True}
+        mlp_kwargs = {}
+        # Recurrent blocks forward kwargs through _filter_kwargs, so merging
+        # is safe — each sub-layer only receives what its signature accepts.
+        recurrent_kwargs = {**kda_kwargs, **mha_kwargs}
 
-        # Assemble all pseudo-queries and layer callables in order
-        all_queries = self.pseudo_queries  # [n_total, D]
-
-        # Build a dispatch list: each entry is a callable(h) -> output
-        # For prelude/coda: residual-free sublayer
-        # For loop: RecurrentBlock (takes h as input, returns single output)
-        layer_fns: List = []
+        # --- Build layer function dispatch list ---
+        # Each entry is a callable(h) -> output tensor.
+        # Prelude/coda: residual-free sublayers
+        # Loop: RecurrentBlock (takes h, returns single output)
+        layer_fns: list = []
 
         # Prelude sublayers
         for i in range(n_prelude):
             layer = self.prelude_layers[i]
-            layer_fns.append(lambda h, _layer=layer: _layer(h, **kwargs))
+            if isinstance(layer, _KDASublayer):
+                kw = kda_kwargs
+            elif isinstance(layer, _MHASublayer):
+                kw = mha_kwargs
+            else:
+                kw = mlp_kwargs
+            layer_fns.append(lambda h, _layer=layer, _kw=kw: _layer(h, **_kw))
 
-        # Loop blocks (each RecurrentBlock is 1 depth layer)
+        # Loop blocks (each RecurrentBlock = 1 depth layer)
         for i in range(n_loop):
             block = self.loop_blocks[i]
-            # RecurrentBlock.forward(h, e, n_loops, **kwargs)
-            # h = AttnRes-aggregated input, e = frozen copy for LTI
             layer_fns.append(
-                lambda h, _block=block, _n=n_loops_actual: _block(
-                    h, h.detach(), n_loops=_n, **kwargs
+                lambda h, _block=block, _n=n_loops_actual, _kw=recurrent_kwargs: _block(
+                    h, h.detach(), n_loops=_n, **_kw
                 )
             )
 
         # Coda sublayers
         for i in range(n_coda):
             layer = self.coda_layers[i]
-            layer_fns.append(lambda h, _layer=layer: _layer(h, **kwargs))
+            if isinstance(layer, _KDASublayer):
+                kw = kda_kwargs
+            elif isinstance(layer, _MHASublayer):
+                kw = mha_kwargs
+            else:
+                kw = mlp_kwargs
+            layer_fns.append(lambda h, _layer=layer, _kw=kw: _layer(h, **_kw))
 
         n_total = len(layer_fns)
         assert n_total == n_prelude + n_loop + n_coda
 
         # --- Unified AttnRes block loop ---
+        all_queries = self.pseudo_queries  # [n_total, D]
+        blocks = [x]  # b0 = embedding output
+
         for block_start in range(0, n_total, block_size):
             num_queries = min(block_size, n_total - block_start)
             bq = all_queries[block_start : block_start + num_queries]
@@ -460,7 +501,7 @@ class NanoMythosAttnRes(nn.Module):
                     values, bq_arg, eps
                 )
                 # Cast to values dtype because flash-attn-res triton kernels
-                # Hardcodes output to bf16, no penalty since we train in bf16 anyways
+                # hardcode output to bf16. No penalty since we train in bf16.
                 # See https://github.com/catswe/flash-attention-residuals/blob/main/src/flash_attn_res/ops/phase_1.py#L25
                 phase1_out = phase1_out.to(values.dtype)
                 bq_list = bq_arg.unbind(0)
@@ -475,7 +516,6 @@ class NanoMythosAttnRes(nn.Module):
                         out = layer_fn(h_in)
                         curr_block = out
                     else:
-                        # Same triton kernel output dtype problem
                         h_in = phase_2_online_softmax_merge_triton_op(
                             curr_block,
                             bq_list[i],
@@ -496,7 +536,6 @@ class NanoMythosAttnRes(nn.Module):
             self.pseudo_queries[-1:],
             eps,
         )
-        # Same triton kernel output dtype problem
         x = final_out.squeeze(0).to(blocks[0].dtype)
 
         # --- Output head ---

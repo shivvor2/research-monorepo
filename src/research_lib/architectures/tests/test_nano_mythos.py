@@ -12,11 +12,12 @@ import torch.nn.functional as F
 
 from research_lib.architectures.config import NanoMythosConfig
 from research_lib.architectures.nano_mythos import (
-    KDASublayer,
-    MHASublayer,
-    MLPSublayer,
+    AttentionType,
     NanoMythosAttnRes,
     _build_recurrent_block,
+    _KDASublayer,
+    _MHASublayer,
+    _MLPSublayer,
     build_attention_pattern,
 )
 
@@ -84,42 +85,46 @@ class TestBuildAttentionPattern:
 
     def test_docstring_example_6_2(self):
         assert build_attention_pattern(6, 2) == [
-            "kda",
-            "kda",
-            "mha",
-            "kda",
-            "kda",
-            "mha",
+            AttentionType.KDA,
+            AttentionType.KDA,
+            AttentionType.MHA,
+            AttentionType.KDA,
+            AttentionType.KDA,
+            AttentionType.MHA,
         ]
 
     def test_docstring_example_5_2(self):
         assert build_attention_pattern(5, 2) == [
-            "kda",
-            "kda",
-            "mha",
-            "kda",
-            "mha",
+            AttentionType.KDA,
+            AttentionType.KDA,
+            AttentionType.MHA,
+            AttentionType.KDA,
+            AttentionType.MHA,
         ]
 
     def test_docstring_example_4_1(self):
         assert build_attention_pattern(4, 1) == [
-            "kda",
-            "mha",
-            "kda",
-            "mha",
+            AttentionType.KDA,
+            AttentionType.MHA,
+            AttentionType.KDA,
+            AttentionType.MHA,
         ]
 
     def test_zero_blocks(self):
         assert build_attention_pattern(0, 2) == []
 
     def test_all_mha_ratio_zero(self):
-        assert build_attention_pattern(3, 0) == ["mha", "mha", "mha"]
+        assert build_attention_pattern(3, 0) == [
+            AttentionType.MHA,
+            AttentionType.MHA,
+            AttentionType.MHA,
+        ]
 
     def test_incomplete_period_forces_final_mha(self):
-        # period = 3; 7 blocks => [kda,kda,mha,kda,kda,mha,kda] -> last forced to mha
+        # period = 3; 7 blocks => [KDA,KDA,MHA,KDA,KDA,MHA,KDA] -> last forced to MHA
         pattern = build_attention_pattern(7, 2)
-        assert pattern[-1] == "mha"
-        assert pattern.count("mha") >= 2
+        assert pattern[-1] is AttentionType.MHA
+        assert pattern.count(AttentionType.MHA) >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +136,7 @@ class TestSublayers(TestNanoMythos):
     """Tests for KDASublayer, MHASublayer, and MLPSublayer."""
 
     def test_mha_sublayer_forward_shape(self, tiny_config):
-        layer = MHASublayer(tiny_config)
+        layer = _MHASublayer(tiny_config)
         h = torch.randn(2, 8, tiny_config.n_embd)
         out = layer(h)
         assert out.shape == (2, 8, tiny_config.n_embd)
@@ -139,7 +144,7 @@ class TestSublayers(TestNanoMythos):
 
     def test_mha_sublayer_uses_causal_mask(self, tiny_config):
         """MHASublayer must respect causal masking via is_causal=True."""
-        layer = MHASublayer(tiny_config)
+        layer = _MHASublayer(tiny_config)
         layer.eval()
         h = torch.randn(1, 10, tiny_config.n_embd)
         with torch.no_grad():
@@ -153,7 +158,7 @@ class TestSublayers(TestNanoMythos):
         assert not torch.allclose(out1[:, -1, :], out2[:, -1, :])
 
     def test_mlp_sublayer_forward_shape(self, tiny_config):
-        layer = MLPSublayer(tiny_config)
+        layer = _MLPSublayer(tiny_config)
         h = torch.randn(2, 8, tiny_config.n_embd)
         out = layer(h)
         assert out.shape == (2, 8, tiny_config.n_embd)
@@ -161,20 +166,20 @@ class TestSublayers(TestNanoMythos):
 
     def test_mlp_sublayer_no_residual(self, tiny_config):
         """MLPSublayer is residual-free: zero input -> non-zero output."""
-        layer = MLPSublayer(tiny_config)
+        layer = _MLPSublayer(tiny_config)
         h = torch.zeros(1, 4, tiny_config.n_embd)
         out = layer(h)
         # FeedForward has bias + activation, so output should not be zero
         assert out.abs().sum() > 0
 
     def test_kda_sublayer_init(self, tiny_config):
-        layer = KDASublayer(tiny_config, layer_idx=0)
+        layer = _KDASublayer(tiny_config, layer_idx=0)
         assert isinstance(layer.norm, nn.RMSNorm)
         assert hasattr(layer.attn, "forward")
 
     @CUDA_ONLY
     def test_kda_sublayer_forward_shape(self, tiny_config):
-        layer = KDASublayer(tiny_config, layer_idx=0).cuda()
+        layer = _KDASublayer(tiny_config, layer_idx=0).cuda()
         h = torch.randn(2, 8, tiny_config.n_embd, device="cuda")
         out = layer(h)
         assert out.shape == (2, 8, tiny_config.n_embd)
@@ -190,18 +195,18 @@ class TestRecurrentBlockBuilder(TestNanoMythos):
     """Tests for _build_recurrent_block factory."""
 
     def test_build_mha_block_init(self, tiny_config):
-        block = _build_recurrent_block(tiny_config, "mha", layer_idx=0)
+        block = _build_recurrent_block(tiny_config, AttentionType.MHA, layer_idx=0)
         assert hasattr(block, "core_block")
         assert hasattr(block, "injection")
         assert block.use_lti == tiny_config.use_lti
 
     def test_build_kda_block_init(self, tiny_config):
-        block = _build_recurrent_block(tiny_config, "kda", layer_idx=0)
+        block = _build_recurrent_block(tiny_config, AttentionType.KDA, layer_idx=0)
         assert hasattr(block, "core_block")
         assert block.use_lti == tiny_config.use_lti
 
     def test_mha_block_forward_cpu(self, tiny_config):
-        block = _build_recurrent_block(tiny_config, "mha", layer_idx=0)
+        block = _build_recurrent_block(tiny_config, AttentionType.MHA, layer_idx=0)
         h = torch.randn(2, 4, tiny_config.n_embd)
         e = torch.randn(2, 4, tiny_config.n_embd)
         out = block(h, e, n_loops=2)
@@ -210,7 +215,9 @@ class TestRecurrentBlockBuilder(TestNanoMythos):
 
     @CUDA_ONLY
     def test_kda_block_forward_cuda(self, tiny_config):
-        block = _build_recurrent_block(tiny_config, "kda", layer_idx=0).cuda()
+        block = _build_recurrent_block(
+            tiny_config, AttentionType.KDA, layer_idx=0
+        ).cuda()
         h = torch.randn(2, 4, tiny_config.n_embd, device="cuda")
         e = torch.randn(2, 4, tiny_config.n_embd, device="cuda")
         out = block(h, e, n_loops=2)
@@ -218,7 +225,7 @@ class TestRecurrentBlockBuilder(TestNanoMythos):
         assert not torch.isnan(out).any()
 
     def test_mha_block_loop_count_override(self, tiny_config):
-        block = _build_recurrent_block(tiny_config, "mha", layer_idx=0)
+        block = _build_recurrent_block(tiny_config, AttentionType.MHA, layer_idx=0)
         h = torch.randn(1, 2, tiny_config.n_embd)
         e = torch.randn(1, 2, tiny_config.n_embd)
         # Disable LTI so we can compare outputs more directly
