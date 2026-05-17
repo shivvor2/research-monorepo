@@ -1,0 +1,45 @@
+# =============================================================================
+# Quick Sanity Check Config
+# =============================================================================
+# Usage:
+#   python 02_pretrain.py --config-name=test
+#   python 02_pretrain.py --config-name=test training.max_steps=50
+# =============================================================================
+
+defaults:
+  - config  # Inherit from main config, then override below
+
+experiment:
+  name: nanomythos_test
+
+checkpoint:
+  resume_from: auto  # Test AutoResume
+
+# Override for quick testing
+training:
+  max_steps: 100
+  grad_accum_schedule: null  # Use simple grad_accum for tests
+  grad_accum: 2
+  val_check_interval: 25
+  limit_val_batches: 5
+  log_every_n_steps: 5
+  checkpoint_every_n_steps: 50
+  save_top_k: 1
+  num_train_shards: 10
+  compile_mode: "max-autotune"
+
+data:
+  batch_size: 2        # Smaller batch for memory safety
+  num_workers: 0       # Avoid multiprocessing issues in tests
+
+logging:
+  wandb:
+    enabled: false     # Don't pollute WandB with test runs
+  csv:
+    enabled: true
+    save_dir: logs/test_csv
+
+# Use test output directory
+hydra:
+  run:
+    dir: outputs/test/${now:%H-%M-%S}

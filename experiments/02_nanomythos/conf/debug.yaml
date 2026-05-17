@@ -1,0 +1,44 @@
+# Quick override config for debugging Triton power-of-2 constraint
+defaults:
+  - config
+
+experiment:
+  name: nanomythos_debug
+
+model:
+  n_embd: 64
+  n_head: 4
+  ff_dim: 128
+  n_prelude_blocks: 1
+  n_loop_blocks: 1
+  n_coda_blocks: 1
+  kda_head_dim: 32
+  film_hidden: 16
+  attnres_block_size: 2
+
+training:
+  max_steps: 5
+  grad_accum_schedule: null
+  grad_accum: 1
+  val_check_interval: 5
+  limit_val_batches: 1
+  log_every_n_steps: 1
+  checkpoint_every_n_steps: 100
+  save_top_k: 1
+  num_train_shards: 1
+  compile_mode: "default"
+
+data:
+  batch_size: 1
+  seq_len: 32
+  num_workers: 0
+
+logging:
+  wandb:
+    enabled: false
+  csv:
+    enabled: false
+
+hydra:
+  run:
+    dir: outputs/debug/${now:%H-%M-%S}
