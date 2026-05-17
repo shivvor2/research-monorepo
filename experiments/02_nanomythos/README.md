@@ -77,6 +77,6 @@ training:
 Parameters are split between **NorMuon** (matrix optimizer) and **CautiousAdamW** (vector optimizer) based on `VECTOR_TARGET_MODULES` in `02_pretrain.py`:
 
 - **NorMuon**: Attention/MLP weight matrices (2D projections)
-- **AdamW**: Embeddings, norms, biases, KDA state parameters (`A_log`, `dt_bias`), LTI injection, ACT halting, short-conv filters, FiLM embeddings, AttnRes pseudo-queries
+- **CautiousAdamW**: Embeddings, norms, biases, KDA state parameters (`A_log`, `dt_bias`), LTI injection, ACT halting, short-conv filters, FiLM embeddings, AttnRes pseudo-queries
 
 See the inline comments in `02_pretrain.py` for the full list.

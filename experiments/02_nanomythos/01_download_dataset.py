@@ -36,7 +36,6 @@ logger = logging.getLogger(__name__)
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    # Check existance of local data
     check_auth()
 
     # Parse arguments
