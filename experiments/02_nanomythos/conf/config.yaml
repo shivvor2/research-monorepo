@@ -1,0 +1,187 @@
+# =============================================================================
+# NanoMythos Training Config
+# =============================================================================
+# Usage:
+#   python 02_pretrain.py                           # Use defaults
+#   python 02_pretrain.py training.max_steps=1000   # Override
+#   python 02_pretrain.py --config-name=test        # Use test config
+# =============================================================================
+
+# Set to an integer for reproducibility, or null for random seed
+seed: null
+
+# -----------------------------------------------------------------------------
+# Experiment Identity & Checkpointing
+# -----------------------------------------------------------------------------
+experiment:
+  # Logical name for this experiment family.
+  # Used to track the "latest" run for auto-resume.
+  name: nanomythos
+
+checkpoint:
+  # Where to write checkpoints *inside* the Hydra run directory
+  dir: checkpoints
+
+  # Resume behavior: 'auto', null, or explicit path
+  # - auto: Find latest run for this experiment.name and resume if
+  #   compatible.
+  # - null: Always start fresh.
+  # - /path/to/ckpt: Resume explicitly from this path.
+  resume_from: auto
+
+# For validation and usage
+checkpoint_path: null
+
+# -----------------------------------------------------------------------------
+# Model Architecture (NanoMythos, ~150M params)
+# -----------------------------------------------------------------------------
+model:
+  # Core GPT-2 small dimensions (n_embd MUST be power of 2 for flash_attn_res)
+  vocab_size: 50304  # Padded for alignment (50257 actual)
+  block_size: 1024
+  n_embd: 1024        # Power of 2 required by flash_attn_res Triton kernels
+  n_head: 16          # n_embd / n_head = 64 (head dimension)
+  ff_dim: 2048
+  bias: false
+  dropout: 0.0
+  padding_idx: 50256
+
+  # Phase structure (prelude + loop + coda)
+  n_prelude_blocks: 2
+  n_loop_blocks: 2
+  n_coda_blocks: 2
+
+  # Attention mixing: 1 KDA per 1 MHA (ratio=1)
+  linear_to_full_ratio: 1
+
+  # Recurrent loop settings (loop phase only)
+  max_loop_iters: 5
+  act_threshold: 0.99
+  use_lti: true
+  loop_dim_fraction: 8
+  loop_theta: 10000.0
+  film_hidden: 64
+
+  # AttnRes settings
+  attnres_block_size: null    # null = auto-compute (~8 blocks)
+  attnres_rmsnorm_eps: 1.0e-6
+
+  # KimiDeltaAttention settings
+  kda_head_dim: 128
+  kda_expand_v: 1.0
+  kda_use_short_conv: true
+  kda_conv_size: 4
+  kda_mode: "chunk"
+
+# -----------------------------------------------------------------------------
+# Data
+# -----------------------------------------------------------------------------
+data:
+  seq_len: 1024
+  batch_size: 4    # Physical batch (limited by 12GB VRAM)
+  num_workers: 2
+
+# -----------------------------------------------------------------------------
+# Training Loop
+# -----------------------------------------------------------------------------
+training:
+  # Torch compile settings
+  compile_mode: "max-autotune-no-cudagraphs"
+
+  # Steps calculated for full FineWeb-10B at max accum (16):
+  # 10B tokens / (4 * 1024 * 16) ≈ 150,000 steps
+  max_steps: 150000
+
+  # Gradient accumulation schedule:
+  #   Steps 0-1999:  accum = 8  (32,768 tokens/step)
+  #   Steps 2000+:   accum = 16 (65,536 tokens/step)
+  #
+  # To use constant accumulation, set grad_accum_schedule: null
+  # and instead set grad_accum below.
+  grad_accum_schedule:
+    0: 8
+    2000: 16
+
+  # Fallback constant grad accum (used when grad_accum_schedule is null)
+  grad_accum: null
+
+  grad_clip_val: 1.0
+  precision: bf16-mixed
+
+  val_check_interval: 1000
+  limit_val_batches: 100
+  log_every_n_steps: 10
+
+  # Checkpoint frequency
+  checkpoint_every_n_steps: 1000
+  save_top_k: 3
+
+  # Number of training shards for fineweb dataset
+  num_train_shards: 99  # All shards
+
+# -----------------------------------------------------------------------------
+# Matrix Optimizer (NorMuon) - for attention/MLP weights
+# -----------------------------------------------------------------------------
+optimizer:
+  matrix:
+    class_path: research_lib.optimizers.NorMuon
+    lr: 0.02
+    weight_decay: 0.1
+    momentum: 0.95
+    beta2: 0.95
+
+    schedule:
+      lr:
+        warmup_frac: 0.01
+        cooldown_frac: 0.20
+        min_value: 0.0
+        max_value: ${optimizer.matrix.lr}
+        decay_type: cosine
+      momentum:
+        warmup_frac: 0.01
+        cooldown_frac: 0.20
+        min_value: 0.85
+        max_value: ${optimizer.matrix.momentum}
+        decay_type: linear
+
+# -----------------------------------------------------------------------------
+# Vector Optimizer (CautiousAdamW) - for embeddings/norms/KDA-state
+# -----------------------------------------------------------------------------
+  vector:
+    class_path: research_lib.optimizers.CautiousAdamW
+    lr: 3.0e-4
+    betas: [0.9, 0.95]
+    weight_decay: 0.1
+
+    schedule:
+      lr:
+        warmup_frac: 0.01
+        cooldown_frac: 0.20
+        min_value: 0.0
+        max_value: ${optimizer.vector.lr}
+        decay_type: cosine
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  # WandB (set project_name to null to disable)
+  wandb:
+    enabled: true
+    project: NanoMythos
+    entity: null  # Optional override; null = default from API key
+    name: null    # Auto-generated if null
+
+  # CSV logger (always enabled for local analysis)
+  csv:
+    enabled: true
+    save_dir: logs/csv
+
+# -----------------------------------------------------------------------------
+# Hydra Settings
+# -----------------------------------------------------------------------------
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: true
