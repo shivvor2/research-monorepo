@@ -18,7 +18,14 @@ functions of a seed).
   must differ from each other and from any train seed (defaults do).
 
 Resumption: :meth:`state_dict` / :meth:`load_state_dict` carry the next
-batch index, so a resumed run continues the same stream.
+batch index, so a resumed run continues the same stream. **Exact resumption
+requires ``num_workers=0``**: only in-process iteration advances the stream
+position — DataLoader worker processes iterate pickled copies of the
+dataset, so the parent's position does not advance. With
+``num_workers > 0`` the caller must instead set the next batch index on
+resume from the trainer's consumed batch count (its global step, absent
+gradient accumulation), e.g.
+``dm.load_state_dict({"next_batch_idx": trainer.global_step})``.
 """
 
 from __future__ import annotations
@@ -180,6 +187,17 @@ class SyntheticRecallDataModule(L.LightningDataModule):
     Raises:
         ValueError: invalid ``task``, sizes, or colliding seeds.
         TypeError: ``task_config`` type does not match ``task``.
+
+    Note:
+        Exact resumption via :meth:`state_dict` / :meth:`load_state_dict`
+        requires ``num_workers=0``: only in-process iteration advances the
+        stream position (worker processes iterate pickled copies of the
+        dataset, so the parent's counter does not move). With
+        ``num_workers > 0``, set the batch index on resume from the
+        trainer's consumed batch count (its global step, absent gradient
+        accumulation), e.g.
+        ``dm.load_state_dict({"next_batch_idx": trainer.global_step})``.
+        Batch *contents* are per-index deterministic for any worker count.
 
     Example:
         >>> dm = SyntheticRecallDataModule(
