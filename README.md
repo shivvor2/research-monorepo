@@ -22,6 +22,8 @@ A monorepo containing:
 
 **Attention Layers:**
 - [Multi-Head Attention](src/research_lib/layers/attention/rotary_mha.py): With RoPE embeddings, QK-Norm, and [XSA](https://arxiv.org/pdf/2603.09078).
+- [Gated delta-rule token mixer (KDA / GDN-2 / GDN; **Reference**)](src/research_lib/layers/attention/gated_delta/reference.py): Single-state gated delta rule with channel-wise erase/write gates and channel-wise decay ([GDN-2](https://arxiv.org/abs/2605.22791)), reducing exactly to [KDA](https://arxiv.org/abs/2510.26692) and [Gated DeltaNet](https://arxiv.org/abs/2412.06464). Includes the GDN-2 Table 5 gate ablations, a causal short conv, and chunkwise/recurrent scan paths.
+    - *Reference implementation* (naive PyTorch + autograd): use fla kernels for production-scale training.
 
 **Optimizers:**
 - [CautiousAdamW](src/research_lib/optimizers/cautious_adamw.py): Patched AdamW optimizer with cautious stepping ([paper](https://arxiv.org/abs/2510.12402)).
