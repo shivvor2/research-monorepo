@@ -14,22 +14,49 @@ geometry of its writes:
 Per example: the write region occupies positions ``[0, R)`` with
 ``R = T - 2K``, divided into ``R / 2`` two-token pair slots (slot ``i`` =
 positions ``2i``, ``2i + 1``); the query block occupies the last ``2K``
-positions as ``[key, answer_slot]`` pairs, each key once in random order.
-Values are drawn distinct from ``[V/2, V)`` (two per double-write key, one
-per single key); keys are drawn distinct from ``[1, V/2)``.
+positions as ``[key, answer_slot]`` pairs, each key once. Keys are drawn
+distinct from ``[1, V/2)``, values distinct from ``[V/2, V)`` (two per
+double-write key with ``v_old != v_new`` since they are distinct draws,
+one per single key). The label at the answer slot of key ``k`` is the
+**latest** value; ``old_labels`` carries ``v_old`` at the answer slots of
+double-write keys, ``key_class`` the class code and ``write_distance`` the
+token distance ``2 (s_2 - s_1)`` between the two writes (``-1`` for single
+keys); both ``-100`` / ``-1`` elsewhere. Labels follow the repo's unshifted
+convention (``labels[p]`` is predicted from ``p - 1``).
 
-The label at the answer slot of key ``k`` is the **latest** value (the
-value of the second write for double-write keys). ``old_labels`` carries
-``v_old`` at the answer slots of double-write keys, ``key_class`` the class
-code and ``write_distance`` the token distance between the two writes
-(``-1`` for single keys); both ``-100`` / ``-1`` elsewhere. Labels follow
-the repo's unshifted convention (``labels[p]`` is predicted from ``p - 1``).
+Unlike MQAR, filler is drawn from ``[1, V)`` **excluding this example's keys
+and values** (rejection sampling), so a filler token can never act as an
+extra write to a queried key.
 
-Unlike MQAR, filler is drawn from ``[1, V)`` **excluding this example's
-keys and values** (rejection sampling), so a filler token can never act as
-an extra write to a queried key.
+Implementation: BATCH-VECTORIZED (throughput). ``generate_overwrite``
+generates all examples of a call — and of each restart round — in
+vectorized numpy passes; per-example placement state lives in a boolean
+mask over the pair slots. The per-example random procedure is the spec's:
 
-Pure and deterministic in ``(config, seed)`` via ``np.random.default_rng``.
+- ``K``: uniform over ``config.num_keys`` (or fixed via ``num_keys``);
+- classes: iid categorical draws from ``class_probs``;
+- keys / values: uniform draws without replacement (rejection on
+  duplicates within a row);
+- placement: keys processed in index order ``t = 0, 1, ...`` — the spec's
+  "process keys in random order" is distributionally equivalent because
+  the classes are iid (the class sequence in processing order has the same
+  law in any order) and the (key, value) pairs are exchangeable.
+  ``s_1`` is uniform over the free pair slots, ``s_2`` uniform over the
+  free slots satisfying the class block rule given ``s_1`` (the slots of a
+  block are contiguous, so the valid slots form a slice ``[a, b)``);
+  ``s_1`` is redrawn up to ``max_placement_attempts`` times, after which
+  the whole example is restarted (fresh ``K``, classes, keys, values; at
+  most ``_MAX_EXAMPLE_RESTARTS`` restarts per example);
+- query block: each key once, in uniform random order (a uniform
+  permutation per example);
+- filler: uniform over ``[1, V)`` excluding the example's keys and values.
+
+Because the batch implementation draws its randomness in a different
+order than a per-example loop, its random streams are its own: generator
++ seed reproduce every example bit-exactly. A spec-literal sequential
+reference procedure lives in the test suite
+(``test_D05_vectorized_matches_reference_distribution``) and is compared
+against this implementation distributionally.
 """
 
 from __future__ import annotations
@@ -107,8 +134,7 @@ class OverwriteConfig:
         # Feasibility check for the largest K: an all-distant assignment must
         # fit (4K write tokens + 2K query tokens <= T), and the write region
         # must span at least distant_min_blocks + 1 blocks.
-        k_max = max(self.num_keys)
-        _validate_key_count(self, k_max)
+        _validate_key_count(self, max(self.num_keys))
         if self.block_size < 2:
             raise ValueError(f"block_size must be >= 2, got {self.block_size}")
         if self.distant_min_blocks < 1:
@@ -161,137 +187,261 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
         )
 
 
-def _placement_ok(
-    cls_code: int, block_a: int, block_b: int, config: OverwriteConfig
-) -> bool:
-    """Class rule for placing the second write in block ``block_b`` when the
-    first write sits in block ``block_a``."""
-    cls_code = OverwriteClass(cls_code)
-    if cls_code == OverwriteClass.SAME:
-        return block_b == block_a
-    if cls_code == OverwriteClass.ADJACENT:
-        return block_b == block_a + 1
-    # DISTANT
-    return block_b - block_a >= config.distant_min_blocks
+def _distinct_ints(
+    rng: np.random.Generator, low: int, high: int, shape: tuple[int, int]
+) -> np.ndarray:
+    """Uniform draws without replacement, per row.
 
+    Each row of the result holds ``shape[1]`` distinct values from
+    ``[low, high)``. Rows are redrawn (rejection) until distinct, which
+    preserves the uniform law over ordered distinct rows.
 
-def _generate_example(
-    config: OverwriteConfig, rng: np.random.Generator, k: int
-) -> dict[str, np.ndarray] | None:
-    """Generate one overwrite example with ``k`` keys.
+    Args:
+        rng: numpy Generator.
+        low: inclusive lower bound.
+        high: exclusive upper bound.
+        shape: ``(rows, draws)``.
 
     Returns:
-        Dict of int64 arrays of shape ``(T,)`` (input_ids, labels,
-        old_labels, key_class, write_distance), or ``None`` to signal that
-        placement failed and the example should be restarted.
+        Int64 array of ``shape`` whose rows hold distinct values.
+
+    Shape:
+        ``(shape)``.
     """
+    out = np.empty(shape, dtype=np.int64)
+    pending = np.arange(shape[0])
+    while pending.size:
+        out[pending] = rng.integers(low, high, size=(pending.size, shape[1]))
+        ordered = np.sort(out[pending], axis=1)
+        duplicate = np.any(ordered[:, 1:] == ordered[:, :-1], axis=1)
+        pending = pending[duplicate]
+    return out
+
+
+def _generate_example_batch(
+    config: OverwriteConfig, rng: np.random.Generator, k_arr: np.ndarray
+) -> tuple[dict[str, np.ndarray], np.ndarray]:
+    """Generate a batch of examples in vectorized numpy passes.
+
+    Args:
+        config: task configuration.
+        rng: numpy Generator (shared across the whole batch).
+        k_arr: ``(n,)`` int64 key counts per row (already drawn or fixed).
+
+    Returns:
+        Tuple ``(arrays, success)``: ``arrays`` maps the five per-example
+        array names (``input_ids``, ``labels``, ``old_labels``,
+        ``key_class``, ``write_distance``) to ``(n, T)`` int64 arrays;
+        ``success`` is the ``(n,)`` bool mask of rows whose placement
+        succeeded (failed rows exhausted their per-key budget and must be
+        restarted by the caller).
+
+    Shape:
+        ``arrays[*]: (n, T)``; ``success: (n,)``.
+    """
+    n = int(k_arr.size)
     seq_len, vocab = config.seq_len, config.vocab_size
-    block = config.block_size
-    write_region = seq_len - 2 * k
-    num_slots = write_region // 2
+    block, dmin = config.block_size, config.distant_min_blocks
+    probs = np.asarray(config.class_probs, dtype=np.float64)
+    probs = probs / probs.sum()
 
-    # Classes (multinomial per key), keys and values (distinct).
-    class_p = np.asarray(config.class_probs, dtype=np.float64)
-    classes = rng.choice(4, size=k, p=class_p / class_p.sum())
-    keys = rng.choice(np.arange(1, vocab // 2), size=k, replace=False)
-    values = rng.choice(np.arange(vocab // 2, vocab), size=2 * k, replace=False)
+    k_max = int(k_arr.max())
+    write_region = seq_len - 2 * k_arr  # (n,), even (T even, k int)
+    n_slots = write_region // 2  # (n,)
+    slots_max = int(n_slots.max())
+    # Slot s occupies positions 2s, 2s + 1 -> block (2 s) // B; the slots of
+    # a block are contiguous: block b covers slots [lo[b], lo[b+1]) with
+    # lo[b] = ceil(b * B / 2) = (b * B + 1) // 2.
+    block_of_slot = (2 * np.arange(slots_max, dtype=np.int64)) // block
+    n_blocks_max = int(block_of_slot[-1]) + 1
+    block_lo = np.array(
+        [(b * block + 1) // 2 for b in range(n_blocks_max + dmin + 3)],
+        dtype=np.int64,
+    )
+    n_blocks = block_of_slot[n_slots - 1] + 1  # (n,) per-row block count
 
-    # Placement: process keys in random order; s_2 > s_1 per the class rule.
-    free = list(range(num_slots))
-    placements: dict[int, tuple[int, ...]] = {}
-    for i in rng.permutation(k):
-        cls_code = int(classes[i])
-        if cls_code == int(OverwriteClass.SINGLE):
-            s = free[int(rng.integers(0, len(free)))]
-            free.remove(s)
-            placements[i] = (s,)
-            continue
-        placed = False
-        for _ in range(config.max_placement_attempts):
-            s1 = free[int(rng.integers(0, len(free)))]
-            b1 = (2 * s1) // block
-            candidates = [
-                s2
-                for s2 in free
-                if s2 > s1 and _placement_ok(cls_code, b1, (2 * s2) // block, config)
-            ]
-            if candidates:
-                s2 = candidates[int(rng.integers(0, len(candidates)))]
-                free.remove(s2)  # s1 is removed below; keep order simple
-                free.remove(s1)
-                placements[i] = (s1, s2)
-                placed = True
+    valid_keys = np.arange(k_max, dtype=np.int64)[None, :] < k_arr[:, None]
+    classes = rng.choice(4, size=(n, k_max), p=probs)
+    keys = _distinct_ints(rng, 1, vocab // 2, (n, k_max))
+    values = _distinct_ints(rng, vocab // 2, vocab, (n, 2 * k_max))
+    # Query order (spec: "each key once, in random order"): a uniform
+    # permutation per row. Argsort of the row's uniforms with invalid keys
+    # masked to +inf: the first K_r entries are then exactly the valid key
+    # indices in uniform random order.
+    uniforms = rng.random((n, k_max))
+    query_order = np.argsort(np.where(valid_keys, uniforms, np.inf), axis=1)
+    q_slot = np.empty((n, k_max), dtype=np.int64)
+    q_rows, q_js = np.nonzero(valid_keys)
+    # Key query_order[r, j] goes to query slot j (j < K_r).
+    q_slot[q_rows, query_order[q_rows, q_js]] = q_js
+
+    # Placement state: free pair slots per row.
+    free_mask = np.arange(slots_max, dtype=np.int64)[None, :] < n_slots[:, None]
+    free_count = n_slots.astype(np.int64).copy()
+    s1_arr = np.full((n, k_max), -1, dtype=np.int64)
+    s2_arr = np.full((n, k_max), -1, dtype=np.int64)
+    slot_arr = np.full((n, k_max), -1, dtype=np.int64)
+    success = np.ones(n, dtype=bool)
+
+    for t in range(k_max):
+        active = np.flatnonzero(k_arr > t)
+        if active.size == 0:
+            break
+        cls_t = classes[active, t]
+        single_rows = active[cls_t == int(OverwriteClass.SINGLE)]
+
+        # Single writes: one uniform free slot.
+        if single_rows.size:
+            counts = free_count[single_rows]
+            ranks = (rng.random(single_rows.size) * counts).astype(np.int64)
+            cum = np.cumsum(free_mask[single_rows], axis=1, dtype=np.int64)
+            # The (rank)-th free slot (0-based) is the first p with
+            # #free in [0..p] == rank + 1.
+            pos = (cum == (ranks + 1)[:, None]).argmax(axis=1)
+            free_mask[single_rows, pos] = False
+            free_count[single_rows] -= 1
+            slot_arr[single_rows, t] = pos
+
+        # Double writes: s1 uniform over free slots, s2 uniform over the
+        # class-valid candidates given s1; retry s1 on failure.
+        remaining = active[cls_t != int(OverwriteClass.SINGLE)]
+        for _attempt in range(config.max_placement_attempts):
+            if remaining.size == 0:
                 break
-        if not placed:
-            return None  # restart the example
+            m = remaining.size
+            counts = free_count[remaining]
+            ranks = (rng.random(m) * counts).astype(np.int64)
+            cum = np.cumsum(free_mask[remaining], axis=1, dtype=np.int64)
+            # cum[:, j] = # free slots in [0..j]; cum0[:, j] = # free in
+            # [0, j), the prefix-sum form used for slice counts.
+            cum0 = np.zeros((m, slots_max + 1), dtype=np.int64)
+            cum0[:, 1:] = cum
+            s1 = (cum == (ranks + 1)[:, None]).argmax(axis=1)
+            b1 = block_of_slot[s1]
+            cls_r = classes[remaining, t]
+            nb_r = n_blocks[remaining]
+            ns_r = n_slots[remaining]
+            # Candidate slice [a, b) per class; the empty sentinel makes
+            # a > b so the count is <= 0.
+            empty = slots_max + 1
+            same_a = s1 + 1
+            same_b = np.minimum(block_lo[b1 + 1], ns_r)
+            adj_ok = b1 + 1 < nb_r
+            adj_a = np.where(adj_ok, block_lo[b1 + 1], empty)
+            adj_b = np.minimum(np.where(adj_ok, block_lo[b1 + 2], 0), ns_r)
+            dist_ok = b1 + dmin < nb_r
+            dist_a = np.where(dist_ok, block_lo[b1 + dmin], empty)
+            dist_b = np.where(dist_ok, ns_r, 0)
+            a = np.where(
+                cls_r == int(OverwriteClass.SAME),
+                same_a,
+                np.where(cls_r == int(OverwriteClass.ADJACENT), adj_a, dist_a),
+            )
+            b = np.where(
+                cls_r == int(OverwriteClass.SAME),
+                same_b,
+                np.where(cls_r == int(OverwriteClass.ADJACENT), adj_b, dist_b),
+            )
+            a_c = np.minimum(a, slots_max)
+            b_c = np.minimum(b, slots_max)
+            local = np.arange(m)
+            cand_count = cum0[local, b_c] - cum0[local, a_c]
+            ok = cand_count > 0
+            if ok.any():
+                rows_ok = remaining[ok]
+                local_ok = np.flatnonzero(ok)
+                c_ranks = (rng.random(rows_ok.size) * cand_count[ok]).astype(np.int64)
+                # The c-th free slot in [a, b) (0-based) is the first p with
+                # #free in [0..p] == #free in [0, a) + c + 1.
+                target = cum0[local_ok, a_c[ok]] + c_ranks + 1
+                s2 = (cum[ok] == target[:, None]).argmax(axis=1)
+                s1_arr[rows_ok, t] = s1[ok]
+                s2_arr[rows_ok, t] = s2
+                free_mask[rows_ok, s1[ok]] = False
+                free_mask[rows_ok, s2] = False
+                free_count[rows_ok] -= 2
+            remaining = remaining[~ok]
+        if remaining.size:
+            # Per-key placement budget exhausted: restart these rows.
+            success[remaining] = False
 
-    input_ids = np.zeros(seq_len, dtype=np.int64)
-    labels = np.full(seq_len, IGNORE_INDEX, dtype=np.int64)
-    old_labels = np.full(seq_len, IGNORE_INDEX, dtype=np.int64)
-    key_class = np.full(seq_len, NO_CLASS, dtype=np.int64)
-    write_distance = np.full(seq_len, NO_DISTANCE, dtype=np.int64)
-    occupied = np.zeros(seq_len, dtype=bool)
+    # ---- Write tokens and query block (vectorized scatter) ----
+    input_ids = np.zeros((n, seq_len), dtype=np.int64)
+    labels = np.full((n, seq_len), IGNORE_INDEX, dtype=np.int64)
+    old_labels = np.full((n, seq_len), IGNORE_INDEX, dtype=np.int64)
+    key_class = np.full((n, seq_len), NO_CLASS, dtype=np.int64)
+    write_distance = np.full((n, seq_len), NO_DISTANCE, dtype=np.int64)
+    occupied = np.zeros((n, seq_len), dtype=bool)
 
-    # Write tokens: slot s holds (key, value) at positions (2s, 2s + 1).
-    used_values = []
-    for i in range(k):
-        key = keys[i]
-        slots = placements[i]
-        if len(slots) == 1:
-            s = slots[0]
-            value = values[2 * i]
-            input_ids[2 * s] = key
-            input_ids[2 * s + 1] = value
-            used_values.append(value)
-        else:
-            s1, s2 = slots
-            v_old, v_new = values[2 * i], values[2 * i + 1]
-            input_ids[2 * s1] = key
-            input_ids[2 * s1 + 1] = v_old
-            input_ids[2 * s2] = key
-            input_ids[2 * s2 + 1] = v_new
-            used_values.extend([v_old, v_new])
-        for s in slots:
-            occupied[2 * s] = True
-            occupied[2 * s + 1] = True
+    is_double = valid_keys & (classes != int(OverwriteClass.SINGLE))
+    is_single = valid_keys & (classes == int(OverwriteClass.SINGLE))
 
-    # Query block: each key once in random order, [key, answer_slot].
-    latest = {
-        i: (values[2 * i] if len(placements[i]) == 1 else values[2 * i + 1])
-        for i in range(k)
-    }
-    for j, i in enumerate(rng.permutation(k)):
-        query_pos = write_region + 2 * j
-        answer_pos = query_pos + 1
-        input_ids[query_pos] = keys[i]
-        occupied[query_pos] = True
-        labels[answer_pos] = latest[i]
-        key_class[answer_pos] = int(classes[i])
-        if len(placements[i]) == 2:
-            s1, s2 = placements[i]
-            old_labels[answer_pos] = values[2 * i]
-            write_distance[answer_pos] = 2 * (s2 - s1)
+    rows_d, ts_d = np.nonzero(is_double)
+    if rows_d.size:
+        s1_d = s1_arr[rows_d, ts_d]
+        s2_d = s2_arr[rows_d, ts_d]
+        input_ids[rows_d, 2 * s1_d] = keys[rows_d, ts_d]
+        input_ids[rows_d, 2 * s1_d + 1] = values[rows_d, 2 * ts_d]
+        input_ids[rows_d, 2 * s2_d] = keys[rows_d, ts_d]
+        input_ids[rows_d, 2 * s2_d + 1] = values[rows_d, 2 * ts_d + 1]
+        occupied[rows_d, 2 * s1_d] = True
+        occupied[rows_d, 2 * s1_d + 1] = True
+        occupied[rows_d, 2 * s2_d] = True
+        occupied[rows_d, 2 * s2_d + 1] = True
+    rows_s, ts_s = np.nonzero(is_single)
+    if rows_s.size:
+        slot_s = slot_arr[rows_s, ts_s]
+        input_ids[rows_s, 2 * slot_s] = keys[rows_s, ts_s]
+        input_ids[rows_s, 2 * slot_s + 1] = values[rows_s, 2 * ts_s]
+        occupied[rows_s, 2 * slot_s] = True
+        occupied[rows_s, 2 * slot_s + 1] = True
 
-    # Filler: uniform over [1, V) excluding this example's keys and values
-    # (all 2K drawn values, used or not).
-    forbidden = np.concatenate([keys, values])
-    fill_positions = np.flatnonzero(~occupied)
-    filled = np.empty(fill_positions.size, dtype=np.int64)
-    index = 0
-    while index < filled.size:
-        draws = rng.integers(1, vocab, size=filled.size - index)
-        accepted = draws[~np.isin(draws, forbidden)]
-        filled[index : index + accepted.size] = accepted
-        index += accepted.size
-    input_ids[fill_positions] = filled
+    # Query block: key t at [write_region + 2 * q_slot[t]], answer at +1.
+    rows_q, ts_q = np.nonzero(valid_keys)
+    q_key_pos = write_region[rows_q] + 2 * q_slot[rows_q, ts_q]
+    ans_pos = q_key_pos + 1
+    input_ids[rows_q, q_key_pos] = keys[rows_q, ts_q]
+    occupied[rows_q, q_key_pos] = True
+    labels[rows_q, ans_pos] = np.where(
+        is_double[rows_q, ts_q],
+        values[rows_q, 2 * ts_q + 1],
+        values[rows_q, 2 * ts_q],
+    )
+    key_class[rows_q, ans_pos] = classes[rows_q, ts_q]
+    dbl_q = is_double[rows_q, ts_q]
+    if dbl_q.any():
+        rows_dq = rows_q[dbl_q]
+        ts_dq = ts_q[dbl_q]
+        old_labels[rows_dq, ans_pos[dbl_q]] = values[rows_dq, 2 * ts_dq]
+        write_distance[rows_dq, ans_pos[dbl_q]] = 2 * (
+            s2_arr[rows_dq, ts_dq] - s1_arr[rows_dq, ts_dq]
+        )
 
-    return {
+    # ---- Filler: uniform over [1, V) excluding this example's keys and
+    #      values (rejection; a (rows, vocab) lookup table is O(K) per row
+    #      and cheap at the pilot sizes). ----
+    forbidden = np.zeros((n, vocab), dtype=bool)
+    forbidden[rows_q, keys[rows_q, ts_q]] = True
+    forbidden[rows_q, values[rows_q, 2 * ts_q]] = True
+    forbidden[rows_q, values[rows_q, 2 * ts_q + 1]] = True
+    fill_rows, fill_cols = np.nonzero(~occupied)
+    tokens = np.empty(fill_rows.size, dtype=np.int64)
+    pending_fill = np.arange(fill_rows.size)
+    while pending_fill.size:
+        tokens[pending_fill] = rng.integers(1, vocab, size=pending_fill.size)
+        rejected = forbidden[fill_rows[pending_fill], tokens[pending_fill]]
+        pending_fill = pending_fill[rejected]
+
+    input_ids[fill_rows, fill_cols] = tokens
+
+    arrays = {
         "input_ids": input_ids,
         "labels": labels,
         "old_labels": old_labels,
         "key_class": key_class,
         "write_distance": write_distance,
     }
+    return arrays, success
 
 
 def generate_overwrite(
@@ -300,12 +450,14 @@ def generate_overwrite(
     seed: int,
     num_keys: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Generate a batch of repeated-key overwrite examples.
+    """Generate a batch of repeated-key overwrite examples (batch-vectorized).
 
     Args:
         config: task configuration.
         num_examples: number of examples ``N`` to generate.
-        seed: seed for ``np.random.default_rng``. Pure and deterministic.
+        seed: seed for ``np.random.default_rng``. Pure and deterministic:
+            the same ``(config, num_examples, seed, num_keys)`` always
+            produces a bit-identical batch.
         num_keys: if given, every example uses exactly this many keys (a
             fixed slice) instead of drawing one from ``config.num_keys``.
 
@@ -321,13 +473,14 @@ def generate_overwrite(
           keys, else ``IGNORE_INDEX``.
         - ``key_class``: class code at answer positions (see
           :class:`OverwriteClass`), else ``-1``.
-        - ``write_distance``: token distance between the two writes at
-          answer positions of double-write keys, else ``-1``.
+        - ``write_distance``: token distance ``2 (s2 - s1)`` between the
+          two writes at answer positions of double-write keys, else ``-1``.
 
     Raises:
-        ValueError: if ``num_keys`` is infeasible for ``config.seq_len``.
+        ValueError: if ``num_examples < 1`` or ``num_keys`` is infeasible for
+            ``config.seq_len``.
         RuntimeError: if placement fails for an example after
-            ``max_placement_attempts`` restarts (unreachable for configs that
+            ``_MAX_EXAMPLE_RESTARTS`` restarts (unreachable for configs that
             pass the construction-time feasibility check).
 
     Shape:
@@ -341,44 +494,37 @@ def generate_overwrite(
 
     rng = np.random.default_rng(seed)
     seq_len = config.seq_len
-
-    input_ids = np.zeros((num_examples, seq_len), dtype=np.int64)
-    labels = np.full((num_examples, seq_len), IGNORE_INDEX, dtype=np.int64)
-    slice_id = np.zeros(num_examples, dtype=np.int64)
-    old_labels = np.full((num_examples, seq_len), IGNORE_INDEX, dtype=np.int64)
-    key_class = np.full((num_examples, seq_len), NO_CLASS, dtype=np.int64)
-    write_distance = np.full((num_examples, seq_len), NO_DISTANCE, dtype=np.int64)
-
-    for n in range(num_examples):
-        example = None
-        k = num_keys if num_keys is not None else 0
-        for _ in range(_MAX_EXAMPLE_RESTARTS):
-            k = (
-                num_keys
-                if num_keys is not None
-                else int(config.num_keys[rng.integers(0, len(config.num_keys))])
-            )
-            example = _generate_example(config, rng, k)
-            if example is not None:
-                break
-        if example is None:
-            raise RuntimeError(
-                f"overwrite: placement failed for example {n} after "
-                f"{_MAX_EXAMPLE_RESTARTS} restarts; the config is likely "
-                f"infeasible: {config}"
-            )
-        slice_id[n] = k
-        input_ids[n] = example["input_ids"]
-        labels[n] = example["labels"]
-        old_labels[n] = example["old_labels"]
-        key_class[n] = example["key_class"]
-        write_distance[n] = example["write_distance"]
-
-    return {
-        "input_ids": torch.from_numpy(input_ids),
-        "labels": torch.from_numpy(labels),
-        "slice_id": torch.from_numpy(slice_id),
-        "old_labels": torch.from_numpy(old_labels),
-        "key_class": torch.from_numpy(key_class),
-        "write_distance": torch.from_numpy(write_distance),
+    names = ("input_ids", "labels", "old_labels", "key_class", "write_distance")
+    arrays: dict[str, np.ndarray] = {
+        "input_ids": np.zeros((num_examples, seq_len), dtype=np.int64),
+        "labels": np.full((num_examples, seq_len), IGNORE_INDEX, dtype=np.int64),
+        "old_labels": np.full((num_examples, seq_len), IGNORE_INDEX, dtype=np.int64),
+        "key_class": np.full((num_examples, seq_len), NO_CLASS, dtype=np.int64),
+        "write_distance": np.full((num_examples, seq_len), NO_DISTANCE, dtype=np.int64),
     }
+    slice_id = np.zeros(num_examples, dtype=np.int64)
+
+    num_keys_arr = np.asarray(config.num_keys, dtype=np.int64)
+    pending = np.arange(num_examples, dtype=np.int64)
+    tries = np.zeros(num_examples, dtype=np.int64)
+    while pending.size:
+        tries[pending] += 1
+        if (tries[pending] > _MAX_EXAMPLE_RESTARTS).any():
+            raise RuntimeError(
+                f"overwrite: placement failed after {_MAX_EXAMPLE_RESTARTS} "
+                f"restarts; the config is likely infeasible: {config}"
+            )
+        if num_keys is None:
+            k_arr = num_keys_arr[rng.integers(0, num_keys_arr.size, size=pending.size)]
+        else:
+            k_arr = np.full(pending.size, num_keys, dtype=np.int64)
+        batch, ok = _generate_example_batch(config, rng, k_arr)
+        done = pending[ok]
+        for name in names:
+            arrays[name][done] = batch[name][ok]
+        slice_id[done] = k_arr[ok]
+        pending = pending[~ok]
+
+    out = {name: torch.from_numpy(arrays[name]) for name in names}
+    out["slice_id"] = torch.from_numpy(slice_id)
+    return out

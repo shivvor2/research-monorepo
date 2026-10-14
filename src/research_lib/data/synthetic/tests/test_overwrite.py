@@ -3,7 +3,10 @@ Test suite for the repeated-key overwrite generator (spec PR 3).
 
 Covers:
   * OverwriteConfig construction / feasibility validation
+  * Determinism per seed
   * D05: example structure (placement classes, latest-value labels, filler)
+  * D05: batch-vectorized implementation vs the spec-literal sequential
+    reference (_reference.py), compared distributionally
   * D06: class proportions match class_probs
   * D07: infeasible configs raise ValueError
 
@@ -15,6 +18,7 @@ import pytest
 import torch
 
 from ..overwrite import OverwriteClass, OverwriteConfig, generate_overwrite
+from ._reference import generate_overwrite_reference
 
 IGNORE = -100
 NO_CLASS = -1
@@ -252,6 +256,111 @@ def test_D05_all_single_class_extreme():
     assert torch.all(batch["key_class"][mask] == int(OverwriteClass.SINGLE))
     assert torch.all(batch["old_labels"] == IGNORE)
     assert torch.all(batch["write_distance"] == NO_DISTANCE)
+
+
+# =============================================================================
+# Tests: determinism
+# =============================================================================
+
+
+def test_D01_overwrite_determinism():
+    """Same seed reproduces the batch bit-exactly; a different seed differs."""
+    batch = generate_overwrite(SMALL, num_examples=16, seed=42)
+    again = generate_overwrite(SMALL, num_examples=16, seed=42)
+    for key in batch:
+        assert torch.equal(batch[key], again[key]), f"{key} differs"
+    other = generate_overwrite(SMALL, num_examples=16, seed=43)
+    assert not torch.equal(batch["input_ids"], other["input_ids"])
+
+
+# =============================================================================
+# Tests: D05 vectorized vs spec-literal reference (distributional)
+# =============================================================================
+
+
+def _first_write_slots(config, batch):
+    """Per-answer (class, first-write slot) and per-class write distances.
+
+    Returns ``{class_code: {"s1": list, "wd": list}}`` extracted from the
+    generated arrays (the write positions of each queried key are exactly
+    the occurrences of its token in the write region, since filler
+    excludes keys).
+    """
+    seq_len = config.seq_len
+    x = batch["input_ids"]
+    cls_arr = batch["key_class"]
+    wd_arr = batch["write_distance"]
+    stats = {c: {"s1": [], "wd": []} for c in range(4)}
+    for e in range(int(batch["slice_id"].shape[0])):
+        k = int(batch["slice_id"][e])
+        write_region = seq_len - 2 * k
+        slot_keys = x[e, 0:write_region:2]  # key token of each pair slot
+        for a in range(write_region + 1, seq_len, 2):
+            cls_code = int(cls_arr[e, a])
+            key = int(x[e, a - 1])
+            s1 = int(np.flatnonzero(slot_keys == key)[0])
+            stats[cls_code]["s1"].append(s1)
+            if cls_code != int(OverwriteClass.SINGLE):
+                stats[cls_code]["wd"].append(int(wd_arr[e, a]))
+    return stats
+
+
+@pytest.mark.slow
+def test_D05_vectorized_matches_reference_distribution():
+    """The batch-vectorized generator reproduces the spec-literal sequential
+    reference (kept verbatim in ``_reference.py``) distributionally.
+
+    Two-sample Kolmogorov-Smirnov tests (alpha = 1e-3) on the per-class
+    write-distance and first-write-slot distributions and on the class
+    frequencies: any placement-law difference (wrong slice bounds, biased
+    s_1 / s_2 / retry handling, query-order bias) shows up here, while the
+    structural tests only check per-example invariants.
+    """
+    from scipy.stats import ks_2samp
+
+    config = OverwriteConfig(
+        vocab_size=1024,
+        seq_len=256,
+        num_keys=(16,),
+        block_size=16,
+        distant_min_blocks=4,
+    )
+    n = 6000
+    vec = generate_overwrite(config, num_examples=n, seed=101, num_keys=16)
+    ref = generate_overwrite_reference(
+        vocab_size=config.vocab_size,
+        seq_len=config.seq_len,
+        num_keys=config.num_keys,
+        class_probs=config.class_probs,
+        block_size=config.block_size,
+        distant_min_blocks=config.distant_min_blocks,
+        max_placement_attempts=config.max_placement_attempts,
+        num_examples=n,
+        seed=202,
+        fixed_num_keys=16,
+    )
+    alpha = 1e-3
+    names = {0: "same", 1: "adjacent", 2: "distant", 3: "single"}
+
+    vec_stats = _first_write_slots(config, vec)
+    ref_stats = _first_write_slots(config, ref)
+    for cls_code in (0, 1, 2):  # write distance per double-write class
+        result = ks_2samp(vec_stats[cls_code]["wd"], ref_stats[cls_code]["wd"])
+        assert result.pvalue > alpha, (names[cls_code], "wd", result)
+    for cls_code in range(4):  # first-write slot per class
+        result = ks_2samp(vec_stats[cls_code]["s1"], ref_stats[cls_code]["s1"])
+        assert result.pvalue > alpha, (names[cls_code], "s1", result)
+
+    # Class frequencies at answer positions.
+    for batch in (vec, ref):
+        assert int((batch["labels"] != IGNORE).sum()) == n * 16
+    mask_vec = (vec["labels"] != IGNORE).flatten()
+    mask_ref = (ref["labels"] != IGNORE).flatten()
+    result = ks_2samp(
+        vec["key_class"].flatten()[mask_vec].tolist(),
+        ref["key_class"].flatten()[mask_ref].tolist(),
+    )
+    assert result.pvalue > alpha, ("class", result)
 
 
 # =============================================================================
