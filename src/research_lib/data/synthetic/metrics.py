@@ -22,9 +22,12 @@ either task).
   - ``other = 1 - acc - leak``.
 
 Class keys use the lowercase :class:`~research_lib.data.synthetic.overwrite.OverwriteClass`
-names (``same``, ``adjacent``, ``distant``, ``single``) and are emitted for
-all four classes (0.0 for classes that never occur). Computation stays on
-the logits' device; :meth:`RecallMetrics.compute` returns Python floats.
+names (``same``, ``adjacent``, ``distant``, ``single``); cells with no
+answers are OMITTED rather than emitted as 0.0 (a 0.0 would be
+indistinguishable from a real zero accuracy downstream), so classes and
+(slice, class) cells that never occur are absent from the dict. Computation
+stays on the logits' device; :meth:`RecallMetrics.compute` returns Python
+floats.
 """
 
 from __future__ import annotations
@@ -187,12 +190,17 @@ class RecallMetrics:
     def compute(self) -> dict[str, float]:
         """Return the accumulated metrics as Python floats.
 
-        Keys: ``'acc'``; ``'acc/slice={n}'`` per observed slice; if class
-        metrics were accumulated, ``'acc/class={c}'``,
-        ``'leak/class={c}'``, ``'other/class={c}'`` for all four classes
-        (0.0 when a class never occurs) and ``'acc/slice={n}/class={c}'``,
-        ``'leak/slice={n}/class={c}''``, ``'other/slice={n}/class={c}'``
-        per observed (slice, class) cell.
+        Keys: ``'acc'``; ``'acc/slice={n}'`` per observed slice. If class
+        metrics were accumulated: ``'acc/class={c}'``, ``'leak/class={c}'``,
+        ``'other/class={c}'`` per observed class and
+        ``'acc/slice={n}/class={c}'``, ``'leak/slice={n}/class={c}'``,
+        ``'other/slice={n}/class={c}'`` per observed (slice, class) cell.
+
+        Cells with no answers are OMITTED (never emitted as 0.0, which
+        would be indistinguishable from a real zero accuracy downstream):
+        classes and (slice, class) cells that never occur are therefore
+        absent from the dict, and downstream consumers must treat a missing
+        key as "not measured", not as zero.
         """
         out: dict[str, float] = {}
 
@@ -210,24 +218,24 @@ class RecallMetrics:
         acc, _, _ = _ratio(total)
         out["acc"] = acc
         for n, stats in sorted(self._slice_totals.items()):
+            if int(stats[0]) == 0:
+                # Empty slice cell: omit (cannot occur for valid batches).
+                continue
             acc_n, _, _ = _ratio(stats)
             out[f"acc/slice={n}"] = acc_n
-        with_class_keys = bool(self._class_totals) or self._with_classes is True
-        if with_class_keys:
-            for c in range(len(CLASS_NAMES)):
-                name = CLASS_NAMES[c]
-                stats = self._class_totals.get(c)
-                if stats is None:
-                    # Class never observed; emit zeros for a stable key set.
-                    out[f"acc/class={name}"] = 0.0
-                    out[f"leak/class={name}"] = 0.0
-                    out[f"other/class={name}"] = 0.0
-                    continue
-                acc_c, leak_c, other_c = _ratio(stats)
-                out[f"acc/class={name}"] = acc_c
-                out[f"leak/class={name}"] = leak_c
-                out[f"other/class={name}"] = other_c
+        for c, stats in sorted(self._class_totals.items()):
+            if int(stats[0]) == 0:
+                # Class never observed: omit.
+                continue
+            name = CLASS_NAMES[c]
+            acc_c, leak_c, other_c = _ratio(stats)
+            out[f"acc/class={name}"] = acc_c
+            out[f"leak/class={name}"] = leak_c
+            out[f"other/class={name}"] = other_c
         for (n, c), stats in sorted(self._slice_class_totals.items()):
+            if int(stats[0]) == 0:
+                # Empty (slice, class) cell: omit.
+                continue
             name = CLASS_NAMES[c]
             acc_nc, leak_nc, other_nc = _ratio(stats)
             out[f"acc/slice={n}/class={name}"] = acc_nc

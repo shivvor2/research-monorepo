@@ -105,17 +105,18 @@ def test_D09_exact_accuracy_slices_classes_leak_other():
     assert out["acc/class=single"] == pytest.approx(0.0)
     assert out["leak/class=adjacent"] == pytest.approx(0.0)
     assert out["other/class=single"] == pytest.approx(1.0)
-    # Unobserved classes are present with zeros.
-    for name in CLASS_NAMES:
-        assert f"acc/class={name}" in out
-        assert f"leak/class={name}" in out
-        assert f"other/class={name}" in out
-    assert out["acc/class=same"] == 0.0
-    assert out["acc/class=distant"] == 0.0
+    # Unobserved classes are OMITTED (not emitted as 0.0).
+    for name in ("same", "distant"):
+        assert f"acc/class={name}" not in out
+        assert f"leak/class={name}" not in out
+        assert f"other/class={name}" not in out
     # Cross slice x class.
     assert out["acc/slice=8/class=adjacent"] == pytest.approx(1.0)
     assert out["leak/slice=8/class=single"] == pytest.approx(0.0)
     assert out["other/slice=8/class=single"] == pytest.approx(1.0)
+    # (slice, class) cells of unobserved classes are absent too.
+    assert "acc/slice=8/class=same" not in out
+    assert "leak/slice=8/class=distant" not in out
 
 
 def test_D09_leakage_counts_old_value_predictions():
@@ -134,6 +135,9 @@ def test_D09_leakage_counts_old_value_predictions():
     assert out["other/class=adjacent"] == pytest.approx(0.0)
     # SINGLE answers never leak (old_labels is IGNORE there).
     assert out["leak/class=single"] == pytest.approx(0.0)
+    # Unobserved classes are omitted.
+    assert "acc/class=same" not in out
+    assert "leak/class=distant" not in out
 
 
 def test_D09_accumulation_across_updates_and_slices():
@@ -172,8 +176,13 @@ def test_D09_accumulation_across_updates_and_slices():
     assert out["acc/slice=8"] == pytest.approx(0.0)
     assert out["acc/slice=4/class=adjacent"] == pytest.approx(1.0)
     assert out["leak/class=adjacent"] == pytest.approx(0.0)
-    # 2 * 1e9-scale leak check: none.
+    # One wrong answer in the adjacent class that did not leak.
     assert out["other/class=adjacent"] == pytest.approx(0.5)
+    # Only the adjacent class was observed; the others are omitted.
+    for name in set(CLASS_NAMES) - {"adjacent"}:
+        assert f"acc/class={name}" not in out
+        assert f"acc/slice=4/class={name}" not in out
+        assert f"acc/slice=8/class={name}" not in out
 
 
 def test_D09_mqar_mode_without_class_keys():
@@ -213,9 +222,15 @@ def test_D09_perfect_and_random_overwrite_batches():
     metrics.update(logits, batch)
     out = metrics.compute()
     assert out["acc"] == pytest.approx(1.0)
-    assert all(out[f"acc/class={name}"] == pytest.approx(1.0) for name in CLASS_NAMES)
-    assert all(out[f"leak/class={name}"] == 0.0 for name in CLASS_NAMES)
-    assert all(out[f"other/class={name}"] == pytest.approx(0.0) for name in CLASS_NAMES)
+    observed = {
+        CLASS_NAMES[int(c)]
+        for c in torch.unique(batch["key_class"][batch["labels"] != IGNORE]).tolist()
+    }
+    assert all(out[f"acc/class={name}"] == pytest.approx(1.0) for name in observed)
+    assert all(out[f"leak/class={name}"] == 0.0 for name in observed)
+    assert all(out[f"other/class={name}"] == pytest.approx(0.0) for name in observed)
+    for name in set(CLASS_NAMES) - observed:
+        assert f"acc/class={name}" not in out
     # Old-value leakage: point every double-write answer at its old value.
     old_labels = batch["old_labels"]
     metrics.reset()
@@ -237,11 +252,25 @@ def test_D09_perfect_and_random_overwrite_batches():
     num_single = int(single_mask.sum())
     total = num_double + num_single
     assert out["acc"] == pytest.approx(num_single / total)
-    assert out["leak/class=distant"] == pytest.approx(1.0)
-    assert out["leak/class=same"] == pytest.approx(1.0)
-    assert out["leak/class=adjacent"] == pytest.approx(1.0)
-    assert out["acc/class=single"] == pytest.approx(1.0)
-    assert out["leak/class=single"] == pytest.approx(0.0)
+    answer_mask = batch["labels"] != IGNORE
+    double_mask = answer_mask & (old_labels != IGNORE)
+    single_cls = {
+        CLASS_NAMES[int(c)]
+        for c in torch.unique(
+            batch["key_class"][answer_mask & (old_labels == IGNORE)]
+        ).tolist()
+    }
+    double_cls = {
+        CLASS_NAMES[int(c)]
+        for c in torch.unique(batch["key_class"][double_mask]).tolist()
+    }
+    assert all(out[f"leak/class={name}"] == pytest.approx(1.0) for name in double_cls)
+    assert all(out[f"acc/class={name}"] == pytest.approx(0.0) for name in double_cls)
+    assert all(out[f"acc/class={name}"] == pytest.approx(1.0) for name in single_cls)
+    assert all(out[f"leak/class={name}"] == pytest.approx(0.0) for name in single_cls)
+    # Empty cells stay omitted.
+    for name in set(CLASS_NAMES) - double_cls - single_cls:
+        assert f"leak/class={name}" not in out
 
 
 # =============================================================================
