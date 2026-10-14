@@ -10,7 +10,9 @@ The reference follows the spec (``impl/03_spec_synthetic_tasks.md`` §4)
 literally: keys processed in random order; ``s_1`` uniform over the free
 pair slots; ``s_2`` uniform over the free slots satisfying the class block
 rule given ``s_1``; ``s_1`` redrawn up to ``max_placement_attempts`` times;
-the example restarted (fresh ``K``, classes, keys, values) on exhaustion;
+the example restarted (classes, keys, values redrawn; the example's
+``K`` is kept across restarts, matching the production generator) on
+exhaustion;
 query block in uniform random order; filler drawn from ``[1, V)`` excluding
 the example's keys and values.
 """
@@ -195,11 +197,16 @@ def generate_overwrite_reference(
     slice_id = np.zeros(num_examples, dtype=np.int64)
 
     for n in range(num_examples):
+        # K drawn once per example and kept across restarts, matching the
+        # production generator (hard-to-place K values are not replaced by
+        # easier ones).
+        k = (
+            fixed_num_keys
+            if fixed_num_keys is not None
+            else num_keys[rng.integers(0, len(num_keys))]
+        )
         example = None
-        k = fixed_num_keys
         for _ in range(_MAX_EXAMPLE_RESTARTS):
-            if fixed_num_keys is None:
-                k = num_keys[rng.integers(0, len(num_keys))]
             example = _generate_reference_example(
                 vocab_size,
                 seq_len,

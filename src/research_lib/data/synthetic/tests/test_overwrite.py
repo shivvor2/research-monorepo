@@ -363,6 +363,32 @@ def test_D05_vectorized_matches_reference_distribution():
     assert result.pvalue > alpha, ("class", result)
 
 
+@pytest.mark.slow
+def test_D05_restarts_keep_k_per_example():
+    """K is drawn once per example and kept across restarts: with a tight
+    config whose restart rate depends on K (all-distant K=42 at T=256
+    restarts ~79% of examples), the slice mix stays at the configured 50/50
+    instead of collapsing toward the easy K. (When restarts redrew K for the
+    pending rows, the K=42 share collapsed to ~0.19.)"""
+    config = OverwriteConfig(num_keys=(8, 42), class_probs=(0.0, 0.0, 1.0, 0.0))
+    num_examples = 2000
+    batch = generate_overwrite(config, num_examples=num_examples, seed=7)
+    share_42 = float((batch["slice_id"] == 42).sum()) / num_examples
+    assert 0.45 < share_42 < 0.55, f"K=42 share {share_42:.3f}"
+    # Restart-heavy generation still produces valid structure, for both K.
+    for e in range(0, num_examples, 200):
+        k = int(batch["slice_id"][e])
+        check_overwrite_example(
+            config,
+            batch["input_ids"][e],
+            batch["labels"][e],
+            batch["old_labels"][e],
+            batch["key_class"][e],
+            batch["write_distance"][e],
+            k,
+        )
+
+
 # =============================================================================
 # Tests: D06 class proportions
 # =============================================================================

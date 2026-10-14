@@ -45,8 +45,10 @@ mask over the pair slots. The per-example random procedure is the spec's:
   free slots satisfying the class block rule given ``s_1`` (the slots of a
   block are contiguous, so the valid slots form a slice ``[a, b)``);
   ``s_1`` is redrawn up to ``max_placement_attempts`` times, after which
-  the whole example is restarted (fresh ``K``, classes, keys, values; at
-  most ``_MAX_EXAMPLE_RESTARTS`` restarts per example);
+  the whole example is restarted (classes, keys, values and placement
+  redrawn; the example's ``K`` is kept across restarts, so hard-to-place
+  ``K`` values are not replaced by easier ones; at most
+  ``_MAX_EXAMPLE_RESTARTS`` restarts per example);
 - query block: each key once, in uniform random order (a uniform
   permutation per example);
 - filler: uniform over ``[1, V)`` excluding the example's keys and values.
@@ -79,8 +81,10 @@ NO_DISTANCE = -1
 """write_distance value at non-answer positions."""
 
 _MAX_EXAMPLE_RESTARTS = 100
-"""Hard cap on example restarts (safety net; unreachable for feasible
-configs, which are validated at construction)."""
+"""Hard cap on example restarts (safety net; never observed at the
+protocol settings; tight configs that pass the construction-time check
+can still need restarts (e.g. all-distant K=42 at T=256 restarts ~79% of
+examples))."""
 
 
 class OverwriteClass(enum.IntEnum):
@@ -480,8 +484,10 @@ def generate_overwrite(
         ValueError: if ``num_examples < 1`` or ``num_keys`` is infeasible for
             ``config.seq_len``.
         RuntimeError: if placement fails for an example after
-            ``_MAX_EXAMPLE_RESTARTS`` restarts (unreachable for configs that
-            pass the construction-time feasibility check).
+            ``_MAX_EXAMPLE_RESTARTS`` restarts (never observed at the
+            protocol settings; tight configs that pass the
+            construction-time check can still need restarts, e.g.
+            all-distant K=42 at T=256 restarts ~79% of examples).
 
     Shape:
         input_ids/labels/old_labels/key_class/write_distance:
@@ -505,6 +511,16 @@ def generate_overwrite(
     slice_id = np.zeros(num_examples, dtype=np.int64)
 
     num_keys_arr = np.asarray(config.num_keys, dtype=np.int64)
+    # Each example's K is drawn ONCE, before the restart loop, and kept
+    # across restarts: redrawing K for the pending rows would replace
+    # hard-to-place K values by easier ones whenever restarts happen,
+    # biasing the slice mix (all-distant K=42 at T=256 restarts ~79% of
+    # examples; with redrawn K its share collapsed from 0.5 to ~0.19).
+    k_all = (
+        num_keys_arr[rng.integers(0, num_keys_arr.size, size=num_examples)]
+        if num_keys is None
+        else np.full(num_examples, num_keys, dtype=np.int64)
+    )
     pending = np.arange(num_examples, dtype=np.int64)
     tries = np.zeros(num_examples, dtype=np.int64)
     while pending.size:
@@ -514,10 +530,7 @@ def generate_overwrite(
                 f"overwrite: placement failed after {_MAX_EXAMPLE_RESTARTS} "
                 f"restarts; the config is likely infeasible: {config}"
             )
-        if num_keys is None:
-            k_arr = num_keys_arr[rng.integers(0, num_keys_arr.size, size=pending.size)]
-        else:
-            k_arr = np.full(pending.size, num_keys, dtype=np.int64)
+        k_arr = k_all[pending]
         batch, ok = _generate_example_batch(config, rng, k_arr)
         done = pending[ok]
         for name in names:
