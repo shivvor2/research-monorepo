@@ -78,6 +78,9 @@ xformers = [
 profile = "black"
 line_length = 88
 
+[tool.pytest.ini_options]
+markers = ["slow: long-running correctness tests (deselect with -m 'not slow')"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["*"]
