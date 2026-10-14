@@ -136,14 +136,19 @@ def _generate_fixed_set(
     """Generate a fixed evaluation set: ``num_per_slice`` examples per slice
     value, concatenated along the batch dimension.
 
-    Slices are generated in sorted order from consecutive spawn keys
-    ``SeedSequence([seed, j])``, so slices and sets with disjoint base seeds
-    never share a stream.
+    Each slice is seeded by its own VALUE — ``SeedSequence([seed,
+    slice_value])`` — not by its position in the config, so a slice's examples
+    are identical across configs that share the slice value (e.g.
+    ``num_keys=(8, 16, 32)`` and ``(16, 32, 64)`` share the ``K=16`` rows)
+    and runs / later re-evaluations stay comparable. Base seeds of the
+    val/test/train streams must differ (enforced by the DataModule).
     """
     generator = _GENERATORS[task]
     parts = []
-    for j, slice_value in enumerate(config.slices):  # type: ignore[attr-defined]
-        part_seed = int(np.random.SeedSequence([int(seed), j]).generate_state(1)[0])
+    for slice_value in config.slices:  # type: ignore[attr-defined]
+        part_seed = int(
+            np.random.SeedSequence([int(seed), int(slice_value)]).generate_state(1)[0]
+        )
         if task == "mqar":
             part = generator(config, num_per_slice, part_seed, num_kv_pairs=slice_value)  # type: ignore[arg-type, call-arg]
         else:

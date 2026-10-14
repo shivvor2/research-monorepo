@@ -288,3 +288,66 @@ def test_D08_fixed_set_generator_matches_dm():
     direct = _generate_fixed_set("mqar", MQAR_CFG, 6, dm.val_seed)
     for key in direct:
         assert torch.equal(dm.val_set[key], direct[key])
+
+
+def test_D08_val_test_slices_seeded_by_slice_value():
+    """Slices are seeded by slice VALUE, not position: configs that share a
+    slice value (and base seed) share that slice's rows bit-exactly, so
+    e.g. re-evaluations under a different slice grid stay comparable."""
+    # Overwrite: K in {16, 32} shared between (8, 16, 32) and (16, 32, 64).
+    ow_a = OverwriteConfig(vocab_size=4096, seq_len=512, num_keys=(8, 16, 32))
+    ow_b = OverwriteConfig(vocab_size=4096, seq_len=512, num_keys=(16, 32, 64))
+    seed = 777
+    set_a = _generate_fixed_set("overwrite", ow_a, 3, seed)
+    set_b = _generate_fixed_set("overwrite", ow_b, 3, seed)
+    for key in set_a:
+        for slice_value in (16, 32):
+            rows_a = set_a[key][set_a["slice_id"] == slice_value]
+            rows_b = set_b[key][set_b["slice_id"] == slice_value]
+            assert rows_a.shape[0] == 3 and rows_b.shape[0] == 3
+            assert torch.equal(rows_a, rows_b), f"{key} K={slice_value} differs"
+    # Slices exclusive to one config are absent from the other.
+    assert int((set_a["slice_id"] == 8).sum()) == 3
+    assert int((set_b["slice_id"] == 8).sum()) == 0
+    assert int((set_b["slice_id"] == 64).sum()) == 3
+    assert int((set_a["slice_id"] == 64).sum()) == 0
+    # A different base seed changes the shared slice's rows.
+    set_c = _generate_fixed_set("overwrite", ow_a, 3, seed + 1)
+    rows_c = set_c["input_ids"][set_c["slice_id"] == 16]
+    rows_a = set_a["input_ids"][set_a["slice_id"] == 16]
+    assert not torch.equal(rows_a, rows_c)
+
+    # MQAR: D in {4, 8} shared between (2, 4, 8) and (4, 8, 16).
+    m_a = MQARConfig(vocab_size=256, seq_len=64, num_kv_pairs=(2, 4, 8))
+    m_b = MQARConfig(vocab_size=256, seq_len=64, num_kv_pairs=(4, 8, 16))
+    s_a = _generate_fixed_set("mqar", m_a, 5, seed=555)
+    s_b = _generate_fixed_set("mqar", m_b, 5, seed=555)
+    for key in s_a:
+        for slice_value in (4, 8):
+            assert torch.equal(
+                s_a[key][s_a["slice_id"] == slice_value],
+                s_b[key][s_b["slice_id"] == slice_value],
+            )
+
+    # DataModule level: two modules with the same val_seed share val rows.
+    dm_a = _dm(
+        task="overwrite",
+        task_config=ow_a,
+        num_val_per_slice=3,
+        val_seed=777,
+        test_seed=888,
+    )
+    dm_b = _dm(
+        task="overwrite",
+        task_config=ow_b,
+        num_val_per_slice=3,
+        val_seed=777,
+        test_seed=999,
+    )
+    dm_a.setup()
+    dm_b.setup()
+    mask_a = dm_a.val_set["slice_id"] == 16
+    mask_b = dm_b.val_set["slice_id"] == 16
+    assert torch.equal(
+        dm_a.val_set["input_ids"][mask_a], dm_b.val_set["input_ids"][mask_b]
+    )
