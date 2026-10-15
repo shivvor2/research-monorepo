@@ -80,6 +80,12 @@ class GatedDeltaReference(nn.Module):
         norm_eps (float): Epsilon for the per-head output RMSNorm. Defaults
             to 1e-5.
         init_scheme (str): ``"paper"`` (default).
+        compute_dtype (torch.dtype | None): Overrides the precision policy
+            of the recurrence core (chunked and recurrent scans).  ``None``
+            (the default) keeps the core in at least fp32 (fp64 modules stay
+            fp64), as in the GDN-2 paper and fla's kernels; an explicit
+            dtype (e.g. ``torch.bfloat16``) is meant for degradation
+            experiments.
         device: Optional torch device.
         dtype: Optional torch dtype.
 
@@ -109,6 +115,7 @@ class GatedDeltaReference(nn.Module):
         scale: float | None = None,
         norm_eps: float = 1e-5,
         init_scheme: str = "paper",
+        compute_dtype: torch.dtype | None = None,
         device=None,
         dtype=None,
     ):
@@ -122,6 +129,7 @@ class GatedDeltaReference(nn.Module):
         self.mode = mode
         self.chunk_size = chunk_size
         self.scale = 1.0 / (head_dim**0.5) if scale is None else float(scale)
+        self.compute_dtype = compute_dtype
         self.projections = GatedDeltaProjections(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -192,6 +200,7 @@ class GatedDeltaReference(nn.Module):
                 initial_state=initial_state,
                 chunk_size=self.chunk_size,
                 scale=self.scale,
+                compute_dtype=self.compute_dtype,
             )
         else:
             o, S = recurrent_scan(
@@ -203,6 +212,7 @@ class GatedDeltaReference(nn.Module):
                 w,
                 initial_state=initial_state,
                 scale=self.scale,
+                compute_dtype=self.compute_dtype,
             )
         y = self.projections.output(o, x)
         new_cache = None

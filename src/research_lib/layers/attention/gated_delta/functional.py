@@ -38,7 +38,12 @@ Precision policy (explicit in code, never left to type promotion):
     gates, log-decay, cumulative sums, every ``exp``, the L2 normalization
     and the triangular solve run in ``max(fp32, input dtype)`` (fp64 in
     tests); the recurrent state is fp32 (fp64 in tests); outputs are cast
-    back to the input dtype at the end.  See :func:`_compute_dtype`.
+    back to the input dtype at the end.  See :func:`_compute_dtype`.  The
+    scan functions additionally disable ``torch.autocast`` around their
+    numerical cores, so bf16-mixed training cannot silently lower the
+    recurrence's precision (the paper's App. D and fla's kernels keep the
+    core in fp32); a ``compute_dtype`` argument overrides the policy for
+    degradation experiments.
 
 Log space by default: :math:`\\mathbf A_{qk}` and :math:`\\mathbf L` are built
 by subtracting cumulative log-decays, masking disallowed entries with
@@ -59,18 +64,28 @@ import torch
 logger = logging.getLogger(__name__)
 
 
-def _compute_dtype(x: torch.Tensor) -> torch.dtype:
-    """Return ``max(fp32, x.dtype)``: the dtype every precision-sensitive op runs in.
+def _compute_dtype(
+    x: torch.Tensor, compute_dtype: torch.dtype | None = None
+) -> torch.dtype:
+    """Resolve the dtype every precision-sensitive operation runs in.
 
-    fp64 stays fp64 (used by the fp64 test suite); fp32, bf16 and fp16 are
-    promoted to fp32, per the precision policy in the module docstring.
+    With ``compute_dtype=None`` (the default policy), fp64 stays fp64 (used
+    by the fp64 test suite) and fp32, bf16 and fp16 are promoted to fp32, so
+    the recurrence core always runs in **at least fp32**, as in the GDN-2
+    paper (App. D.1-D.4) and fla's kernels.
 
     Args:
-        x (Tensor): Any tensor whose dtype defines the policy.
+        x (Tensor): Any tensor whose dtype defines the default policy.
+        compute_dtype (torch.dtype | None): Explicit override of the policy
+            (e.g. ``torch.bfloat16`` for degradation experiments).  The
+            caller owns the numerical consequences; there is no checking
+            that the override is *wider* than the input dtype.
 
     Returns:
-        torch.dtype: ``torch.float64`` or ``torch.float32``.
+        torch.dtype: ``compute_dtype`` if given, else ``max(fp32, x.dtype)``.
     """
+    if compute_dtype is not None:
+        return compute_dtype
     if x.dtype == torch.float64:
         return torch.float64
     return torch.float32
@@ -184,11 +199,18 @@ def recurrent_scan(
     w: torch.Tensor,
     initial_state: torch.Tensor | None = None,
     scale: float = 1.0,
+    compute_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Token-by-token scan of the GDN-2 recurrence.
 
     Used for tests and decoding; never for training (it stores a state per
     token through autograd).
+
+    The numerical core runs with autocast **disabled**, in the compute
+    dtype, so a surrounding ``torch.autocast`` region (e.g. bf16-mixed
+    training) cannot silently lower the recurrence's precision; autocast
+    stays active everywhere outside this function.  Inputs keep whatever
+    dtype the caller produced; outputs are cast back to the input dtype.
 
     Args:
         q (Tensor): Queries of shape ``(B, T, H, d_k)`` (fla layout; the
@@ -201,6 +223,11 @@ def recurrent_scan(
         initial_state (Tensor | None): Initial state of shape
             ``(B, H, d_k, d_v)`` or ``None`` (zeros).
         scale (float): Output scale.
+        compute_dtype (torch.dtype | None): Overrides the precision policy
+            for the recurrence core.  ``None`` (the default) keeps the core
+            in at least fp32 (fp64 inputs stay fp64), as in the GDN-2 paper
+            and fla's kernels; an explicit dtype (e.g. ``torch.bfloat16``)
+            is meant for degradation experiments.
 
     Returns:
         tuple: ``(o, final_state)`` with ``o`` of shape ``(B, T, H, d_v)`` in
@@ -209,7 +236,7 @@ def recurrent_scan(
     """
     B, T, H, dk = q.shape
     dv = v.shape[-1]
-    cd = _compute_dtype(q)
+    cd = _compute_dtype(q, compute_dtype)
     if k.shape != q.shape or b.shape != q.shape or g.shape != q.shape:
         raise ValueError(
             f"q/k/b/g must all be (B,T,H,dk); got q={tuple(q.shape)}, "
@@ -219,36 +246,40 @@ def recurrent_scan(
         raise ValueError(
             f"v/w must be (B,T,H,dv); got v={tuple(v.shape)}, w={tuple(w.shape)}"
         )
-    # internal layout (B, H, T, D), compute dtype
-    q_ = q.transpose(1, 2).to(cd)
-    k_ = k.transpose(1, 2).to(cd)
-    v_ = v.transpose(1, 2).to(cd)
-    g_ = g.transpose(1, 2).to(cd)
-    b_ = b.transpose(1, 2).to(cd)
-    w_ = w.transpose(1, 2).to(cd)
-    if initial_state is None:
-        S = q_.new_zeros(B, H, dk, dv)
-    else:
-        if initial_state.shape != (B, H, dk, dv):
-            raise ValueError(
-                f"initial_state must be (B,H,dk,dv) = {(B, H, dk, dv)}, "
-                f"got {tuple(initial_state.shape)}"
-            )
-        S = initial_state.to(cd)
-    outputs = []
-    for t in range(T):
-        # decay
-        Sd = S * g_[:, :, t].exp()[..., None]
-        # gated read, then u = w*v - S'^T (b*k)
-        read = (Sd * (b_[:, :, t] * k_[:, :, t])[..., :, None]).sum(dim=-2)
-        u = w_[:, :, t] * v_[:, :, t] - read
-        # write
-        S = Sd + k_[:, :, t][..., None] * u[..., None, :]
-        # read after write
-        outputs.append(scale * (q_[:, :, t][..., :, None] * S).sum(dim=-2))
-    o = torch.stack(outputs, dim=2)  # (B, H, T, dv)
-    o = o.transpose(1, 2).to(q.dtype)
-    return o, S
+    # Autocast off for the recurrence core: the surrounding region (e.g.
+    # bf16-mixed training) keeps its speed, but this function's numerics
+    # always run in the compute dtype.
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        # internal layout (B, H, T, D), compute dtype
+        q_ = q.transpose(1, 2).to(cd)
+        k_ = k.transpose(1, 2).to(cd)
+        v_ = v.transpose(1, 2).to(cd)
+        g_ = g.transpose(1, 2).to(cd)
+        b_ = b.transpose(1, 2).to(cd)
+        w_ = w.transpose(1, 2).to(cd)
+        if initial_state is None:
+            S = q_.new_zeros(B, H, dk, dv)
+        else:
+            if initial_state.shape != (B, H, dk, dv):
+                raise ValueError(
+                    f"initial_state must be (B,H,dk,dv) = {(B, H, dk, dv)}, "
+                    f"got {tuple(initial_state.shape)}"
+                )
+            S = initial_state.to(cd)
+        outputs = []
+        for t in range(T):
+            # decay
+            Sd = S * g_[:, :, t].exp()[..., None]
+            # gated read, then u = w*v - S'^T (b*k)
+            read = (Sd * (b_[:, :, t] * k_[:, :, t])[..., :, None]).sum(dim=-2)
+            u = w_[:, :, t] * v_[:, :, t] - read
+            # write
+            S = Sd + k_[:, :, t][..., None] * u[..., None, :]
+            # read after write
+            outputs.append(scale * (q_[:, :, t][..., :, None] * S).sum(dim=-2))
+        o = torch.stack(outputs, dim=2)  # (B, H, T, dv)
+        o = o.transpose(1, 2).to(q.dtype)
+        return o, S
 
 
 class ChunkLocals(NamedTuple):
@@ -287,6 +318,7 @@ def chunk_local_terms(
     g: torch.Tensor,
     b: torch.Tensor,
     w: torch.Tensor,
+    compute_dtype: torch.dtype | None = None,
 ) -> ChunkLocals:
     """Compute Phase-1 (chunk-local) terms for all chunks at once.
 
@@ -298,6 +330,11 @@ def chunk_local_terms(
     at pilot scale; see ``04`` §2.9 "Getting the matmul back" for the
     sub-chunking optimization deferred to the kernel work.
 
+    The numerical core runs with autocast **disabled**, in the compute
+    dtype (at least fp32 by default, as in the GDN-2 paper and fla's
+    kernels), so a surrounding ``torch.autocast`` region cannot silently
+    lower Phase 1's precision.
+
     Args:
         q (Tensor): ``(B, H, N, C, d_k)`` chunk-major queries.
         k (Tensor): ``(B, H, N, C, d_k)`` chunk-major keys.
@@ -305,11 +342,29 @@ def chunk_local_terms(
         g (Tensor): ``(B, H, N, C, d_k)`` chunk-major log-decay.
         b (Tensor): ``(B, H, N, C, d_k)`` chunk-major erase gate.
         w (Tensor): ``(B, H, N, C, d_v)`` chunk-major write gate.
+        compute_dtype (torch.dtype | None): Overrides the precision policy
+            (``None`` = at least fp32; an explicit dtype is for degradation
+            experiments).
 
     Returns:
-        ChunkLocals: the named tuple of Phase-1 tensors.
+        ChunkLocals: the named tuple of Phase-1 tensors, in the compute
+        dtype.
     """
-    cd = _compute_dtype(q)
+    cd = _compute_dtype(q, compute_dtype)
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        return _chunk_local_terms_impl(q, k, v, g, b, w, cd)
+
+
+def _chunk_local_terms_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    w: torch.Tensor,
+    cd: torch.dtype,
+) -> ChunkLocals:
+    """Autocast-disabled implementation of :func:`chunk_local_terms`."""
     q = q.to(cd)
     k = k.to(cd)
     v = v.to(cd)
@@ -374,12 +429,21 @@ def chunk_scan(
     initial_state: torch.Tensor | None = None,
     chunk_size: int = 16,
     scale: float = 1.0,
+    compute_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Chunkwise forward: Phase 1 batched over chunks, Phase 2 sequential over chunks.
 
     Same outputs as :func:`recurrent_scan`.  ``T`` need not be a multiple of
     ``chunk_size``: the last chunk may be shorter (all formulas hold for any
     chunk length; the short tail is processed with its own Phase-1 call).
+
+    The numerical core (Phase 1 and Phase 2) runs with autocast
+    **disabled**, in the compute dtype (at least fp32 by default, as in the
+    GDN-2 paper and fla's kernels), so a surrounding ``torch.autocast``
+    region (e.g. bf16-mixed training) cannot silently lower the recurrence's
+    precision; autocast stays active everywhere outside this function.
+    Inputs keep whatever dtype the caller produced; outputs are cast back
+    to the input dtype.
 
     Phase 2, per chunk (``04`` §2.11):
 
@@ -402,6 +466,11 @@ def chunk_scan(
             ``None`` (zeros).
         chunk_size (int): Chunk length ``C``. Defaults to 16.
         scale (float): Output scale.
+        compute_dtype (torch.dtype | None): Overrides the precision policy
+            for the recurrence core.  ``None`` (the default) keeps the core
+            in at least fp32 (fp64 inputs stay fp64), as in the GDN-2 paper
+            and fla's kernels; an explicit dtype (e.g. ``torch.bfloat16``)
+            is meant for degradation experiments.
 
     Returns:
         tuple: ``(o, final_state)`` with ``o`` of shape ``(B, T, H, d_v)`` in
@@ -412,11 +481,36 @@ def chunk_scan(
         raise ValueError(f"chunk_size must be >= 1, got {chunk_size}")
     B, T, H, dk = q.shape
     dv = v.shape[-1]
-    cd = _compute_dtype(q)
+    cd = _compute_dtype(q, compute_dtype)
     if k.shape != q.shape or b.shape != q.shape or g.shape != q.shape:
         raise ValueError("q, k, b, g must share the (B,T,H,dk) shape")
     if v.shape != (B, T, H, dv) or w.shape != (B, T, H, dv):
         raise ValueError("v and w must share the (B,T,H,dv) shape")
+    # Autocast off for the recurrence core (see the docstring).  The
+    # compute_dtype override is threaded through to Phase 1 so an explicit
+    # narrow dtype is not re-promoted by chunk_local_terms' default policy.
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        return _chunk_scan_impl(
+            q, k, v, g, b, w, initial_state, chunk_size, scale, cd, compute_dtype
+        )
+
+
+def _chunk_scan_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    b: torch.Tensor,
+    w: torch.Tensor,
+    initial_state: torch.Tensor | None,
+    chunk_size: int,
+    scale: float,
+    cd: torch.dtype,
+    compute_dtype: torch.dtype | None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Autocast-disabled implementation of :func:`chunk_scan`."""
+    B, T, H, dk = q.shape
+    dv = v.shape[-1]
     # internal layout (B, H, T, D), compute dtype
     q_ = q.transpose(1, 2).to(cd)
     k_ = k.transpose(1, 2).to(cd)
@@ -452,12 +546,12 @@ def chunk_scan(
 
     loc_list: list[ChunkLocals] = []
     if n_full > 0:
-        loc_full = chunk_local_terms(qf, kf, vf, gf, bf, wf)
+        loc_full = chunk_local_terms(qf, kf, vf, gf, bf, wf, compute_dtype)
         loc_list.extend(
             ChunkLocals(*(field[:, :, n] for field in loc_full)) for n in range(n_full)
         )
     if tail:
-        loc_tail = chunk_local_terms(qt, kt, vt, gt, bt, wt)
+        loc_tail = chunk_local_terms(qt, kt, vt, gt, bt, wt, compute_dtype)
         loc_list.append(ChunkLocals(*(field[:, :, 0] for field in loc_tail)))
 
     # ---- Phase 2: sequential over chunks --------------------------------

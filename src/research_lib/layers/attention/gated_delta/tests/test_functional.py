@@ -524,3 +524,103 @@ class TestG14GateReduction:
         # const-constructed full run
         torch.testing.assert_close(o_mode, o_full, atol=ATOL, rtol=RTOL)
         torch.testing.assert_close(S_mode, S_full, atol=ATOL, rtol=RTOL)
+
+
+# =============================================================================
+# Sourcery review: precision under autocast + compute_dtype override
+# =============================================================================
+
+
+def _make_inputs_fp32(T: int, seed: int) -> dict:
+    """Random fp32 inputs with unit-norm keys and mild decay."""
+    gen = torch.Generator().manual_seed(seed)
+    f32 = {"dtype": torch.float32, "generator": gen}
+    return {
+        "q": torch.randn(B, T, H, DK, **f32),
+        "k": torch.nn.functional.normalize(torch.randn(B, T, H, DK, **f32), dim=-1),
+        "v": torch.randn(B, T, H, DV, **f32),
+        "g": -0.5 * torch.rand(B, T, H, DK, **f32),
+        "b": torch.rand(B, T, H, DK, **f32),
+        "w": torch.rand(B, T, H, DV, **f32),
+        "S0": torch.randn(B, H, DK, DV, **f32),
+    }
+
+
+def _run_chunk(inp: dict, **kwargs) -> tuple:
+    return chunk_scan(
+        inp["q"],
+        inp["k"],
+        inp["v"],
+        inp["g"],
+        inp["b"],
+        inp["w"],
+        initial_state=inp["S0"],
+        chunk_size=4,
+        **kwargs,
+    )
+
+
+class TestPrecisionAutocast:
+    def test_autocast_bf16_does_not_touch_the_core(self):
+        """Under cpu bf16 autocast, fp32 inputs compute in fp32 and match
+        the autocast-free computation exactly."""
+        inp = _make_inputs_fp32(T=24, seed=11)
+        o_ref, S_ref = _run_chunk(inp)
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            o_ac, S_ac = _run_chunk(inp)
+        assert o_ac.dtype == torch.float32
+        assert S_ac.dtype == torch.float32
+        torch.testing.assert_close(o_ac, o_ref, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(S_ac, S_ref, atol=1e-6, rtol=1e-6)
+
+    def test_bf16_inputs_return_bf16_and_match_fp32_path(self):
+        """bf16 inputs: core in fp32, outputs cast back to bf16; matches the
+        fp32 computation (on the same values) cast to bf16."""
+        inp = _make_inputs_fp32(T=24, seed=12)
+        o_ref, S_ref = _run_chunk(inp)
+        inp_bf = {n: t.to(torch.bfloat16) for n, t in inp.items()}
+        o_bf, S_bf = _run_chunk(inp_bf)
+        assert o_bf.dtype == torch.bfloat16
+        # the state stays in the (default) fp32 compute dtype
+        assert S_bf.dtype == torch.float32
+        torch.testing.assert_close(o_bf, o_ref.to(torch.bfloat16), atol=1e-2, rtol=1e-2)
+        torch.testing.assert_close(S_bf, S_ref, atol=1e-2, rtol=1e-2)
+
+    def test_compute_dtype_fp64_on_fp32_inputs_matches_fp64_path(self):
+        """compute_dtype=torch.float64 on fp32 inputs reproduces the fp64
+        (exact-upcast) computation; outputs still cast back to fp32."""
+        inp = _make_inputs_fp32(T=24, seed=13)
+        inp64 = {n: t.to(torch.float64) for n, t in inp.items()}
+        o64, S64 = _run_chunk(inp64)  # default policy: fp64 stays fp64
+        o_ov, S_ov = _run_chunk(inp, compute_dtype=torch.float64)
+        assert o_ov.dtype == torch.float32  # cast back to the input dtype
+        assert S_ov.dtype == torch.float64  # state in the compute dtype
+        torch.testing.assert_close(o_ov, o64.to(torch.float32), atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(S_ov, S64, atol=ATOL, rtol=RTOL)
+
+    def test_compute_dtype_threaded_through_recurrent_scan(self):
+        """The override must apply to the recurrent path too."""
+        inp = _make_inputs_fp32(T=16, seed=14)
+        inp64 = {n: t.to(torch.float64) for n, t in inp.items()}
+        o64, S64 = recurrent_scan(
+            inp64["q"],
+            inp64["k"],
+            inp64["v"],
+            inp64["g"],
+            inp64["b"],
+            inp64["w"],
+            initial_state=inp64["S0"],
+        )
+        o_ov, S_ov = recurrent_scan(
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["g"],
+            inp["b"],
+            inp["w"],
+            initial_state=inp["S0"],
+            compute_dtype=torch.float64,
+        )
+        assert o_ov.dtype == torch.float32
+        torch.testing.assert_close(o_ov, o64.to(torch.float32), atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(S_ov, S64, atol=ATOL, rtol=RTOL)

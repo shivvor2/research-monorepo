@@ -203,3 +203,26 @@ class TestDeviceDtypeFactoryKwargs:
         layer = _make_layer("full", dtype=torch.float32)
         for name, p in layer.named_parameters():
             assert p.dtype == torch.float32, f"{name} has dtype {p.dtype}"
+
+
+# =============================================================================
+# Sourcery review: compute_dtype constructor pass-through
+# =============================================================================
+
+
+class TestComputeDTypePassThrough:
+    def test_layer_compute_dtype_fp64_on_fp32_module(self):
+        """compute_dtype=torch.float64 reaches both scan paths: the chunk
+        and recurrent layers agree, and match the default layer closely
+        (same inputs, recurrence computed one level wider)."""
+        torch.manual_seed(6)
+        default_layer = _make_layer("full", dtype=torch.float32)
+        layer = _make_layer("full", dtype=torch.float32, compute_dtype=torch.float64)
+        layer.load_state_dict(default_layer.state_dict())
+        x = torch.randn(2, 20, HIDDEN, dtype=torch.float32)
+        y_chunk, _ = layer(x, mode="chunk")
+        y_rec, _ = layer(x, mode="recurrent")
+        assert y_chunk.dtype == torch.float32
+        torch.testing.assert_close(y_chunk, y_rec, atol=1e-6, rtol=1e-6)
+        y_default, _ = default_layer(x, mode="chunk")
+        torch.testing.assert_close(y_chunk, y_default, atol=1e-4, rtol=1e-4)
