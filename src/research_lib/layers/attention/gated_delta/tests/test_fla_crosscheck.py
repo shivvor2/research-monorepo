@@ -27,13 +27,21 @@ ATOL = RTOL = 1e-4  # fla's naive references cast to fp32
 B, H, DK, DV = 2, 2, 8, 6
 
 
-def _fla_naive(module_name: str, func_name: str):
-    """Import a fla naive reference or return None (release difference)."""
-    try:
-        module = importlib.import_module(module_name)
-    except ImportError:
-        return None
-    return getattr(module, func_name, None)
+def _fla_naive(module_names: tuple[str, ...], func_name: str):
+    """Import a fla naive reference or return None (release difference).
+
+    Tries each candidate module path in order (fla has moved the naive
+    references into ``*.naive`` submodules across releases).
+    """
+    for module_name in module_names:
+        try:
+            module = importlib.import_module(module_name)
+        except ImportError:
+            continue
+        func = getattr(module, func_name, None)
+        if func is not None:
+            return func
+    return None
 
 
 def _make_inputs(T: int, seed: int = 0) -> dict:
@@ -54,7 +62,9 @@ class TestG16FlaCrosscheck:
         """full mode vs fla.ops.gdn2.naive_recurrent_gdn2 (skipped when the
         installed fla release has no gdn2 module)."""
         pytest.importorskip("fla")
-        naive = _fla_naive("fla.ops.gdn2", "naive_recurrent_gdn2")
+        naive = _fla_naive(
+            ("fla.ops.gdn2.naive", "fla.ops.gdn2"), "naive_recurrent_gdn2"
+        )
         if naive is None:
             pytest.skip(
                 "fla.ops.gdn2.naive_recurrent_gdn2 not available in the "
@@ -82,7 +92,7 @@ class TestG16FlaCrosscheck:
         """kda mode vs fla.ops.kda.naive.naive_recurrent_kda with
         beta = mean(b) of shape [B, T, H]."""
         pytest.importorskip("fla")
-        naive = _fla_naive("fla.ops.kda.naive", "naive_recurrent_kda")
+        naive = _fla_naive(("fla.ops.kda.naive", "fla.ops.kda"), "naive_recurrent_kda")
         if naive is None:
             pytest.skip("fla.ops.kda.naive not available")
         T = 16
@@ -107,7 +117,7 @@ class TestG16FlaCrosscheck:
         naive_recurrent_gated_delta_rule (note: beta before g, scalar g)."""
         pytest.importorskip("fla")
         naive = _fla_naive(
-            "fla.ops.gated_delta_rule.naive",
+            ("fla.ops.gated_delta_rule.naive", "fla.ops.gated_delta_rule"),
             "naive_recurrent_gated_delta_rule",
         )
         if naive is None:
