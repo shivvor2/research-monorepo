@@ -624,3 +624,88 @@ class TestPrecisionAutocast:
         assert o_ov.dtype == torch.float32
         torch.testing.assert_close(o_ov, o64.to(torch.float32), atol=ATOL, rtol=RTOL)
         torch.testing.assert_close(S_ov, S64, atol=ATOL, rtol=RTOL)
+
+
+# =============================================================================
+# Sourcery review: T == 0 (empty sequence) behavior of both scan paths
+# =============================================================================
+
+
+class TestEmptySequence:
+    def _empty_inputs(self, seed: int) -> dict:
+        gen = torch.Generator().manual_seed(seed)
+        f64 = {"dtype": torch.float64, "generator": gen}
+        return {
+            "q": torch.randn(B, 0, H, DK, **f64),
+            "k": torch.randn(B, 0, H, DK, **f64),
+            "v": torch.randn(B, 0, H, DV, **f64),
+            "g": -0.5 * torch.rand(B, 0, H, DK, **f64),
+            "b": torch.rand(B, 0, H, DK, **f64),
+            "w": torch.rand(B, 0, H, DV, **f64),
+        }
+
+    def test_T0_recurrent_scan_zero_state(self):
+        inp = self._empty_inputs(seed=20)
+        o, S = recurrent_scan(
+            inp["q"], inp["k"], inp["v"], inp["g"], inp["b"], inp["w"]
+        )
+        assert o.shape == (B, 0, H, DV)
+        assert o.dtype == torch.float64  # input dtype
+        assert S.shape == (B, H, DK, DV)
+        assert torch.count_nonzero(S) == 0  # zeros when initial_state is None
+
+    def test_T0_recurrent_scan_returns_initial_state_unchanged(self):
+        inp = self._empty_inputs(seed=21)
+        S0 = torch.randn(B, H, DK, DV, dtype=torch.float64)
+        o, S = recurrent_scan(
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["g"],
+            inp["b"],
+            inp["w"],
+            initial_state=S0,
+        )
+        assert o.shape == (B, 0, H, DV)
+        assert S is S0  # same tensor, unchanged
+
+    def test_T0_chunk_scan_zero_state(self):
+        inp = self._empty_inputs(seed=22)
+        o, S = chunk_scan(
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["g"],
+            inp["b"],
+            inp["w"],
+            chunk_size=4,
+        )
+        assert o.shape == (B, 0, H, DV)
+        assert o.dtype == torch.float64
+        assert S.shape == (B, H, DK, DV)
+        assert torch.count_nonzero(S) == 0
+
+    def test_T0_chunk_scan_returns_initial_state_unchanged(self):
+        inp = self._empty_inputs(seed=23)
+        S0 = torch.randn(B, H, DK, DV, dtype=torch.float64)
+        o, S = chunk_scan(
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["g"],
+            inp["b"],
+            inp["w"],
+            initial_state=S0,
+            chunk_size=4,
+        )
+        assert o.shape == (B, 0, H, DV)
+        assert torch.equal(S, S0)
+
+    def test_T0_both_paths_agree(self):
+        inp = self._empty_inputs(seed=24)
+        S0 = torch.randn(B, H, DK, DV, dtype=torch.float64)
+        args = (inp["q"], inp["k"], inp["v"], inp["g"], inp["b"], inp["w"])
+        o_r, S_r = recurrent_scan(*args, initial_state=S0)
+        o_c, S_c = chunk_scan(*args, initial_state=S0, chunk_size=4)
+        assert o_r.shape == o_c.shape == (B, 0, H, DV)
+        assert torch.equal(S_r, S_c)

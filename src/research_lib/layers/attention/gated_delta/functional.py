@@ -204,7 +204,9 @@ def recurrent_scan(
     """Token-by-token scan of the GDN-2 recurrence.
 
     Used for tests and decoding; never for training (it stores a state per
-    token through autograd).
+    token through autograd).  ``T == 0`` is allowed: the output is an empty
+    ``(B, 0, H, d_v)`` tensor in the input dtype and the initial state is
+    returned unchanged (zeros if ``None``), matching :func:`chunk_scan`.
 
     The numerical core runs with autocast **disabled**, in the compute
     dtype, so a surrounding ``torch.autocast`` region (e.g. bf16-mixed
@@ -246,6 +248,16 @@ def recurrent_scan(
         raise ValueError(
             f"v/w must be (B,T,H,dv); got v={tuple(v.shape)}, w={tuple(w.shape)}"
         )
+    if T == 0:
+        # Empty sequence: nothing to scan.  Return an empty output in the
+        # input dtype and the unchanged initial state (zeros if None), the
+        # same behavior chunk_scan already has (its empty-output branch
+        # handles T=0 naturally).
+        if initial_state is None:
+            S = q.new_zeros(B, H, dk, dv, dtype=cd)
+        else:
+            S = initial_state.to(cd)
+        return q.new_zeros(B, 0, H, dv), S
     # Autocast off for the recurrence core: the surrounding region (e.g.
     # bf16-mixed training) keeps its speed, but this function's numerics
     # always run in the compute dtype.
