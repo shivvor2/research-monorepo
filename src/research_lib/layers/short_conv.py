@@ -140,8 +140,16 @@ class CausalShortConv1d(nn.Module):
         if act is not None:
             y = act(y)
         # The new cache is the last K-1 entries of [cache, x]; this is also
-        # correct when T < K-1 (part of the old cache is retained).
-        new_cache = padded[..., -(K - 1) :] if output_final_state else None
+        # correct when T < K-1 (part of the old cache is retained).  K=1
+        # needs an explicit empty cache: -(K-1) is -0, so the slice would
+        # return the *whole* padded tensor.  The slice is cloned so the
+        # cache does not keep the entire prefill's storage alive.
+        if not output_final_state:
+            new_cache = None
+        elif K > 1:
+            new_cache = padded[..., -(K - 1) :].clone()
+        else:
+            new_cache = padded.new_empty(B, C, 0)
         return y, new_cache
 
     def extra_repr(self) -> str:

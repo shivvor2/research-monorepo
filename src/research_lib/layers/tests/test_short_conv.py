@@ -102,3 +102,53 @@ class TestG09ShortConv:
             groups=channels,
         ).transpose(1, 2)
         torch.testing.assert_close(y, expected, atol=1e-6, rtol=1e-6)
+
+
+class TestKernelSizeOneCache:
+    """Sourcery review: kernel_size == 1 must return an empty (B, C, 0)
+    cache (-(K-1) is -0, so a naive slice would return the whole padded
+    tensor)."""
+
+    def test_kernel_size_1_empty_cache_shape(self):
+        conv = _make_conv(channels=5, kernel_size=1)
+        x = torch.randn(2, 8, 5)
+        y, cache = conv(x, output_final_state=True)
+        assert cache is not None
+        assert cache.shape == (2, 5, 0)
+        # the whole-sequence output must equal the pointwise (K=1) conv
+        xt = x.transpose(1, 2)
+        expected = F.silu(F.conv1d(xt, conv.conv.weight, None, groups=5))
+        torch.testing.assert_close(y, expected.transpose(1, 2), atol=1e-6, rtol=1e-6)
+
+    def test_kernel_size_1_segmented_equals_one_pass(self):
+        conv = _make_conv(channels=5, kernel_size=1)
+        T = 10
+        x = torch.randn(2, T, 5)
+        y_full, _ = conv(x)
+        cache = None
+        outputs = []
+        start = 0
+        for seg in [3, 1, 6]:
+            y_seg, cache = conv(
+                x[:, start : start + seg], cache=cache, output_final_state=True
+            )
+            outputs.append(y_seg)
+            start += seg
+        torch.testing.assert_close(
+            torch.cat(outputs, dim=1), y_full, atol=1e-6, rtol=1e-6
+        )
+
+    def test_cache_is_owned_copy(self):
+        """The returned cache must not share storage with the caller's input
+        (it also must not pin the whole prefill, hence the clone)."""
+        channels, K = 5, 4
+        conv = _make_conv(channels, K)
+        x = torch.randn(2, 16, channels)
+        _, cache = conv(x, output_final_state=True)
+        assert cache is not None
+        assert cache.untyped_storage().data_ptr() != x.untyped_storage().data_ptr()
+        # and it is a genuine copy: mutating the input afterwards leaves the
+        # cache unchanged
+        x_copy_ptr = cache.untyped_storage().data_ptr()
+        x[:, :] = 0.0
+        assert cache.untyped_storage().data_ptr() == x_copy_ptr
