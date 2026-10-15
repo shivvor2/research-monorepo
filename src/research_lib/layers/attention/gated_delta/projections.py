@@ -67,10 +67,19 @@ class HeadRMSNorm(nn.Module):
         >>> y = norm(x)
     """
 
-    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-5):
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        eps: float = 1e-5,
+        device=None,
+        dtype=None,
+    ):
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_heads, head_dim))
+        self.weight = nn.Parameter(
+            torch.ones(num_heads, head_dim, device=device, dtype=dtype)
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Normalize in the compute dtype (fp32 unless the input is fp64).
@@ -174,7 +183,7 @@ class GatedDeltaProjections(nn.Module):
         self.A_log = nn.Parameter(torch.empty(H, device=device, dtype=dtype))
         self.dt_bias = nn.Parameter(torch.empty(H, dk, device=device, dtype=dtype))
         # Output branch: per-head RMSNorm, SiLU gate from x, final projection.
-        self.norm = HeadRMSNorm(H, dv, eps=norm_eps)
+        self.norm = HeadRMSNorm(H, dv, eps=norm_eps, device=device, dtype=dtype)
         self.out_gate_proj = nn.Linear(d, H * dv, bias=False, **f)
         self.out_proj = nn.Linear(H * dv, d, bias=False, **f)
 

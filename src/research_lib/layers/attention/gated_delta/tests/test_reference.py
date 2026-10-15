@@ -11,6 +11,7 @@ Run with::
 import pytest
 import torch
 
+from ..projections import GatedDeltaProjections
 from ..reference import GatedDeltaReference
 
 GATE_MODES = ["full", "b_only", "w_only", "kda", "gdn"]
@@ -172,3 +173,33 @@ class TestG15OutputGate:
         y, _ = layer(x)
         assert y.shape == (2, 10, HIDDEN)
         assert torch.isfinite(y).all()
+
+
+# =============================================================================
+# Sourcery review: device/dtype factory kwargs must reach every parameter
+# =============================================================================
+
+
+class TestDeviceDtypeFactoryKwargs:
+    def test_all_parameters_on_meta_device(self):
+        """device="meta" construction puts every parameter on that device
+        (no real allocation; works without CUDA)."""
+        proj = GatedDeltaProjections(
+            hidden_size=HIDDEN,
+            num_heads=HEADS,
+            head_dim=HEAD_DIM,
+            expand_v=EXPAND_V,
+            device="meta",
+        )
+        for name, p in proj.named_parameters():
+            assert p.device.type == "meta", f"{name} is on {p.device}"
+
+    def test_layer_all_parameters_on_meta_device(self):
+        layer = _make_layer("full", device="meta")
+        for name, p in layer.named_parameters():
+            assert p.device.type == "meta", f"{name} is on {p.device}"
+
+    def test_dtype_factory_kwarg_reaches_all_parameters(self):
+        layer = _make_layer("full", dtype=torch.float32)
+        for name, p in layer.named_parameters():
+            assert p.dtype == torch.float32, f"{name} has dtype {p.dtype}"
