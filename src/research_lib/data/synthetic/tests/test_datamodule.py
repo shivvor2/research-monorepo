@@ -19,6 +19,7 @@ import pytest
 import torch
 from torch.utils.data import DataLoader
 
+from .. import datamodule as datamodule_module
 from ..datamodule import (
     SyntheticRecallDataModule,
     _batch_seed,
@@ -307,7 +308,7 @@ def test_D08_resume_sharded_with_workers():
         dataset = _SyntheticTrainDataset(
             task="mqar", config=MQAR_CFG, batch_size=4, train_seed=0
         )
-        dataset.next_batch_idx = saved
+        dataset.next_local_idx = saved
         with patch(
             "torch.utils.data.get_worker_info",
             return_value=SimpleNamespace(id=worker_id, num_workers=num_workers),
@@ -327,6 +328,108 @@ def test_D08_resume_sharded_with_workers():
         expected["batch_index"] = torch.tensor(index, dtype=torch.int64)
         assert _batch_content(batch) == _batch_content(expected)
         assert int(batch["batch_index"]) == index
+
+
+def _rank_batches(rank, count, world_size=2, num_workers=1):
+    """Collect `count` batches from a rank's dataset under a simulated
+    (world_size, rank) process group (and optional DataLoader workers)."""
+    dataset = _SyntheticTrainDataset(
+        task="mqar", config=MQAR_CFG, batch_size=4, train_seed=0
+    )
+    with patch.object(
+        datamodule_module,
+        "_distributed_world_size_and_rank",
+        return_value=(world_size, rank),
+    ):
+        if num_workers > 1:
+            batches = {}
+            for worker_id in range(num_workers):
+                with patch(
+                    "torch.utils.data.get_worker_info",
+                    return_value=SimpleNamespace(id=worker_id, num_workers=num_workers),
+                ):
+                    worker_batches = _take(iter(dataset), count // num_workers)
+                for batch in worker_batches:
+                    batches[int(batch["batch_index"])] = batch
+            return [batches[index] for index in sorted(batches)]
+        return _take(iter(dataset), count)
+
+
+def _expected_batch(index):
+    expected = generate_mqar(MQAR_CFG, num_examples=4, seed=_batch_seed(0, index))
+    expected["batch_index"] = torch.tensor(index, dtype=torch.int64)
+    return expected
+
+
+def test_D08_ddp_two_rank_stream_partition_and_resume():
+    """W = 2 (simulated): the two ranks' global indices are disjoint and
+    together cover 0..N-1 in lockstep order, with contents equal to the
+    per-index generations (so the global stream is identical to W = 1);
+    resume via the transfer hook + state_dict is exact per rank."""
+    rank0 = _rank_batches(0, 5)
+    rank1 = _rank_batches(1, 5)
+    assert [int(b["batch_index"]) for b in rank0] == [0, 2, 4, 6, 8]
+    assert [int(b["batch_index"]) for b in rank1] == [1, 3, 5, 7, 9]
+    for batch in rank0 + rank1:
+        index = int(batch["batch_index"])
+        assert _batch_content(batch) == _batch_content(_expected_batch(index))
+
+    # Resume: feed rank 0's batches through the transfer hook (W = 2) and
+    # checkpoint after 3 of them (globals 0, 2, 4 -> local 0, 1, 2).
+    dm = _dm()
+    dm.trainer = SimpleNamespace(training=True)
+    with patch.object(
+        datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 0)
+    ):
+        for batch in rank0[:3]:
+            dm.on_before_batch_transfer(batch, 0)
+        state = dm.state_dict()
+    assert state == {"next_batch_idx": 3}
+    fresh = _dm()
+    fresh.load_state_dict(state)
+    with patch.object(
+        datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 0)
+    ):
+        resumed = _take(fresh.train_dataloader(), 2)
+    assert [int(b["batch_index"]) for b in resumed] == [6, 8]
+    for batch in resumed:
+        index = int(batch["batch_index"])
+        assert _batch_content(batch) == _batch_content(_expected_batch(index))
+
+    # Ranks x DataLoader workers: the four (rank, worker) streams are
+    # disjoint and together cover 0..11.
+    produced = {}
+    for rank in (0, 1):
+        for batch in _rank_batches(rank, 6, num_workers=2):
+            index = int(batch["batch_index"])
+            assert index not in produced, "global index produced twice"
+            produced[index] = batch
+    assert sorted(produced) == list(range(12))
+    for index, batch in produced.items():
+        assert _batch_content(batch) == _batch_content(_expected_batch(index))
+
+
+def test_D08_ddp_val_test_divisibility():
+    """Under a process group with world size > 1, val/test set sizes must be
+    divisible by the world size: Lightning's DistributedSampler pads by
+    duplicating rows, which would double-count examples in the metrics."""
+    three_slices = MQARConfig(vocab_size=512, seq_len=128, num_kv_pairs=(2, 4, 8))
+    # 3 slices x 3 examples = 9, not divisible by 2.
+    dm = _dm(task_config=three_slices, num_val_per_slice=3, num_test_per_slice=3)
+    with patch.object(
+        datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 0)
+    ):
+        with pytest.raises(ValueError, match="divisible"):
+            dm.setup()
+
+    # Divisible sizes (2 slices x 3 = 6) do not raise under W = 2 ...
+    with patch.object(
+        datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 0)
+    ):
+        _dm(num_val_per_slice=3, num_test_per_slice=3).setup()
+
+    # ... and the odd config is fine at W = 1.
+    _dm(task_config=three_slices, num_val_per_slice=3, num_test_per_slice=3).setup()
 
 
 # =============================================================================

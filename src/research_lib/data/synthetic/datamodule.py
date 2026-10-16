@@ -10,7 +10,11 @@ functions of a seed).
   ``np.random.SeedSequence([train_seed, i])``, so the stream is
   deterministic per ``(train_seed, batch index)`` and independent of the
   worker count: worker ``w`` produces the batches ``w, w + num_workers, ...``
-  (each batch index exactly once, never duplicated).
+  (each batch index exactly once, never duplicated). Under DDP (world size
+  ``W``, rank ``r``), the same holds per rank over the LOCAL index: worker
+  ``w`` of rank ``r`` yields the global indices ``(local) * W + r`` with
+  ``local = w, w + num_workers, ...``, so the ranks' global indices are
+  disjoint and together cover the stream in lockstep.
 - **Validation / test:** generated once in :meth:`setup`:
   ``num_val_per_slice`` / ``num_test_per_slice`` examples per slice value
   (``D`` for MQAR, ``K`` for overwrite), concatenated into one fixed set,
@@ -26,7 +30,9 @@ batch is moved to the device — advances the stream position from it (with
 ``num_workers=0`` the in-process iterator advances the position directly
 as well). Validation and test batches carry no ``"batch_index"`` and are
 untouched; the hook is a no-op without an attached trainer in the training
-stage (i.e. outside Lightning).
+stage (i.e. outside Lightning). Under DDP the position is the rank's next
+LOCAL batch index (global = local * world_size + rank); ranks consume the
+stream in lockstep, so any rank's saved position is valid for every rank.
 """
 
 from __future__ import annotations
@@ -72,16 +78,33 @@ def _batch_seed(train_seed: int, index: int) -> int:
     )
 
 
+def _distributed_world_size_and_rank() -> tuple[int, int]:
+    """World size and rank: ``torch.distributed`` when a process group is
+    initialized, else ``(1, 0)``.
+
+    Read fresh at each use (``__iter__``, the transfer hook, ``setup``) so
+    the current state is always seen and tests can simulate ranks.
+    """
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return torch.distributed.get_world_size(), torch.distributed.get_rank()
+    return 1, 0
+
+
 class _SyntheticTrainDataset(IterableDataset):
     """Infinite train stream yielding whole batches.
 
     Batch ``i`` is generated from ``np.random.SeedSequence([train_seed, i])``
     (via :func:`_batch_seed`) and carries its global batch index in the
-    ``"batch_index"`` key (int64 scalar tensor). Worker ``w`` of
-    ``num_workers`` produces the batch indices ``w', w' + num_workers, ...``
-    where ``w'`` is the smallest index ``>= next_batch_idx`` congruent to
-    ``w (mod num_workers)``, so no batch index is ever produced twice and
-    every batch's content depends only on its index.
+    ``"batch_index"`` key (int64 scalar tensor). The dataset keeps a
+    per-rank LOCAL counter ``next_local_idx``; worker ``w`` of
+    ``num_workers`` produces the local indices ``w', w' + num_workers, ...``
+    where ``w'`` is the smallest local index ``>= next_local_idx``
+    congruent to ``w (mod num_workers)``, and the GLOBAL batch index of a
+    local index is ``local * world_size + rank`` (world size / rank from
+    :func:`_distributed_world_size_and_rank`, i.e. 1 / 0 without a process
+    group, so global == local in single-process runs). No (rank, worker)
+    pair ever produces the same global index twice and every batch's
+    content depends only on its global index.
     """
 
     def __init__(
@@ -97,7 +120,7 @@ class _SyntheticTrainDataset(IterableDataset):
         self.config = config
         self.batch_size = batch_size
         self.train_seed = train_seed
-        self.next_batch_idx = 0
+        self.next_local_idx = 0
 
     def generate_batch(self, index: int) -> dict[str, torch.Tensor]:
         """Generate batch ``index`` (pure; independent of call order).
@@ -116,21 +139,23 @@ class _SyntheticTrainDataset(IterableDataset):
         return batch
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        world_size, rank = _distributed_world_size_and_rank()
         info = torch.utils.data.get_worker_info()
         worker_id = info.id if info is not None else 0
         num_workers = info.num_workers if info is not None else 1
-        # Worker w owns indices ≡ w (mod num_workers); start at the smallest
-        # owned index >= next_batch_idx.
-        index = self.next_batch_idx + ((worker_id - self.next_batch_idx) % num_workers)
+        # Worker w owns local indices ≡ w (mod num_workers); start at the
+        # smallest owned index >= next_local_idx. The global batch index of
+        # a local index is local * world_size + rank.
+        local = self.next_local_idx + ((worker_id - self.next_local_idx) % num_workers)
         while True:
-            batch = self.generate_batch(index)
+            batch = self.generate_batch(local * world_size + rank)
             if info is None:
-                # In-process iteration advances the stream position (exact
-                # resumption for the default num_workers=0; worker processes
-                # iterate copies and advance their own).
-                self.next_batch_idx = index + num_workers
+                # In-process iteration advances the (parent's) stream
+                # position; with DataLoader workers the parent's position is
+                # advanced by SyntheticRecallDataModule.on_before_batch_transfer.
+                self.next_local_idx = local + 1
             yield batch
-            index += num_workers
+            local += num_workers
 
 
 class _FixedRowDataset(Dataset):
@@ -199,7 +224,10 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         num_workers: DataLoader workers for the train stream.
 
     Raises:
-        ValueError: invalid ``task``, sizes, or colliding seeds.
+        ValueError: invalid ``task``, sizes, or colliding seeds; or, under a
+            distributed process group with world size > 1, a val/test set
+            size not divisible by the world size (DistributedSampler would
+            pad by duplicating rows and double-count examples).
         TypeError: ``task_config`` type does not match ``task``.
 
     Note:
@@ -213,8 +241,13 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         too). Validation and test batches carry no ``"batch_index"`` and
         are left untouched. Outside Lightning (no trainer attached, or
         not in the training stage) the hook is a no-op and the position
-        only advances on in-process iteration. Batch *contents* are
-        per-index deterministic for any worker count.
+        only advances on in-process iteration. Under DDP the position is
+        the rank's next LOCAL batch index (global = local * world_size +
+        rank; ranks run in lockstep, so any rank's saved position is valid
+        for every rank), and :meth:`setup` raises when a val/test set size
+        is not divisible by the world size (DistributedSampler padding
+        would double-count examples). Batch *contents* are per-index
+        deterministic for any worker count and world size.
 
     Example:
         >>> dm = SyntheticRecallDataModule(
@@ -305,6 +338,24 @@ class SyntheticRecallDataModule(L.LightningDataModule):
                 and cached).
         """
         self._ensure_train_dataset()
+        world_size, _ = _distributed_world_size_and_rank()
+        if world_size > 1:
+            num_slices = len(tuple(self.task_config.slices))  # type: ignore[attr-defined]
+            for set_name, per_slice, arg_name in (
+                ("validation", self.num_val_per_slice, "num_val_per_slice"),
+                ("test", self.num_test_per_slice, "num_test_per_slice"),
+            ):
+                size = per_slice * num_slices
+                if size % world_size != 0:
+                    raise ValueError(
+                        f"the {set_name} set has {size} examples "
+                        f"({per_slice} per slice x {num_slices} slices), not "
+                        f"divisible by world_size={world_size}: Lightning "
+                        f"wraps these loaders in a DistributedSampler that "
+                        f"pads by duplicating rows, which would double-count "
+                        f"examples in the metrics; choose {arg_name} or "
+                        f"world_size so the product is divisible"
+                    )
         if self._val_set is None:
             self._val_set = self._build_val_set()
         if self._test_set is None:
@@ -384,12 +435,17 @@ class SyntheticRecallDataModule(L.LightningDataModule):
     # ------------------------------------------------------------------ #
 
     def state_dict(self) -> dict[str, Any]:
-        """Serialize the train stream position (next global batch index)."""
-        return {"next_batch_idx": int(self._ensure_train_dataset().next_batch_idx)}
+        """Serialize the train stream position.
+
+        The value is the next LOCAL batch index (per rank; equal to the
+        global batch index at world size 1). Ranks consume the stream in
+        lockstep, so any rank's value is valid for every rank.
+        """
+        return {"next_batch_idx": int(self._ensure_train_dataset().next_local_idx)}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Resume the train stream from a serialized position."""
-        self._ensure_train_dataset().next_batch_idx = int(state_dict["next_batch_idx"])
+        """Resume the train stream from a serialized local batch index."""
+        self._ensure_train_dataset().next_local_idx = int(state_dict["next_batch_idx"])
 
     def on_before_batch_transfer(
         self, batch: dict[str, torch.Tensor], dataloader_idx: int = 0
@@ -418,6 +474,8 @@ class SyntheticRecallDataModule(L.LightningDataModule):
             and trainer is not None
             and bool(getattr(trainer, "training", False))
         ):
+            world_size, _ = _distributed_world_size_and_rank()
             index = int(batch["batch_index"])
-            self._ensure_train_dataset().next_batch_idx = index + 1
+            # global = local * world_size + rank  =>  local = index // world_size.
+            self._ensure_train_dataset().next_local_idx = index // world_size + 1
         return batch
