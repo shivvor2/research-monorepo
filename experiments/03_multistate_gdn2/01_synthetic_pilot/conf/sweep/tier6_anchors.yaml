@@ -1,0 +1,20 @@
+# Tier 6 anchors: Log-Linear Table 2 sanity (protocol §3.4).
+# gate gdn x layout {single, ll} x d in {16, 32, 64} x seeds 0-4, MQAR
+# only. 30 runs. Head counts follow the paper: 1 head at d = 16, 2
+# otherwise (one small anchor override file per dimension).
+# Run: python 01_train.py +sweep=tier6_anchors --multirun
+
+# @package _global_
+experiment:
+  phase: 2
+  tier: tier6_anchors
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mqar
+      model.gate_mode: gdn
+      model.layout: single,ll
+      +anchor: tier6_d16,tier6_d32,tier6_d64
+      seed: range(0,5)

@@ -1,0 +1,59 @@
+# =============================================================================
+# Debug config: one training step with every layout
+# =============================================================================
+# Usage:
+#   python 01_train.py --config-name=debug --multirun
+# Runs single, ws, fs and ll once each (multirun) on the tiny task.
+
+defaults:
+  - config
+
+experiment:
+  name: multistate_gdn2_pilot_debug
+  phase: 1
+  tier: debug
+
+model:
+  vocab_size: 64
+  d_model: 16
+  num_heads: 1
+  t_max: 32
+  window: 4
+
+task:
+  vocab_size: 64
+  seq_len: 32
+  num_kv_pairs: [2, 4]
+  max_seq_len: 32
+
+data:
+  num_workers: 0
+  num_val_per_slice: 4
+  num_test_per_slice: 4
+
+training:
+  batch_size: 16
+  max_steps: 1
+  val_check_interval: 1
+  log_every_n_steps: 1
+
+optimizer:
+  lr: 0.003
+
+logging:
+  csv:
+    enabled: true
+    save_dir: logs/debug_csv
+  wandb:
+    enabled: false
+
+hydra:
+  run:
+    dir: outputs/debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/debug/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: "${hydra:job.num}"
+  mode: MULTIRUN
+  sweeper:
+    params:
+      model.layout: single,ws,fs,ll

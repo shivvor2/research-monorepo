@@ -1,0 +1,21 @@
+# MQAR task (Zoology format; protocol §3.1).
+#
+# Keys are drawn from [1, V/2) and values from [V/2, V) without repetition;
+# the D pairs occupy the first 2D positions; queries sit at even offsets
+# after the context under a power law (power_a); filler is uniform over the
+# full vocabulary (random_non_queries). Loss on answer positions only.
+
+name: mqar
+vocab_size: 8192
+seq_len: 256
+num_kv_pairs: [4, 8, 16, 32, 64]   # D drawn per example (slices)
+power_a: 0.01                      # strongly favours early query slots
+random_non_queries: true
+
+# Longest sequence the model will see on this task (ll slot count and
+# t_max come from this).
+max_seq_len: 256
+
+# Held-out evaluation seeds (must differ from train seed = run seed).
+val_seed: 1000003
+test_seed: 2000003

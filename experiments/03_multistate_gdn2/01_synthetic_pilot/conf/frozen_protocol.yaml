@@ -1,0 +1,31 @@
+# Frozen protocol (template).
+#
+# Filled in at the end of Phase 1 calibration, committed with
+# frozen: true, and NOT revisited afterwards. 01_train.py refuses to run
+# with experiment.phase >= 2 until frozen is true, and resolves
+# optimizer.lr (when null) from lr_table[task][layout][gate_mode].
+
+frozen: false
+
+# d_model chosen in calibration from {32, 64} (protocol §10 rule 2).
+d_model: null
+
+# Harness switches chosen in calibration (rule 3): layer_pattern in
+# {zoology, mixer_x2} and state_mixer in {none, mlp}.
+harness:
+  layer_pattern: null
+  state_mixer: null
+
+# Peak LR per (task, layout, gate_mode), selected on seeds 100-101
+# (rule 4; D24) from {1e-3, 3e-3, 1e-2}.
+lr_table:
+  mqar:
+    single: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    ws: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    fs: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    ll: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+  overwrite:
+    single: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    ws: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    fs: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    ll: {full: null, b_only: null, w_only: null, kda: null, gdn: null}

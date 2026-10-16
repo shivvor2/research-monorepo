@@ -1,0 +1,54 @@
+# =============================================================================
+# Tiny CPU smoke config
+# =============================================================================
+# Usage:
+#   python 01_train.py --config-name=test
+# Finishes in a few minutes on CPU and writes a run JSON under runs/mqar/.
+
+defaults:
+  - config
+
+experiment:
+  name: multistate_gdn2_pilot_test
+  phase: 1
+  tier: smoke
+
+model:
+  vocab_size: 64
+  d_model: 16
+  num_heads: 1
+  t_max: 32
+  window: 4
+  gate_mode: full
+  layout: ws
+
+task:
+  vocab_size: 64
+  seq_len: 32
+  num_kv_pairs: [2, 4]
+  max_seq_len: 32
+
+data:
+  num_workers: 0
+  num_val_per_slice: 16
+  num_test_per_slice: 16
+
+training:
+  batch_size: 64
+  max_steps: 20
+  val_check_interval: 10
+  log_every_n_steps: 1
+
+optimizer:
+  lr: 0.003   # calibration is not frozen yet; the smoke config sets its own
+
+logging:
+  csv:
+    enabled: true
+    save_dir: logs/test_csv
+  wandb:
+    enabled: false
+
+hydra:
+  run:
+    dir: outputs/test/${now:%Y-%m-%d}/${now:%H-%M-%S}
