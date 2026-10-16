@@ -61,10 +61,10 @@ def make_lam(T: int, L: int, seed: int = 1) -> torch.Tensor:
     return 0.2 + 1.8 * torch.rand(B, T, H, L, dtype=torch.float64, generator=gen)
 
 
-def layout_params(layout: str) -> dict:
-    """Standard per-layout scan arguments for the common sizes."""
+def layout_params(layout: str, block_size: int = C_COMMON) -> dict:
+    """Standard per-layout scan arguments for the given block size."""
     if layout in ("ws", "fs"):
-        return {"layout": layout, "window": W_COMMON, "block_size": C_COMMON}
+        return {"layout": layout, "window": W_COMMON, "block_size": block_size}
     return {"layout": layout, "window": 0, "block_size": 0}
 
 
@@ -611,6 +611,102 @@ class TestM13DecodeHandoff:
         y_dec = torch.cat(outs, dim=1)
         torch.testing.assert_close(y_dec, y_ref, atol=ATOL, rtol=RTOL)
         assert cache.position == T_prefill + T_decode
+
+    @pytest.mark.parametrize("layout", ["ws", "ll"])
+    def test_M13b_prefill_then_chunk_decode(self, layout):
+        """M13 variant: decode steps in mode="chunk" too.  A one-token
+        chunked call has n_head capped at T=1, so it is handled by the
+        head/tail paths — but through the chunk-mode entry, which is what
+        a chunk-mode-only decode loop uses."""
+        d = 32
+        torch.manual_seed(0)
+        layer = MultistateGatedDelta(
+            hidden_size=d,
+            num_heads=H,
+            head_dim=DK,
+            layout=layout,
+            window=W_COMMON,
+            block_size=C_COMMON,
+            chunk_size=C_COMMON,
+            t_max=T_MAX_LL,
+            dtype=torch.float64,
+        )
+        torch.manual_seed(4)
+        T_prefill, T_decode = 16, 24
+        x = torch.randn(B, T_prefill + T_decode, d, dtype=torch.float64)
+        # one recurrent pass over everything
+        y_ref, _ = layer(x, mode="recurrent")
+        # chunk prefill, then one-token CHUNK-mode decode steps
+        y, cache = layer(x[:, :T_prefill], use_cache=True, mode="chunk")
+        outs = [y]
+        for t in range(T_prefill, T_prefill + T_decode):
+            y_t, cache = layer(
+                x[:, t : t + 1], cache=cache, use_cache=True, mode="chunk"
+            )
+            outs.append(y_t)
+        y_dec = torch.cat(outs, dim=1)
+        torch.testing.assert_close(y_dec, y_ref, atol=ATOL, rtol=RTOL)
+        assert cache.position == T_prefill + T_decode
+
+
+class TestM14bShortChunkCalls:
+    """M14b: chunk-mode calls shorter than the distance to the next
+    boundary.  The head must be capped at T (a call from position 5 with
+    C=16 and T=1 has n_head=1, not 11); uncapped, n_full would go negative
+    (and -1 is truthy, so the full-chunk reshape would raise) and t_tail
+    would be -1, reprocessing the last token."""
+
+    SHORT_POSITIONS = [17, 5, 31]
+    SHORT_T = [1, 3, 15, 16, 17]
+    C_SHORT = 16
+
+    @pytest.mark.parametrize("layout", LAYOUTS)
+    @pytest.mark.parametrize("position", SHORT_POSITIONS)
+    @pytest.mark.parametrize("T", SHORT_T)
+    def test_M14b_short_calls_match_recurrent(self, layout, position, T):
+        # canonical cache at `position` (built by the recurrent path)
+        p_inp = make_inputs(position, seed=21)
+        p_lam = make_lam(position, lam_levels(layout), seed=22)
+        _, S_p = multistate_recurrent_scan(
+            p_inp["q"],
+            p_inp["k"],
+            p_inp["v"],
+            p_inp["g"],
+            p_inp["b"],
+            p_inp["w"],
+            p_lam,
+            position=0,
+            **layout_params(layout, block_size=self.C_SHORT),
+        )
+        inp = make_inputs(T, seed=23)
+        lam = make_lam(T, lam_levels(layout), seed=24)
+        o_c, S_c = multistate_chunk_scan(
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["g"],
+            inp["b"],
+            inp["w"],
+            lam,
+            initial_state=S_p,
+            position=position,
+            chunk_size=self.C_SHORT,
+            **layout_params(layout, block_size=self.C_SHORT),
+        )
+        o_r, S_r = multistate_recurrent_scan(
+            inp["q"],
+            inp["k"],
+            inp["v"],
+            inp["g"],
+            inp["b"],
+            inp["w"],
+            lam,
+            initial_state=S_p,
+            position=position,
+            **layout_params(layout, block_size=self.C_SHORT),
+        )
+        torch.testing.assert_close(o_c, o_r, atol=ATOL, rtol=RTOL)
+        torch.testing.assert_close(S_c, S_r, atol=ATOL, rtol=RTOL)
 
 
 class TestM14MisalignedChunkStart:

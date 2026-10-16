@@ -543,7 +543,12 @@ def multistate_chunk_scan(
         pos = position
         out_parts: list[torch.Tensor] = []
         # ---- head: recurrently to the next chunk boundary ----------------
-        n_head = (-pos) % chunk_size
+        # Capped at T: a call whose input ends before the next boundary
+        # consumes the whole input recurrently.  Without the cap,
+        # n_head > T would advance `pos` past the input, n_full would go
+        # negative (and -1 is truthy, so the full-chunk reshape would run
+        # and raise), and t_tail = -1 would reprocess the last token.
+        n_head = min((-pos) % chunk_size, T)
         if n_head:
             o_h, S = multistate_recurrent_scan(
                 q[:, :n_head],
