@@ -47,6 +47,7 @@ A monorepo containing:
 - [DualOptimizerModule](src/research_lib/training/modules/dual_optimizer.py): LightningModule for training with two optimizers. Supports gradient accumulation scheduling.
     - *Reference:* Implementation details write-up on [r/MachineLearning](https://www.reddit.com/r/learnmachinelearning/comments/1qiw6p0/the_global_step_trap_when_using_multiple/).
 - [FineWebDataModule](src/research_lib/data/fineweb_datamodule.py): DataModule handling [`kjj0/finewebedu10B-gpt2`](https://huggingface.co/datasets/kjj0/finewebedu10B-gpt2) from Hugging Face.
+- [SyntheticRecallDataModule](src/research_lib/data/synthetic/datamodule.py): MQAR (Zoology format) and repeated-key overwrite with placement classes. Streams fresh seeded training batches and holds fixed validation/test slices; includes answer-position metrics (per-slice, per-class accuracy, old-value leakage). *(Reference generators for the multi-state GDN-2 pilot.)*
 - [ExperimentStateCallback](src/research_lib/training/callbacks/experiment_state.py): Callback to track the latest checkpoint path for automated experiment resumption.
 
 ### Utilities
