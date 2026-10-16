@@ -199,16 +199,46 @@ class TestM03bLlMerges:
             torch.testing.assert_close(out[..., 2, :, :], S[..., 2, :, :])
 
     def test_ll_token_merge_every_step_matches_fenwick_trace(self):
-        """After merging for arriving at ``t`` (t >= 1), the active levels
-        of ``t - 1``'s buckets follow the 05 §6.3 trace."""
-        L = 7
-        S = self._stack(L)
-        for t in range(1, 33):
-            S = ll_token_merge(S, next_position=t)
-            # slot j+1 == sum of slots 0..j from *before* the merge is
-            # checked structurally in test_ll_token_merge_exact; here just
-            # exercise every position including powers of two.
-        assert S.shape[-3] == L
+        """The token-level carries reproduce the Fenwick bucket structure.
+
+        Start from zeros; at each position p = 0..63 add a distinct
+        one-hot "write" (token id p) to slot 0 (the sentinel), then apply
+        the carry for arriving at p + 1.  After each step:
+
+        - slots 0..lssb(p + 1) are zero (the merge folds them into the
+          next level, and nothing ever copies into slot 0);
+        - the total over slots is preserved (exactly one copy of every
+          token 0..p);
+        - each slot holds exactly the tokens whose Fenwick level, as
+          seen from position p + 1, is that slot — {s : ll_level(p+1, s)
+          = l} — so a wrong carry index or a missing zeroing fails the
+          trace, as does discarding or keeping stale content.
+        """
+        n_tokens = 64
+        L = num_slots("ll", t_max=n_tokens)
+        eye = torch.eye(n_tokens, dtype=torch.float64)
+        S = torch.zeros(L, n_tokens, 1, dtype=torch.float64)
+        for p in range(n_tokens):
+            # token p's write lands in slot 0 (the sentinel); functional
+            S = torch.cat(
+                [S[..., :1, :, :] + eye[p, :, None], S[..., 1:, :, :]], dim=-3
+            )
+            S = ll_token_merge(S, p + 1)
+            j = lssb(p + 1)
+            assert torch.count_nonzero(S[..., : j + 1, :, :]) == 0, f"p={p}"
+            expected_total = torch.zeros(n_tokens, 1, dtype=torch.float64)
+            expected_total[: p + 1] = 1.0
+            torch.testing.assert_close(
+                S.sum(dim=-3), expected_total, msg=f"p={p}: total not preserved"
+            )
+            for lvl in range(L):
+                expected = torch.zeros(n_tokens, 1, dtype=torch.float64)
+                for s in range(p + 1):
+                    if ll_level(p + 1, s) == lvl:
+                        expected[s, 0] = 1.0
+                torch.testing.assert_close(
+                    S[lvl], expected, msg=f"p={p}: wrong tokens in level {lvl}"
+                )
 
     def test_ll_chunk_merge_exact(self):
         k, L = 2, 8  # C = 4, coarse slots 3..7
