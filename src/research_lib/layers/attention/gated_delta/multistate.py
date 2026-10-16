@@ -622,7 +622,12 @@ def multistate_chunk_scan(
                 # chunk. One cached (C, C) offset matrix per chunk size
                 # (ll_offset_level_matrix), moved to the device once for
                 # this call; never a per-chunk (or per-entry) computation.
-                levels = ll_offset_level_matrix(chunk_size).to(q.device)
+                # non_blocking: the cached source tensor is never mutated,
+                # so the H2D copy may stay off the sync path (a blocking
+                # .to would stream-sync once per call; see sync_check).
+                levels = ll_offset_level_matrix(chunk_size).to(
+                    q.device, non_blocking=True
+                )
                 pre_full = _ll_precompute(loc_full, w_f, v_f, lam_full, levels)
             for n in range(n_full):
                 p0 = position + t0 + n * chunk_size  # absolute chunk start
