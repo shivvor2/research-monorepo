@@ -440,17 +440,6 @@ def _ll_chunk_step(
         and the canonical slot stack for the next position.
     """
     k = chunk_size.bit_length() - 1
-    # Canonical-form invariant: at a chunk boundary the fine levels
-    # (slots 0..k) are zero — they are intra-chunk quantities, recomputed
-    # from a zero state each chunk (05 §7.1).  A cache violating this is
-    # not in the canonical form (rule 8: assert, never silently ignore).
-    if (S[..., : k + 1, :, :].abs().max() if S.numel() else 0) > 0:
-        raise ValueError(
-            "layout='ll' chunk path requires the canonical cache form at a "
-            f"chunk start: slots 0..{k} (the intra-chunk levels) must be "
-            "zero, got nonzero entries; continue from a cache produced by "
-            "a previous call (or zeros)"
-        )
     # ---- inter-chunk: coarse levels are transported-only buckets -------
     O_inter = torch.einsum(
         "bhcl,bhlcd->bhcd",
@@ -597,6 +586,35 @@ def multistate_chunk_scan(
             )  # (B,H,N,C,L)
             pre_full: LlChunkPrecomputed | None = None
             if layout is Layout.LL:
+                # Canonical-form check, ONCE per call (it used to live in
+                # the per-chunk step, costing a device sync per chunk):
+                # the state entering the FIRST full chunk (after the
+                # recurrent head) must have zero fine slots 0..k — they are
+                # intra-chunk quantities, recomputed from a zero state each
+                # chunk (05 §7.1), so a nonzero cache here is not in the
+                # canonical form (rule 8: assert, never silently ignore).
+                # Canonical-form check, ONCE per call, and only where it
+                # can fail: on a caller-supplied cache entering the first
+                # full chunk directly (initial_state given, no recurrent
+                # head). A fresh state is zeros by construction, and a
+                # state produced by the recurrent head is canonical by
+                # construction (its merges run at every arrival), so
+                # checking either would be a device readback for nothing.
+                # After the first chunk the invariant holds by
+                # construction anyway: the chunk step only touches the
+                # coarse slots (>= k+1) and the merge zeroes the folded
+                # coarse slots; the fine slots pass through untouched.
+                k_lvl = chunk_size.bit_length() - 1
+                if initial_state is not None and n_head == 0:
+                    fine = S[..., : k_lvl + 1, :, :]
+                    if fine.numel() and fine.abs().max() > 0:
+                        raise ValueError(
+                            "layout='ll' chunk path requires the canonical "
+                            f"cache form at a chunk start: slots 0..{k_lvl} "
+                            "(the intra-chunk levels) must be zero, got "
+                            "nonzero entries; continue from a cache "
+                            "produced by a previous call (or zeros)"
+                        )
                 # In-chunk levels depend only on the offsets for an aligned
                 # chunk (05 §7.1): fine levels come from the low k bits —
                 # which are the bits of the offsets, since p0 ≡ 0 (mod C) —
