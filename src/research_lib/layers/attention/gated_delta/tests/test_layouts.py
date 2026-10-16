@@ -15,6 +15,7 @@ from ..layouts import (
     ll_chunk_merge,
     ll_level,
     ll_level_matrix,
+    ll_offset_level_matrix,
     ll_token_merge,
     lssb,
     num_slots,
@@ -275,6 +276,26 @@ class TestM03bLlMerges:
         torch.testing.assert_close(M2, M)
         with pytest.raises(ValueError):
             ll_level_matrix(torch.zeros(2, 2, dtype=torch.long))
+
+    def test_ll_offset_level_matrix_matches_per_position(self):
+        """The cached in-chunk offset matrix equals the per-position
+        computation for every aligned chunk start: level(t, s) for an
+        aligned chunk depends only on the offsets (05 §7.1)."""
+        for C in (4, 8, 16):
+            off = ll_offset_level_matrix(C)
+            assert off.shape == (C, C)
+            assert off.device.type == "cpu"
+            for p0 in (0, C, 2 * C, 3 * C, 7 * C):
+                expected = ll_level_matrix(p0 + torch.arange(C))
+                torch.testing.assert_close(off, expected, atol=ATOL, rtol=RTOL)
+
+    def test_ll_offset_level_matrix_cached_shared(self):
+        """The cache returns the same shared tensor per chunk size
+        (read-only; callers must not mutate it)."""
+        a = ll_offset_level_matrix(8)
+        b = ll_offset_level_matrix(8)
+        assert a is b
+        assert ll_offset_level_matrix(4) is not a
 
     def test_layout_enum_accepts_plain_strings(self):
         assert Layout("ws") is Layout.WS

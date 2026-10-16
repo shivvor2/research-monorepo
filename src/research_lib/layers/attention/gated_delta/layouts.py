@@ -31,6 +31,7 @@ Run tests with::
     pytest src/research_lib/layers/attention/gated_delta/tests/test_layouts.py -v
 """
 
+import functools
 import logging
 from enum import Enum
 
@@ -143,27 +144,94 @@ def ll_level(t: int, s: int) -> int:
 
 
 def ll_level_matrix(positions: torch.Tensor) -> torch.Tensor:
-    """Level of every (query, key) pair in a chunk.
+    """Level of every (query, key) pair in a chunk, vectorized.
+
+    The per-position reference for tests: computes every pair's level at
+    once with broadcast bit operations — no per-entry assignment into a
+    (possibly device) tensor and no host read (``.tolist()``) of a device
+    tensor.  The chunk path does **not** call this (it uses the cached
+    in-chunk offset matrix, :func:`ll_offset_level_matrix`, which is equal
+    to this for every aligned chunk start).
 
     Args:
-        positions (Tensor): 1-D ``LongTensor`` of absolute positions,
-            shape ``(C,)``.  The chunk must be contiguous and increasing
-            (in-chunk pairs then only take levels ``0..k`` with
-            ``C = 2^k``, but this function does not require it).
+        positions (Tensor): 1-D integer tensor of absolute positions,
+            shape ``(C,)``, 0-based, non-negative.  The chunk must be
+            contiguous and increasing (in-chunk pairs then only take
+            levels ``0..k`` with ``C = 2^k``, but this function does not
+            require it).
 
     Returns:
-        Tensor: ``(C, C)`` ``LongTensor`` with ``out[t, s] = ll_level(t, s)``
-        for ``s <= t`` (row = query) and ``-1`` above the diagonal.
+        Tensor: ``(C, C)`` ``LongTensor`` on ``positions``' device with
+        ``out[t, s] = ll_level(t, s)`` for ``s <= t`` (row = query) and
+        ``-1`` above the diagonal.
     """
     if positions.dim() != 1:
         raise ValueError(f"positions must be 1-D, got shape {tuple(positions.shape)}")
-    C = positions.shape[0]
-    pos = positions.tolist()
-    out = torch.full((C, C), -1, dtype=torch.long, device=positions.device)
-    for r in range(C):
-        for c in range(r + 1):
-            out[r, c] = ll_level(pos[r], pos[c])
-    return out
+    pos = positions.to(torch.long)
+    C = pos.shape[0]
+    dev = pos.device
+    if C == 0:
+        return torch.empty(0, 0, dtype=torch.long, device=dev)
+    t = pos.view(C, 1)
+    s = pos.view(1, C)
+    # Broadcast over (query, key, level): level l (1..63) matches iff bit
+    # l-1 of t is set and s is in [h - 2^(l-1), h), h = t - t mod 2^(l-1).
+    # Exactly one level matches per s < t (the buckets partition [0, t]).
+    lvs = torch.arange(1, 64, device=dev)
+    sizes = torch.ones((), dtype=torch.long, device=dev) << (lvs - 1)
+    bits = ((t.unsqueeze(-1) >> (lvs - 1)) & 1).bool()  # (C, 1, 63)
+    h = t.unsqueeze(-1) - (t.unsqueeze(-1) % sizes)  # (C, 1, 63)
+    in_range = (h - sizes <= s.unsqueeze(-1)) & (s.unsqueeze(-1) < h)  # (C,C,63)
+    match = bits & in_range
+    big = torch.full_like(lvs, 64)
+    lev = torch.where(match, lvs, big).amin(dim=-1)  # (C, C), 64 = no match
+    diag = s == t
+    return torch.where(
+        diag,
+        torch.zeros((), dtype=torch.long, device=dev),
+        torch.where(
+            s < t,
+            lev,
+            torch.full((), -1, dtype=torch.long, device=dev),
+        ),
+    )
+
+
+@functools.cache
+def ll_offset_level_matrix(chunk_size: int) -> torch.Tensor:
+    """In-chunk level matrix for an *aligned* chunk, cached per chunk size.
+
+    For a chunk starting at ``p0 ≡ 0 (mod chunk_size)``, the level of an
+    in-chunk pair ``(t, s) = (p0 + r, p0 + c)`` depends only on the offsets
+    ``(r, c)``: the fine levels are determined by the low ``k`` bits (which
+    are the bits of the offsets, since ``p0``'s low bits are zero), and the
+    coarse levels never contain tokens of the current chunk
+    (``05_derivation_multi_state.md`` §7.1).  One ``(C, C)`` matrix therefore
+    covers every aligned chunk:
+
+    ``out[r, c] = ll_level(r, c)`` for ``c <= r`` and ``-1`` above the
+    diagonal — equal to ``ll_level_matrix(p0 + arange(C))`` for any aligned
+    ``p0`` (tested).
+
+    Built once per ``chunk_size`` from Python ints (no tensor ops),
+    ``functools.cache``d, and moved to the device once per call by the
+    caller (``.to(device)`` — an async copy, not a sync).  The returned
+    tensor is **shared**: treat it as read-only (index it, ``.to(device)``
+    it, never mutate it in place).
+
+    Args:
+        chunk_size (int): Chunk length ``C`` (a power of two for the chunk
+            path; not checked here).
+
+    Returns:
+        Tensor: ``(C, C)`` CPU ``LongTensor`` of in-chunk levels, ``-1``
+        above the diagonal.
+    """
+    rows = tuple(
+        tuple(ll_level(r, c) if c <= r else -1 for c in range(chunk_size))
+        for r in range(chunk_size)
+    )
+    return torch.tensor(rows, dtype=torch.long)
 
 
 def ws_shift(S: torch.Tensor, window: int) -> torch.Tensor:

@@ -66,7 +66,7 @@ from research_lib.layers.attention.gated_delta.functional import (
 from research_lib.layers.attention.gated_delta.layouts import (
     Layout,
     ll_chunk_merge,
-    ll_level_matrix,
+    ll_offset_level_matrix,
     ll_token_merge,
     num_slots,
     ws_shift,
@@ -382,17 +382,17 @@ def _ll_precompute(
         w_f (Tensor): ``(B, H, N, C, d_v)`` chunk-major write gate.
         v_f (Tensor): ``(B, H, N, C, d_v)`` chunk-major values.
         lam_full (Tensor): ``(B, H, N, C, L)`` λ for all chunks.
-        levels (Tensor): ``(N, C, C)`` per-chunk in-chunk level matrices
-            (levels of in-chunk pairs), ``-1`` above the diagonal, already on
-            the target device.
+        levels (Tensor): ``(C, C)`` in-chunk offset level matrix (levels of
+            in-chunk pairs, which depend only on the offsets for an aligned
+            chunk), ``-1`` above the diagonal, already on the target device.
 
     Returns:
         LlChunkPrecomputed: the batched quantities (see the NamedTuple).
     """
     B, Hc, N, C = loc_full.Aqk.shape[:4]
-    idx = levels.clamp(min=0).view(1, 1, N, C, C).expand(B, Hc, N, C, C)
+    idx = levels.clamp(min=0).view(1, 1, 1, C, C).expand(B, Hc, N, C, C)
     lam_h = lam_full.gather(-1, idx)  # (B,H,N,C,C)
-    lam_h = lam_h * (levels >= 0).to(lam_h.dtype).view(1, 1, N, C, C)  # 0 above diag
+    lam_h = lam_h * (levels >= 0).to(lam_h.dtype).view(1, 1, 1, C, C)  # 0 above diag
     z_full = w_f * v_f  # (B,H,N,C,dv)
     aqk_n = loc_full.Aqk @ loc_full.N  # (B,H,N,C,C) exact pairwise coefficients
     o_intra = (aqk_n * lam_h) @ z_full  # (B,H,N,C,dv)
@@ -597,17 +597,14 @@ def multistate_chunk_scan(
             )  # (B,H,N,C,L)
             pre_full: LlChunkPrecomputed | None = None
             if layout is Layout.LL:
-                # Per-chunk in-chunk level matrices, stacked once.  Built on
-                # CPU (Python ints; no device tensor is touched by
-                # ll_level_matrix), moved to the device in one copy.
-                levels = torch.stack(
-                    [
-                        ll_level_matrix(
-                            position + t0 + n * chunk_size + torch.arange(chunk_size)
-                        )
-                        for n in range(n_full)
-                    ]
-                ).to(q.device)
+                # In-chunk levels depend only on the offsets for an aligned
+                # chunk (05 §7.1): fine levels come from the low k bits —
+                # which are the bits of the offsets, since p0 ≡ 0 (mod C) —
+                # and coarse levels never contain tokens of the current
+                # chunk. One cached (C, C) offset matrix per chunk size
+                # (ll_offset_level_matrix), moved to the device once for
+                # this call; never a per-chunk (or per-entry) computation.
+                levels = ll_offset_level_matrix(chunk_size).to(q.device)
                 pre_full = _ll_precompute(loc_full, w_f, v_f, lam_full, levels)
             for n in range(n_full):
                 p0 = position + t0 + n * chunk_size  # absolute chunk start
