@@ -91,7 +91,7 @@ def test_answer_predictions_shift_and_mask():
 def test_D09_exact_accuracy_slices_classes_leak_other():
     batch = _hand_batch()
     logits = _hand_logits()
-    metrics = RecallMetrics()
+    metrics = RecallMetrics(slice_values=[8])
     metrics.update(logits, batch)
     out = metrics.compute()
 
@@ -126,7 +126,7 @@ def test_D09_leakage_counts_old_value_predictions():
     logits[0, 2, 10] = 5.0
     # Answer at position 5 (target 7, class SINGLE): predict correctly.
     logits[0, 4, 7] = 5.0
-    metrics = RecallMetrics()
+    metrics = RecallMetrics(slice_values=[8])
     metrics.update(logits, batch)
     out = metrics.compute()
     assert out["acc"] == pytest.approx(0.5)
@@ -141,7 +141,7 @@ def test_D09_leakage_counts_old_value_predictions():
 
 
 def test_D09_accumulation_across_updates_and_slices():
-    metrics = RecallMetrics()
+    metrics = RecallMetrics(slice_values=[4, 8])
     # Slice 4: 1 correct answer; slice 8: 2 answers, 1 correct.
     labels = torch.full((2, 4), IGNORE, dtype=torch.int64)
     labels[0, 3] = 5
@@ -189,7 +189,7 @@ def test_D09_mqar_mode_without_class_keys():
     config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2,))
     batch = generate_mqar(config, num_examples=4, seed=0)
     logits = torch.zeros(4, config.seq_len, config.vocab_size, dtype=torch.float64)
-    metrics = RecallMetrics()
+    metrics = RecallMetrics(slice_values=config.slices)
     metrics.update(logits, batch)
     out = metrics.compute()
     # All predictions are 0; never equal to a value (>= V/2 = 64) -> acc 0.
@@ -218,7 +218,7 @@ def test_D09_perfect_and_random_overwrite_batches():
     labels = batch["labels"]
     ans_b, ans_p = (labels != IGNORE).nonzero(as_tuple=True)
     logits[ans_b, ans_p - 1, labels[ans_b, ans_p]] = 30.0
-    metrics = RecallMetrics()
+    metrics = RecallMetrics(slice_values=config.slices)
     metrics.update(logits, batch)
     out = metrics.compute()
     assert out["acc"] == pytest.approx(1.0)
@@ -271,6 +271,93 @@ def test_D09_perfect_and_random_overwrite_batches():
     # Empty cells stay omitted.
     for name in set(CLASS_NAMES) - double_cls - single_cls:
         assert f"leak/class={name}" not in out
+
+
+def test_D09_constructor_validation():
+    with pytest.raises(ValueError):
+        RecallMetrics(slice_values=())
+    with pytest.raises(ValueError):
+        RecallMetrics(slice_values=(8, -1))
+    with pytest.raises(ValueError, match="8"):
+        RecallMetrics(slice_values=(4, 8, 8))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_D09_update_is_sync_free():
+    """update() performs no host synchronization: under CUDA sync debug mode
+    'error' (which raises on any synchronizing call, including internal
+    .item()/D2H transfers) the update runs clean. torch.bincount was
+    measured to synchronize (it computes input.max() on the host), which is
+    why the accumulation uses index_add_."""
+    config = OverwriteConfig(
+        vocab_size=512,
+        seq_len=128,
+        num_keys=(8,),
+        block_size=16,
+        distant_min_blocks=4,
+    )
+    batch = generate_overwrite(config, num_examples=4, seed=0, num_keys=8)
+    batch = {key: value.cuda() for key, value in batch.items()}
+    labels = batch["labels"]
+    logits = torch.full((4, config.seq_len, config.vocab_size), -30.0, device="cuda")
+    ans_b, ans_p = (labels != -100).nonzero(as_tuple=True)
+    logits[ans_b, ans_p - 1, labels[ans_b, ans_p]] = 30.0
+
+    metrics = RecallMetrics(slice_values=config.slices)
+    metrics.update(logits, batch)  # warmup: allocates the counts on device
+    metrics.reset()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        metrics.update(logits, batch)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert metrics.compute()["acc"] == pytest.approx(1.0)
+
+
+def test_D09_two_rank_reduction_matches_combined():
+    """Summing two accumulators' count tensors (what all_reduce(SUM) does in
+    compute() under DDP) and deriving through the same compute() path
+    matches one accumulator fed both halves."""
+    config = OverwriteConfig(
+        vocab_size=512,
+        seq_len=128,
+        num_keys=(8,),
+        block_size=16,
+        distant_min_blocks=4,
+    )
+    batch = generate_overwrite(config, num_examples=8, seed=3, num_keys=8)
+    half1 = {key: value[:4] for key, value in batch.items()}
+    half2 = {key: value[4:] for key, value in batch.items()}
+    torch.manual_seed(0)
+    logits1 = torch.randn(4, config.seq_len, config.vocab_size, dtype=torch.float64)
+    torch.manual_seed(1)
+    logits2 = torch.randn(4, config.seq_len, config.vocab_size, dtype=torch.float64)
+
+    rank0 = RecallMetrics(slice_values=config.slices)
+    rank1 = RecallMetrics(slice_values=config.slices)
+    combined = RecallMetrics(slice_values=config.slices)
+    rank0.update(logits1, half1)
+    rank1.update(logits2, half2)
+    combined.update(logits1, half1)
+    combined.update(logits2, half2)
+
+    # The all_reduce(SUM) of the per-rank counts, applied to rank 0.
+    rank0._counts += rank1._counts
+    rank0._unknown += rank1._unknown
+    assert rank0.compute() == combined.compute()
+
+
+def test_D09_unknown_slice_values_raise_in_compute():
+    """Answers whose slice_id is not among slice_values are counted in a
+    separate on-device counter and reported (ValueError) by compute()."""
+    config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2,))
+    batch = generate_mqar(config, num_examples=4, seed=0)
+    batch["slice_id"] = batch["slice_id"] + 100  # outside slice_values
+    logits = torch.zeros(4, config.seq_len, config.vocab_size, dtype=torch.float64)
+    metrics = RecallMetrics(slice_values=config.slices)
+    metrics.update(logits, batch)
+    with pytest.raises(ValueError, match="outside slice_values"):
+        metrics.compute()
 
 
 # =============================================================================
