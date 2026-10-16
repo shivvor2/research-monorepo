@@ -758,6 +758,56 @@ class TestM14MisalignedChunkStart:
         torch.testing.assert_close(S_c, S_r, atol=ATOL, rtol=RTOL)
 
 
+class TestChunkScanDtypeContract:
+    """The chunk scan returns the output in the input dtype (the head/tail
+    recurrent parts already do; the full-chunk parts are cast after the
+    concatenation), and the state in the compute dtype."""
+
+    def test_bf16_ragged_head_and_tail_returns_bf16(self):
+        T, pos, C = 20, 3, 8  # head 5, one full chunk, ragged tail 7
+        gen = torch.Generator().manual_seed(42)
+        f = {"dtype": torch.bfloat16, "generator": gen}
+        q = torch.randn(B, T, H, DK, **f)
+        k = F.normalize(torch.randn(B, T, H, DK, **f), dim=-1)
+        v = torch.randn(B, T, H, DV, **f)
+        g = -torch.rand(B, T, H, DK, **f)
+        b = torch.rand(B, T, H, DK, **f)
+        w = torch.rand(B, T, H, DV, **f)
+        lam = 0.2 + 1.8 * torch.rand(B, T, H, L_WS, **f)
+        o_c, S_c = multistate_chunk_scan(
+            q,
+            k,
+            v,
+            g,
+            b,
+            w,
+            lam,
+            layout="ws",
+            window=W_COMMON,
+            block_size=C,
+            position=pos,
+            chunk_size=C,
+        )
+        o_r, S_r = multistate_recurrent_scan(
+            q,
+            k,
+            v,
+            g,
+            b,
+            w,
+            lam,
+            layout="ws",
+            window=W_COMMON,
+            block_size=C,
+            position=pos,
+        )
+        assert o_c.dtype == torch.bfloat16  # the input dtype, not fp32
+        assert S_c.dtype == torch.float32  # the state stays in the compute dtype
+        # both paths compute in fp32 and round to bf16; agree to bf16 ulps
+        torch.testing.assert_close(o_c, o_r, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(S_c, S_r, atol=1e-4, rtol=1e-4)
+
+
 class TestM15ParameterAccounting:
     """M15: gate modes identical; layouts differ only by the λ module."""
 

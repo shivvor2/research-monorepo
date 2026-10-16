@@ -675,7 +675,13 @@ def multistate_chunk_scan(
             )
             out_parts.append(o_t)
         if out_parts:
-            o = torch.cat(out_parts, dim=1)
+            # The head/tail parts are already in the input dtype (the
+            # recurrent scan casts); the full-chunk parts are in the
+            # compute dtype.  Cast the concatenation to the input dtype —
+            # the documented contract, and what the recurrent scan
+            # returns (for bf16 inputs the cat would otherwise promote
+            # to fp32).
+            o = torch.cat(out_parts, dim=1).to(q.dtype)
         else:
             o = q.new_zeros(B, 0, H, dv)
         return o, S
