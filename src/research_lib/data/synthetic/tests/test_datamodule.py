@@ -103,12 +103,17 @@ def test_D08_train_stream_deterministic_per_seed_and_batch_index():
     for first, second in zip(batches, batches2, strict=True):
         assert _batch_content(first) == _batch_content(second)
 
-    # Batch i equals a direct generation from SeedSequence([train_seed, i]).
+    # Batch i equals a direct generation from SeedSequence([train_seed, i]),
+    # plus its global batch index in the "batch_index" key.
     for i, batch in enumerate(batches):
         expected = generate_mqar(
             MQAR_CFG, num_examples=dm.batch_size, seed=_batch_seed(dm.train_seed, i)
         )
+        expected["batch_index"] = torch.tensor(i, dtype=torch.int64)
         assert _batch_content(batch) == _batch_content(expected)
+        assert int(batch["batch_index"]) == i
+        assert batch["batch_index"].dtype == torch.int64
+        assert batch["batch_index"].shape == ()
 
     # Different train seed -> different stream.
     dm3 = _dm(train_seed=123)
@@ -121,11 +126,6 @@ def test_D08_train_stream_worker_sharding():
     """Worker w of num_workers produces the batches w, w + num_workers, ...;
     the union over workers covers every stream index exactly once, for any
     worker count."""
-    reference = [
-        generate_mqar(MQAR_CFG, num_examples=4, seed=_batch_seed(0, i))
-        for i in range(9)
-    ]
-
     for num_workers in (1, 2, 3):
         produced = {}
         for worker_id in range(num_workers):
@@ -140,12 +140,18 @@ def test_D08_train_stream_worker_sharding():
             indices = [worker_id + num_workers * j for j in range(3)]
             for index, batch in zip(indices, worker_batches, strict=True):
                 assert index not in produced, "batch index produced twice"
+                assert int(batch["batch_index"]) == index
                 produced[index] = batch
         # Every stream index covered exactly once (3 per worker), identical
-        # content per index, for any worker count.
+        # content per index (including the batch_index key), for any worker
+        # count.
         assert sorted(produced) == list(range(3 * num_workers))
         for index, batch in produced.items():
-            assert _batch_content(batch) == _batch_content(reference[index])
+            expected = generate_mqar(
+                MQAR_CFG, num_examples=4, seed=_batch_seed(0, index)
+            )
+            expected["batch_index"] = torch.tensor(index, dtype=torch.int64)
+            assert _batch_content(batch) == _batch_content(expected)
 
 
 def test_D08_train_stream_worker_count_independent_via_dataloader():
@@ -159,17 +165,19 @@ def test_D08_train_stream_worker_count_independent_via_dataloader():
     collected = _take(loader, 6)
     del loader
 
-    reference = {
-        _batch_content(generate_mqar(MQAR_CFG, 4, seed=_batch_seed(0, i)))
-        for i in range(6)
-    }
+    reference = set()
+    for i in range(6):
+        expected = generate_mqar(MQAR_CFG, 4, seed=_batch_seed(0, i))
+        expected["batch_index"] = torch.tensor(i, dtype=torch.int64)
+        reference.add(_batch_content(expected))
     assert len({_batch_content(b) for b in collected}) == 6  # no duplicates
     assert {_batch_content(b) for b in collected} == reference
 
 
 def test_D08_resume_via_state_dict():
     dm = _dm()
-    _take(dm.train_dataloader(), 3)
+    consumed = _take(dm.train_dataloader(), 3)
+    assert [int(b["batch_index"]) for b in consumed] == [0, 1, 2]
     state = dm.state_dict()
     assert state == {"next_batch_idx": 3}
 
@@ -183,7 +191,109 @@ def test_D08_resume_via_state_dict():
             num_examples=dm.batch_size,
             seed=_batch_seed(dm.train_seed, 3 + offset),
         )
+        expected["batch_index"] = torch.tensor(3 + offset, dtype=torch.int64)
         assert _batch_content(batch) == _batch_content(expected)
+        assert int(batch["batch_index"]) == 3 + offset
+
+
+@pytest.mark.parametrize("num_workers", [2, 3])
+def test_D08_stream_position_exact_for_any_worker_count(num_workers):
+    """The stream position advanced by on_before_batch_transfer makes
+    state_dict resumption exact for any worker count: batches fed through
+    the hook in DataLoader (round-robin) order, checkpointed mid-stream,
+    restore into a fresh module that continues the uninterrupted stream
+    with no replay and no skip."""
+    # The uninterrupted reference stream, batch by batch.
+    reference = []
+    for i in range(10):
+        expected = generate_mqar(MQAR_CFG, num_examples=4, seed=_batch_seed(0, i))
+        expected["batch_index"] = torch.tensor(i, dtype=torch.int64)
+        reference.append(expected)
+
+    dm = _dm()
+    # The hook requires an attached trainer in the training stage.
+    dm.trainer = SimpleNamespace(training=True)
+
+    # Simulated workers (patched get_worker_info). The generator body reads
+    # the (patched) worker info lazily on first next(), so each worker's
+    # batches are collected inside its patch context; they are then fed
+    # through the hook in DataLoader round-robin order: step s takes worker
+    # s % num_workers' next batch, which has global index s.
+    worker_batches = {}
+    for worker_id in range(num_workers):
+        dataset = _SyntheticTrainDataset(
+            task="mqar", config=MQAR_CFG, batch_size=4, train_seed=0
+        )
+        with patch(
+            "torch.utils.data.get_worker_info",
+            return_value=SimpleNamespace(id=worker_id, num_workers=num_workers),
+        ):
+            worker_batches[worker_id] = _take(
+                iter(dataset), len(range(worker_id, 10, num_workers))
+            )
+    mid = 7
+    state = None
+    consumed = []
+    for step in range(10):
+        batch = worker_batches[step % num_workers][step // num_workers]
+        dm.on_before_batch_transfer(batch, 0)
+        consumed.append(batch)
+        if step == mid - 1:
+            state = dm.state_dict()
+
+    assert [int(b["batch_index"]) for b in consumed] == list(range(10))
+    assert state is not None and state == {"next_batch_idx": mid}
+
+    # Fresh module: the continuation equals the uninterrupted stream from
+    # `mid` on (no replay of 0..mid-1, no skip).
+    fresh = _dm()
+    fresh.load_state_dict(state)
+    resumed = _take(fresh.train_dataloader(), 3)
+    for offset, batch in enumerate(resumed):
+        assert _batch_content(batch) == _batch_content(reference[mid + offset])
+
+    # Without an attached trainer the hook is a no-op.
+    quiet = _dm()
+    quiet.on_before_batch_transfer(consumed[0], 0)
+    assert quiet.state_dict() == {"next_batch_idx": 0}
+
+
+def test_D08_batch_index_ignored_by_loss():
+    """The extra "batch_index" key does not affect the training loss:
+    DualOptimizerModule.compute_loss reads only `labels` (and falls back to
+    `input_ids`), so extra batch keys are ignored."""
+    import torch.nn.functional as F
+    from torch import nn
+
+    from ....training.modules.dual_optimizer import DualOptimizerModule
+    from ....training.presets import default_adamw_config
+
+    dm = _dm()
+    batch = _take(dm.train_dataloader(), 1)[0]
+    assert "batch_index" in batch
+
+    matrix_opt, matrix_sched = default_adamw_config()
+    vector_opt, vector_sched = default_adamw_config()
+    module = DualOptimizerModule(
+        model=nn.Identity(),
+        matrix_optimizer_config=matrix_opt,
+        vector_optimizer_config=vector_opt,
+        matrix_schedule_config=matrix_sched,
+        vector_schedule_config=vector_sched,
+    )
+    torch.manual_seed(0)
+    logits = torch.randn(
+        dm.batch_size, MQAR_CFG.seq_len, MQAR_CFG.vocab_size, dtype=torch.float64
+    )
+    loss = module.compute_loss(logits, batch)
+    labels = batch["labels"]
+    ans_b, ans_p = (labels != -100).nonzero(as_tuple=True)
+    manual = F.cross_entropy(logits[ans_b, ans_p - 1], labels[ans_b, ans_p])
+    assert torch.allclose(loss, manual, atol=1e-10, rtol=1e-10)
+
+    # Removing the key changes nothing.
+    without_index = {k: v for k, v in batch.items() if k != "batch_index"}
+    assert torch.allclose(module.compute_loss(logits, without_index), loss)
 
 
 def test_D08_resume_sharded_with_workers():
@@ -214,7 +324,9 @@ def test_D08_resume_sharded_with_workers():
     assert sorted(produced) == [5, 6, 7, 8, 9, 10]
     for index, batch in produced.items():
         expected = generate_mqar(MQAR_CFG, num_examples=4, seed=_batch_seed(0, index))
+        expected["batch_index"] = torch.tensor(index, dtype=torch.int64)
         assert _batch_content(batch) == _batch_content(expected)
+        assert int(batch["batch_index"]) == index
 
 
 # =============================================================================
@@ -275,11 +387,14 @@ def test_D08_overwrite_task_batches():
         "old_labels",
         "key_class",
         "write_distance",
+        "batch_index",
     }
     assert all(t.dtype == torch.int64 for t in train_batch.values())
     assert train_batch["input_ids"].shape == (dm.batch_size, OW_CFG.seq_len)
     val_batch = list(dm.val_dataloader())[0]
-    assert set(val_batch) == set(train_batch)
+    # Eval batches carry the task keys only (no "batch_index").
+    assert set(val_batch) == set(train_batch) - {"batch_index"}
+    assert "batch_index" not in val_batch
 
 
 def test_D08_fixed_set_generator_matches_dm():

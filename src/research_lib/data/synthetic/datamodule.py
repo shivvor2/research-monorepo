@@ -18,14 +18,15 @@ functions of a seed).
   must differ from each other and from any train seed (defaults do).
 
 Resumption: :meth:`state_dict` / :meth:`load_state_dict` carry the next
-batch index, so a resumed run continues the same stream. **Exact resumption
-requires ``num_workers=0``**: only in-process iteration advances the stream
-position — DataLoader worker processes iterate pickled copies of the
-dataset, so the parent's position does not advance. With
-``num_workers > 0`` the caller must instead set the next batch index on
-resume from the trainer's consumed batch count (its global step, absent
-gradient accumulation), e.g.
-``dm.load_state_dict({"next_batch_idx": trainer.global_step})``.
+batch index, so a resumed run continues the same stream — **exactly, for
+any ``num_workers``**: every training batch carries its global batch index
+in the ``"batch_index"`` key, and :meth:`on_before_batch_transfer` —
+called by Lightning in the training loop, in the main process, before the
+batch is moved to the device — advances the stream position from it (with
+``num_workers=0`` the in-process iterator advances the position directly
+as well). Validation and test batches carry no ``"batch_index"`` and are
+untouched; the hook is a no-op without an attached trainer in the training
+stage (i.e. outside Lightning).
 """
 
 from __future__ import annotations
@@ -75,11 +76,12 @@ class _SyntheticTrainDataset(IterableDataset):
     """Infinite train stream yielding whole batches.
 
     Batch ``i`` is generated from ``np.random.SeedSequence([train_seed, i])``
-    (via :func:`_batch_seed`). Worker ``w`` of ``num_workers`` produces the
-    batch indices ``w', w' + num_workers, ...`` where ``w'`` is the smallest
-    index ``>= next_batch_idx`` congruent to ``w (mod num_workers)``, so no
-    batch index is ever produced twice and every batch's content depends
-    only on its index.
+    (via :func:`_batch_seed`) and carries its global batch index in the
+    ``"batch_index"`` key (int64 scalar tensor). Worker ``w`` of
+    ``num_workers`` produces the batch indices ``w', w' + num_workers, ...``
+    where ``w'`` is the smallest index ``>= next_batch_idx`` congruent to
+    ``w (mod num_workers)``, so no batch index is ever produced twice and
+    every batch's content depends only on its index.
     """
 
     def __init__(
@@ -98,12 +100,20 @@ class _SyntheticTrainDataset(IterableDataset):
         self.next_batch_idx = 0
 
     def generate_batch(self, index: int) -> dict[str, torch.Tensor]:
-        """Generate batch ``index`` (pure; independent of call order)."""
-        return _GENERATORS[self.task](
+        """Generate batch ``index`` (pure; independent of call order).
+
+        The returned dict is the generator's batch plus the scalar int64
+        tensor ``"batch_index"`` (the global batch index), which the
+        DataModule's ``on_before_batch_transfer`` uses to track the stream
+        position for any worker count.
+        """
+        batch = _GENERATORS[self.task](
             self.config,  # type: ignore[arg-type]
             num_examples=self.batch_size,
             seed=_batch_seed(self.train_seed, index),
         )
+        batch["batch_index"] = torch.tensor(index, dtype=torch.int64)
+        return batch
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         info = torch.utils.data.get_worker_info()
@@ -193,15 +203,18 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         TypeError: ``task_config`` type does not match ``task``.
 
     Note:
-        Exact resumption via :meth:`state_dict` / :meth:`load_state_dict`
-        requires ``num_workers=0``: only in-process iteration advances the
-        stream position (worker processes iterate pickled copies of the
-        dataset, so the parent's counter does not move). With
-        ``num_workers > 0``, set the batch index on resume from the
-        trainer's consumed batch count (its global step, absent gradient
-        accumulation), e.g.
-        ``dm.load_state_dict({"next_batch_idx": trainer.global_step})``.
-        Batch *contents* are per-index deterministic for any worker count.
+        Resumption via :meth:`state_dict` / :meth:`load_state_dict` is exact
+        for any ``num_workers``: every training batch carries its global
+        batch index in the ``"batch_index"`` key, and
+        :meth:`on_before_batch_transfer` — called by Lightning in the
+        training loop, in the main process, before the batch is moved to
+        the device — advances the stream position from it (with
+        ``num_workers=0`` the in-process iterator advances it directly
+        too). Validation and test batches carry no ``"batch_index"`` and
+        are left untouched. Outside Lightning (no trainer attached, or
+        not in the training stage) the hook is a no-op and the position
+        only advances on in-process iteration. Batch *contents* are
+        per-index deterministic for any worker count.
 
     Example:
         >>> dm = SyntheticRecallDataModule(
@@ -377,3 +390,34 @@ class SyntheticRecallDataModule(L.LightningDataModule):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         """Resume the train stream from a serialized position."""
         self._ensure_train_dataset().next_batch_idx = int(state_dict["next_batch_idx"])
+
+    def on_before_batch_transfer(
+        self, batch: dict[str, torch.Tensor], dataloader_idx: int = 0
+    ) -> dict[str, torch.Tensor]:
+        """Advance the train stream position from the batch's global index.
+
+        Lightning calls this hook in the main process for every batch
+        (before it is moved to the device), including when the train stream
+        is consumed through DataLoader workers, so the position that
+        :meth:`state_dict` serializes is exact for any ``num_workers``.
+        Validation and test batches carry no ``"batch_index"`` and are
+        returned untouched, as is any batch observed without an attached
+        trainer in the training stage (outside Lightning).
+
+        Args:
+            batch: a batch from one of the dataloaders.
+            dataloader_idx: index of the dataloader (unused).
+
+        Returns:
+            The batch, unchanged.
+        """
+        trainer = getattr(self, "trainer", None)
+        if (
+            isinstance(batch, dict)
+            and "batch_index" in batch
+            and trainer is not None
+            and bool(getattr(trainer, "training", False))
+        ):
+            index = int(batch["batch_index"])
+            self._ensure_train_dataset().next_batch_idx = index + 1
+        return batch
