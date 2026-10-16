@@ -154,7 +154,10 @@ class TestM05ChunkMatchesRecurrent:
     @pytest.mark.parametrize("gate_mode", GATE_MODES)
     @pytest.mark.parametrize("T", [32, 37])
     def test_M05_chunk_equals_recurrent(self, layout, gate_mode, T):
-        inp = make_inputs(T, seed=hash((layout, gate_mode)) % 1000)
+        # Deterministic seed per (layout, gate_mode): hash() is salted per
+        # process (PYTHONHASHSEED), which made this test unreproducible.
+        seed = LAYOUTS.index(layout) * 10 + GATE_MODES.index(gate_mode)
+        inp = make_inputs(T, seed=seed)
         lam = make_lam(T, lam_levels(layout), seed=2)
         b, w, g = apply_gate_mode(inp["b"], inp["w"], inp["g"], gate_mode)
         args = dict(
