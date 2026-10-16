@@ -713,7 +713,7 @@ def summarize_partition(
         └── Frozen: 3,345,678 (21.8%)
 
         Trainable Parameters by Optimizer:
-        ├── Targetted Parameters: 9,500,000 (79.2% of trainable)
+        ├── Targeted Parameters: 9,500,000 (79.2% of trainable)
         └── Other Parameters: 2,500,000 (20.8% of trainable)
         ...
     """
@@ -754,14 +754,14 @@ def summarize_partition(
         f"└── Frozen: {counts.frozen:,} ({frozen_pct:.1f}%)",
         "",
         "Trainable Parameters by Optimizer:",
-        f"├── Targetted Parameters: {target_count:,} ({target_pct:.1f}% of trainable)",
+        f"├── Targeted Parameters: {target_count:,} ({target_pct:.1f}% of trainable)",
         f"└── Other Parameters: {other_count:,} ({other_pct:.1f}% of trainable)",
     ]
 
     # Add target parameter samples
     if target_named:
         lines.append("")
-        lines.append("Targetted parameters:")
+        lines.append("Targeted parameters:")
         for name, param in target_named[:max_params_to_show]:
             lines.append(f"  {name}: {tuple(param.shape)}")
         if len(target_named) > max_params_to_show:

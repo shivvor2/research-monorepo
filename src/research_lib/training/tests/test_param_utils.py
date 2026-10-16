@@ -526,8 +526,8 @@ class TestSummarizePartition:
         assert "Total:" in summary
         assert "Trainable:" in summary
         assert "Frozen:" in summary
-        assert "Matrix optimizer (target):" in summary
-        assert "Vector optimizer (other):" in summary
+        assert "Targeted Parameters:" in summary
+        assert "Other Parameters:" in summary
 
     def test_summary_shows_percentages(self):
         """Test that summary shows percentages."""
