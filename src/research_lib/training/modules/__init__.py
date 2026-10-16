@@ -58,7 +58,9 @@ Example:
 """
 
 from .dual_optimizer import DualOptimizerModule
+from .synthetic_recall import SyntheticRecallModule
 
 __all__ = [
     "DualOptimizerModule",
+    "SyntheticRecallModule",
 ]
