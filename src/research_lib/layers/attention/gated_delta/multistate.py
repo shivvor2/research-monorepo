@@ -48,6 +48,7 @@ Run tests with::
 """
 
 import logging
+from typing import NamedTuple
 
 import torch
 import torch.nn as nn
@@ -61,7 +62,6 @@ from research_lib.layers.attention.gated_delta.functional import (
     chunk_local_terms,
     chunk_scan,
     recurrent_scan,
-    transition,
 )
 from research_lib.layers.attention.gated_delta.layouts import (
     Layout,
@@ -334,31 +334,102 @@ def _ws_fs_chunk_step(
     return O_chunk, ws_shift(S_next, window)
 
 
+class LlChunkPrecomputed(NamedTuple):
+    """State-independent per-chunk LL quantities, batched over full chunks.
+
+    Computed once per call (Phase 1 for all chunks in one
+    :func:`chunk_local_terms` call, then the derived quantities batched
+    over the chunk axis), so the per-chunk Python loop only ever touches
+    state-dependent tensors.  Index with ``[:, :, n]`` for chunk ``n``.
+
+    Fields (all ``(B, H, N, ...)``):
+        o_intra: ``(C, d_v)`` — the intra-chunk output
+            ``((Aqk N) ⊙ Λ^H) Z`` (fine levels ``0..k``).
+        r_mat: ``(C, d_k)`` — the coarse-level read operator
+            ``R = Qg - Aqk W``.
+        f_mat: ``(d_k, d_k)`` — the coarse-level transport
+            ``F = Diag(γ^C) - M^T W``.
+        s_chunk: ``(d_k, d_v)`` — the chunk's own content at the chunk end,
+            ``M^T NZ`` (a level-``k+1`` bucket).
+    """
+
+    o_intra: torch.Tensor
+    r_mat: torch.Tensor
+    f_mat: torch.Tensor
+    s_chunk: torch.Tensor
+
+
+def _ll_precompute(
+    loc_full: ChunkLocals,
+    w_f: torch.Tensor,
+    v_f: torch.Tensor,
+    lam_full: torch.Tensor,
+    levels: torch.Tensor,
+) -> LlChunkPrecomputed:
+    """Batch the state-independent LL quantities over all full chunks.
+
+    One gather for ``Λ^H`` (from the in-chunk level matrix), one matmul
+    for ``Aqk N``, and the intra-chunk output
+    ``((Aqk N) ⊙ Λ^H) Z`` — each a single batched call over
+    ``(B, H, N, ...)`` — plus the coarse-level read/transport operators
+    and the chunk content.  The per-chunk loop then only does the
+    state-dependent work (``05`` §7.3: coarse levels are
+    transported-only buckets read through ``R``).
+
+    Args:
+        loc_full (ChunkLocals): Phase-1 terms for all chunks, ``(B, H, N,
+            ...)``.
+        w_f (Tensor): ``(B, H, N, C, d_v)`` chunk-major write gate.
+        v_f (Tensor): ``(B, H, N, C, d_v)`` chunk-major values.
+        lam_full (Tensor): ``(B, H, N, C, L)`` λ for all chunks.
+        levels (Tensor): ``(N, C, C)`` per-chunk in-chunk level matrices
+            (levels of in-chunk pairs), ``-1`` above the diagonal, already on
+            the target device.
+
+    Returns:
+        LlChunkPrecomputed: the batched quantities (see the NamedTuple).
+    """
+    B, Hc, N, C = loc_full.Aqk.shape[:4]
+    idx = levels.clamp(min=0).view(1, 1, N, C, C).expand(B, Hc, N, C, C)
+    lam_h = lam_full.gather(-1, idx)  # (B,H,N,C,C)
+    lam_h = lam_h * (levels >= 0).to(lam_h.dtype).view(1, 1, N, C, C)  # 0 above diag
+    z_full = w_f * v_f  # (B,H,N,C,dv)
+    aqk_n = loc_full.Aqk @ loc_full.N  # (B,H,N,C,C) exact pairwise coefficients
+    o_intra = (aqk_n * lam_h) @ z_full  # (B,H,N,C,dv)
+    r_mat = loc_full.Qg - loc_full.Aqk @ loc_full.W  # (B,H,N,C,dk)
+    dk = loc_full.Qg.shape[-1]
+    eye = torch.eye(dk, dtype=loc_full.Qg.dtype, device=loc_full.Qg.device)
+    f_mat = (
+        loc_full.gC.unsqueeze(-1) * eye - loc_full.M.transpose(-1, -2) @ loc_full.W
+    )  # (B,H,N,dk,dk)
+    s_chunk = loc_full.M.transpose(-1, -2) @ loc_full.NZ  # (B,H,N,dk,dv)
+    return LlChunkPrecomputed(
+        o_intra=o_intra, r_mat=r_mat, f_mat=f_mat, s_chunk=s_chunk
+    )
+
+
 def _ll_chunk_step(
     S: torch.Tensor,
-    loc: ChunkLocals,
-    Z: torch.Tensor,
+    pre: LlChunkPrecomputed,
     lam_c: torch.Tensor,
     position: int,
     chunk_size: int,
     scale: float,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """One LL chunk step (spec §2.4 / ``05`` §7), from an aligned chunk start.
+    """State-dependent part of one LL chunk step (spec §2.4 / ``05`` §7).
 
-    Intra-chunk (fine levels ``0..k``): the exact pairwise coefficient
-    matrix ``Aqk N`` masked by the level-λ matrix ``Λ^H`` applied to the
-    chunk writes ``Z = w ⊙ v``.  Inter-chunk (coarse levels ``>= k+1``):
-    transported-only buckets read with ``R = Qg - Aqk W``.  At the chunk
-    end: transport the coarse levels with ``F = Diag(gC) - M^T W``, then a
-    Fenwick carry on the chunk counter folds this chunk's content
-    (``M^T NZ``, a level-``k+1`` bucket) into the coarse levels.
+    Every state-independent quantity (the intra-chunk output
+    ``((Aqk N) ⊙ Λ^H) Z``, the coarse read operator ``R``, the coarse
+    transport ``F``, the chunk's own content ``M^T NZ``) arrives
+    precomputed and batched over chunks (:func:`_ll_precompute`); this
+    step only touches state-dependent tensors.
 
     Args:
         S (Tensor): Canonical slot stack ``(B, H, L, d_k, d_v)`` at the
             chunk start (slots ``0..k`` are zero there, by the canonical
             form at a chunk boundary).
-        loc (ChunkLocals): Phase-1 quantities for this chunk.
-        Z (Tensor): Chunk writes ``(B, H, C, d_v)`` (``w ⊙ v``).
+        pre (LlChunkPrecomputed): The precomputed quantities for this
+            chunk (already sliced from the batched tuple).
         lam_c (Tensor): ``(B, H, C, L)`` λ for this chunk.
         position (int): Absolute position of the chunk start.
         chunk_size (int): ``C = 2^k``.
@@ -368,8 +439,6 @@ def _ll_chunk_step(
         tuple: ``(O_chunk, S_next)`` — the chunk output ``(B, H, C, d_v)``
         and the canonical slot stack for the next position.
     """
-    B, Hc, C = loc.Aqk.shape[:3]
-    dk = loc.Qg.shape[-1]
     k = chunk_size.bit_length() - 1
     # Canonical-form invariant: at a chunk boundary the fine levels
     # (slots 0..k) are zero — they are intra-chunk quantities, recomputed
@@ -382,30 +451,19 @@ def _ll_chunk_step(
             "zero, got nonzero entries; continue from a cache produced by "
             "a previous call (or zeros)"
         )
-    # ---- intra-chunk: the H mask on the WY-transformed matrix ----------
-    positions = position + torch.arange(C, device=S.device)
-    levels = ll_level_matrix(positions)  # (C, C), -1 above the diagonal
-    idx = levels.clamp(min=0).view(1, 1, C, C).expand(B, Hc, C, C)
-    LamH = lam_c.gather(-1, idx)  # (B, H, C, C)
-    LamH = LamH * (levels >= 0).to(LamH.dtype).view(1, 1, C, C)  # 0 above diag
-    AqkN = loc.Aqk @ loc.N  # (B, H, C, C) exact pairwise coefficients
-    O_intra = (AqkN * LamH) @ Z  # (B, H, C, dv)
     # ---- inter-chunk: coarse levels are transported-only buckets -------
-    R = loc.Qg - loc.Aqk @ loc.W  # (B, H, C, dk)
     O_inter = torch.einsum(
         "bhcl,bhlcd->bhcd",
         lam_c[..., k + 1 :],
-        R.unsqueeze(2) @ S[..., k + 1 :, :, :],
+        pre.r_mat.unsqueeze(2) @ S[..., k + 1 :, :, :],
     )
-    O_chunk = scale * (O_intra + O_inter)
+    O_chunk = scale * (pre.o_intra + O_inter)
     # ---- end of chunk: transport, then a Fenwick step over chunks ------
-    eye = torch.eye(dk, dtype=S.dtype, device=S.device)
-    F = loc.gC.unsqueeze(-1) * eye - loc.M.transpose(-1, -2) @ loc.W  # (B,H,dk,dk)
     S = torch.cat(
-        [S[..., : k + 1, :, :], F.unsqueeze(2) @ S[..., k + 1 :, :, :]], dim=-3
+        [S[..., : k + 1, :, :], pre.f_mat.unsqueeze(2) @ S[..., k + 1 :, :, :]],
+        dim=-3,
     )
-    S_chunk = loc.M.transpose(-1, -2) @ loc.NZ  # (B, H, dk, dv)
-    S = ll_chunk_merge(S, S_chunk, (position + chunk_size) // chunk_size, k)
+    S = ll_chunk_merge(S, pre.s_chunk, (position + chunk_size) // chunk_size, k)
     return O_chunk, S
 
 
@@ -516,31 +574,61 @@ def multistate_chunk_scan(
             )
             out_parts.append(o_h)
             pos += n_head
-        # ---- full chunks ---------------------------------------------------
+        # ---- full chunks: Phase 1 batched over all of them -----------------
+        # One chunk_local_terms call on (B, H, N, C, ·) (as functional.chunk_scan
+        # does): transpose, cast, then split the time axis into chunks (the
+        # reshape copies the non-contiguous transpose). The state-independent
+        # LL quantities are batched over the chunk axis too (_ll_precompute),
+        # so the per-chunk loop below only ever touches state-dependent tensors.
         n_full = (T - n_head) // chunk_size
-        for n in range(n_full):
-            t0 = n_head + n * chunk_size  # local index within this call
-            p0 = position + t0  # absolute chunk start
-            assert p0 % chunk_size == 0, "chunk alignment invariant"
-            sl = slice(t0, t0 + chunk_size)
-            q_c = q[:, sl].transpose(1, 2).to(cd).unsqueeze(2)  # (B,H,1,C,dk)
-            k_c = k[:, sl].transpose(1, 2).to(cd).unsqueeze(2)
-            v_c = v[:, sl].transpose(1, 2).to(cd).unsqueeze(2)
-            g_c = g[:, sl].transpose(1, 2).to(cd).unsqueeze(2)
-            b_c = b[:, sl].transpose(1, 2).to(cd).unsqueeze(2)
-            w_c = w[:, sl].transpose(1, 2).to(cd).unsqueeze(2)
-            loc = chunk_local_terms(q_c, k_c, v_c, g_c, b_c, w_c, compute_dtype)
-            loc = ChunkLocals(*(f[:, :, 0] for f in loc))  # squeeze N=1
-            lam_c = lam[:, sl].transpose(1, 2).to(cd)  # (B,H,C,L)
-            if layout in (Layout.WS, Layout.FS):
-                O_c, S = _ws_fs_chunk_step(
-                    S, q_c[:, :, 0], loc, lam_c, layout, window, scale
-                )
-            else:
-                Z = w_c[:, :, 0] * v_c[:, :, 0]  # (B, H, C, dv)
-                O_c, S = _ll_chunk_step(S, loc, Z, lam_c, p0, chunk_size, scale)
-            out_parts.append(O_c.transpose(1, 2))  # (B, C, H, dv)
-            pos += chunk_size
+        if n_full:
+            t0 = n_head
+            t1 = n_head + n_full * chunk_size
+            sl = slice(t0, t1)
+            q_f = q[:, sl].transpose(1, 2).to(cd).reshape(B, H, n_full, chunk_size, dk)
+            k_f = k[:, sl].transpose(1, 2).to(cd).reshape(B, H, n_full, chunk_size, dk)
+            g_f = g[:, sl].transpose(1, 2).to(cd).reshape(B, H, n_full, chunk_size, dk)
+            b_f = b[:, sl].transpose(1, 2).to(cd).reshape(B, H, n_full, chunk_size, dk)
+            v_f = v[:, sl].transpose(1, 2).to(cd).reshape(B, H, n_full, chunk_size, dv)
+            w_f = w[:, sl].transpose(1, 2).to(cd).reshape(B, H, n_full, chunk_size, dv)
+            loc_full = chunk_local_terms(q_f, k_f, v_f, g_f, b_f, w_f, compute_dtype)
+            lam_full = (
+                lam[:, sl].transpose(1, 2).to(cd).reshape(B, H, n_full, chunk_size, L)
+            )  # (B,H,N,C,L)
+            pre_full: LlChunkPrecomputed | None = None
+            if layout is Layout.LL:
+                # Per-chunk in-chunk level matrices, stacked once.  Built on
+                # CPU (Python ints; no device tensor is touched by
+                # ll_level_matrix), moved to the device in one copy.
+                levels = torch.stack(
+                    [
+                        ll_level_matrix(
+                            position + t0 + n * chunk_size + torch.arange(chunk_size)
+                        )
+                        for n in range(n_full)
+                    ]
+                ).to(q.device)
+                pre_full = _ll_precompute(loc_full, w_f, v_f, lam_full, levels)
+            for n in range(n_full):
+                p0 = position + t0 + n * chunk_size  # absolute chunk start
+                assert p0 % chunk_size == 0, "chunk alignment invariant"
+                loc_n = ChunkLocals(*(f[:, :, n] for f in loc_full))  # (B,H,C,·)
+                lam_c = lam_full[:, :, n]  # (B,H,C,L)
+                if layout in (Layout.WS, Layout.FS):
+                    O_c, S = _ws_fs_chunk_step(
+                        S, q_f[:, :, n], loc_n, lam_c, layout, window, scale
+                    )
+                else:
+                    assert pre_full is not None  # set for LL just above
+                    pre_n = LlChunkPrecomputed(
+                        o_intra=pre_full.o_intra[:, :, n],
+                        r_mat=pre_full.r_mat[:, :, n],
+                        f_mat=pre_full.f_mat[:, :, n],
+                        s_chunk=pre_full.s_chunk[:, :, n],
+                    )
+                    O_c, S = _ll_chunk_step(S, pre_n, lam_c, p0, chunk_size, scale)
+                out_parts.append(O_c.transpose(1, 2))  # (B, C, H, dv)
+                pos += chunk_size
         # ---- ragged tail: recurrently --------------------------------------
         t_tail = n_head + n_full * chunk_size
         if t_tail < T:
