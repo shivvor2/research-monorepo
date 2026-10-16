@@ -81,6 +81,11 @@ def test_mqar_config_validation():
         MQARConfig(vocab_size=256, seq_len=64, num_kv_pairs=())  # empty slices
     with pytest.raises(ValueError):
         MQARConfig(vocab_size=512, seq_len=64, num_kv_pairs=(32,))  # 4D > T
+    with pytest.raises(ValueError, match="4"):
+        # Duplicate slice values are rejected, naming the duplicates.
+        MQARConfig(vocab_size=512, seq_len=64, num_kv_pairs=(4, 4, 8))
+    with pytest.raises(ValueError, match="8"):
+        MQARConfig(vocab_size=512, seq_len=64, num_kv_pairs=(8, 16, 8, 16))
     with pytest.raises(ValueError):
         generate_mqar(SMALL, num_examples=2, seed=0, num_kv_pairs=32)
 

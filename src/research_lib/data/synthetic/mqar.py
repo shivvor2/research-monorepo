@@ -76,6 +76,11 @@ class MQARConfig:
             )
         if not self.num_kv_pairs:
             raise ValueError("num_kv_pairs must be non-empty")
+        duplicates = sorted(
+            {d for d in self.num_kv_pairs if self.num_kv_pairs.count(d) > 1}
+        )
+        if duplicates:
+            raise ValueError(f"duplicate num_kv_pairs entries: {duplicates}")
         # Zoology's assertion: 4 * D <= T for every D (context 2D + queries 2D).
         for d in self.num_kv_pairs:
             if d < 1:

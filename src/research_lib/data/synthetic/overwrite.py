@@ -135,10 +135,14 @@ class OverwriteConfig:
             )
         if not self.num_keys:
             raise ValueError("num_keys must be non-empty")
-        # Feasibility check for the largest K: an all-distant assignment must
-        # fit (4K write tokens + 2K query tokens <= T), and the write region
-        # must span at least distant_min_blocks + 1 blocks.
-        _validate_key_count(self, max(self.num_keys))
+        duplicates = sorted({k for k in self.num_keys if self.num_keys.count(k) > 1})
+        if duplicates:
+            raise ValueError(f"duplicate num_keys entries: {duplicates}")
+        # Feasibility for EVERY entry (an all-distant assignment must fit:
+        # 4K write tokens + 2K query tokens <= T, and the write region must
+        # span at least distant_min_blocks + 1 blocks).
+        for entry in self.num_keys:
+            _validate_key_count(self, entry)
         if self.block_size < 2:
             raise ValueError(f"block_size must be >= 2, got {self.block_size}")
         if self.distant_min_blocks < 1:

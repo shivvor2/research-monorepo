@@ -147,6 +147,14 @@ def test_overwrite_config_validation():
         OverwriteConfig(vocab_size=128, seq_len=128)  # vocab not > seq_len
     with pytest.raises(ValueError):
         OverwriteConfig(num_keys=())  # empty slices
+    # Every num_keys entry is validated, not only the maximum.
+    with pytest.raises(ValueError, match=">= 1"):
+        OverwriteConfig(vocab_size=1024, seq_len=256, num_keys=(0, 8))
+    with pytest.raises(ValueError, match=">= 1"):
+        OverwriteConfig(vocab_size=1024, seq_len=256, num_keys=(-1, 8))
+    with pytest.raises(ValueError, match="8"):
+        # Duplicate slice values are rejected, naming the duplicates.
+        OverwriteConfig(vocab_size=1024, seq_len=256, num_keys=(8, 16, 8))
     with pytest.raises(ValueError):
         OverwriteConfig(class_probs=(0.25, 0.25, 0.25, 0.3))  # sums > 1
     with pytest.raises(ValueError):

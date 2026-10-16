@@ -62,10 +62,12 @@ def _batch_seed(train_seed: int, index: int) -> int:
         index: global batch index.
 
     Returns:
-        A usable int seed for ``np.random.default_rng`` (uint32 draw).
+        A usable int seed for ``np.random.default_rng`` (64-bit draw).
     """
     return int(
-        np.random.SeedSequence([int(train_seed), int(index)]).generate_state(1)[0]
+        np.random.SeedSequence([int(train_seed), int(index)]).generate_state(
+            1, dtype=np.uint64
+        )[0]
     )
 
 
@@ -154,7 +156,9 @@ def _generate_fixed_set(
     parts = []
     for slice_value in config.slices:  # type: ignore[attr-defined]
         part_seed = int(
-            np.random.SeedSequence([int(seed), int(slice_value)]).generate_state(1)[0]
+            np.random.SeedSequence([int(seed), int(slice_value)]).generate_state(
+                1, dtype=np.uint64
+            )[0]
         )
         if task == "mqar":
             part = generator(config, num_per_slice, part_seed, num_kv_pairs=slice_value)  # type: ignore[arg-type, call-arg]
