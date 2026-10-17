@@ -27,6 +27,10 @@ model:                     # -> ZoologyLMConfig
   layer_pattern: zoology   # layer 0 BaseConv, layer 1 the layer under test
   state_mixer: none
   num_heads: 2
+  head_dim: null           # null -> d_model // num_heads
+  expand_v: 1.0            # value-dim multiplier (tier 5 sets 10)
+  ff_mult: 4               # feed-forward hidden-dim multiplier
+  base_conv_kernel: 3      # the Zoology layer-0 short-conv kernel size
   gate_mode: full
   layout: single
   lambda_mode: mlp
@@ -44,6 +48,7 @@ optimizer:
 
 training:
   batch_size: 256
+  collect_mixer_stats: true  # per-layer lambda/erase statistics during validation
   max_steps: 20000
   val_check_interval: 500
   early_stop_threshold: 0.99

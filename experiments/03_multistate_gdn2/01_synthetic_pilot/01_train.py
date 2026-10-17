@@ -291,7 +291,7 @@ def build_model(cfg: DictConfig) -> ZoologyLM:
     Python that reads them is mixer-specific.
     """
     c = cfg.model
-    head_dim = c.get("head_dim", None)
+    head_dim = c.head_dim
     head_dim = int(head_dim) if head_dim is not None else c.d_model // c.num_heads
 
     def make_mixer() -> MultistateGatedDelta:
@@ -299,7 +299,7 @@ def build_model(cfg: DictConfig) -> ZoologyLM:
             hidden_size=c.d_model,
             num_heads=c.num_heads,
             head_dim=head_dim,
-            expand_v=c.get("expand_v", 1.0),
+            expand_v=c.expand_v,
             gate_mode=c.gate_mode,
             layout=c.layout,
             lambda_mode=c.lambda_mode,
@@ -315,13 +315,13 @@ def build_model(cfg: DictConfig) -> ZoologyLM:
         d_model=c.d_model,
         make_mixer=make_mixer,
         pattern=c.layer_pattern,
-        conv_kernel=c.get("base_conv_kernel", 3),  # the old config default
+        conv_kernel=c.base_conv_kernel,
     )
     model_config = ZoologyLMConfig(
         vocab_size=c.vocab_size,
         d_model=c.d_model,
         state_mixer=c.state_mixer,
-        ff_mult=c.get("ff_mult", 4),  # the old config default
+        ff_mult=c.ff_mult,
     )
     return ZoologyLM(model_config, mixers)
 
@@ -331,7 +331,7 @@ def build_module(
 ) -> MGDN2SyntheticRecallModule:
     """The training module with the two AdamW weight-decay groups."""
     matrix_optimizer_config, vector_optimizer_config = build_weight_decay_configs(
-        str(cfg.optimizer.get("decay_scheme", "grouped")),
+        cfg.optimizer.decay_scheme,
         weight_decay=cfg.optimizer.weight_decay,
         betas=tuple(cfg.optimizer.betas),
     )
@@ -370,7 +370,7 @@ def make_run_id(cfg: DictConfig, lr: float) -> str:
         f"-{cfg.model.lambda_mode}-d{cfg.model.d_model}-lr{lr:g}"
     )
     # A non-default weight-decay scheme is part of the run's identity.
-    scheme = str(cfg.optimizer.get("decay_scheme", "grouped"))
+    scheme = str(cfg.optimizer.decay_scheme)
     if scheme != "grouped":
         run_id += f"-wd-{scheme}"
     run_id += f"-s{cfg.seed}"
@@ -435,12 +435,12 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
                 "lr_resolved": lr_resolved.get("value"),
                 # Also recorded via the config; kept top-level so analyses
                 # need not dig for it (one JSON per run, rsync-able).
-                "decay_scheme": str(cfg.optimizer.get("decay_scheme", "grouped")),
+                "decay_scheme": str(cfg.optimizer.decay_scheme),
             },
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
-    if bool(cfg.training.get("collect_mixer_stats", True)):
+    if bool(cfg.training.collect_mixer_stats):
         callbacks.append(LayerStatsCallback(prefix="mixer", summarize=per_slot_summary))
     return callbacks
 

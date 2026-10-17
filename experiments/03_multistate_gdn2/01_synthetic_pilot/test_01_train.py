@@ -390,6 +390,52 @@ def model_cfg(**overrides):
     return OmegaConf.create({"model": model})
 
 
+def first_sweeper_value(value) -> str:
+    """The first value of a --multirun sweeper parameter.
+
+    ``"a,b,c"`` -> ``"a"``; ``"range(0,10)"`` -> ``"0"``; a single value
+    passes through.
+    """
+    value = str(value)
+    if value.startswith("range("):
+        inner = value[value.index("(") + 1 : value.rindex(")")]
+        return inner.split(",")[0].strip()
+    return value.split(",")[0].strip()
+
+
+class TestSweepConfigsCompose:
+    """Every sweep file must compose through Hydra, exactly as
+    ``--multirun`` would.
+
+    Hydra struct mode rejects overrides of keys missing from
+    ``conf/config.yaml`` ("Key ... is not in struct"), so a default that
+    lives only in Python makes a tier unlaunchable. The other tests build
+    configs with ``make_cfg``; only a real composition catches this.
+    """
+
+    def test_every_sweep_file_composes(self):
+        from hydra import compose, initialize_config_dir
+
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        sweeps = sorted((conf_dir / "sweep").glob("*.yaml"))
+        assert len(sweeps) >= 10  # sanity: we found the sweep group
+        for path in sweeps:
+            stem = path.stem
+            # The sweeper parameters come from the sweep file (compose()
+            # returns the config without the hydra section). DictConfig
+            # .get does not traverse dotted paths; use OmegaConf.select.
+            params = OmegaConf.select(
+                OmegaConf.load(path), "hydra.sweeper.params", default={}
+            )
+            overrides = [f"+sweep={stem}"] + [
+                f"{key}={first_sweeper_value(value)}" for key, value in params.items()
+            ]
+            # The first value of every sweeper parameter must be a valid
+            # override (this is what --multirun submits first).
+            with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+                compose(config_name="config", overrides=overrides)
+
+
 class TestBuildModel:
     """The experiment's builder: make_mixer + zoology_mixers + ZoologyLM.
 
