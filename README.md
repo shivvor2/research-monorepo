@@ -20,7 +20,7 @@ A monorepo containing:
 
 **Architectures:**
 - [Modded NanoGPT (Base)](src/research_lib/architectures/modded_nanogpt_base.py): Transformer blocks with MHA and pre-norm (RMSNorm).
-- [ZoologyLM](src/research_lib/architectures/zoology_lm.py): Zoology-style two-layer causal LM with a pluggable gated-delta mixer (layer 0 `BaseConv`, layer 1 the layer under test; no positional embedding). *(Harness for the multi-state GDN-2 pilot.)*
+- [ZoologyLM](src/research_lib/architectures/zoology_lm.py): Zoology-style causal LM harness taking already-built sequence mixers (`zoology_mixers` lays out the Zoology patterns: BaseConv in even blocks, the experiment's `make_mixer()` in odd blocks, or one mixer everywhere; no positional embedding).
 
 **Attention Layers:**
 - [Multi-Head Attention](src/research_lib/layers/attention/rotary_mha.py): With RoPE embeddings, QK-Norm, and [XSA](https://arxiv.org/pdf/2603.09078).
@@ -54,14 +54,15 @@ A monorepo containing:
 - [FineWebDataModule](src/research_lib/data/fineweb_datamodule.py): DataModule handling [`kjj0/finewebedu10B-gpt2`](https://huggingface.co/datasets/kjj0/finewebedu10B-gpt2) from Hugging Face.
 - [SyntheticRecallDataModule](src/research_lib/data/synthetic/datamodule.py): MQAR (Zoology format) and repeated-key overwrite with placement classes. Streams fresh seeded training batches and holds fixed validation/test slices; includes answer-position metrics (per-slice, per-class accuracy, old-value leakage). *(Reference generators for the multi-state GDN-2 pilot.)*
 - [ExperimentStateCallback](src/research_lib/training/callbacks/experiment_state.py): Callback to track the latest checkpoint path for automated experiment resumption.
-- [SyntheticRecallModule](src/research_lib/training/modules/synthetic_recall.py): `DualOptimizerModule` for the synthetic recall tasks (answer-only loss with a full-sequence switch, `RecallMetrics` logging, mixer statistics during validation).
-- [RunSummaryCallback](src/research_lib/training/callbacks/run_summary.py): One JSON per run (config + hash, provenance, parameters, timing, stopping, metrics), written atomically at fit / test end.
+- [MGDN2SyntheticRecallModule](src/research_lib/training/modules/mgdn2_synthetic_recall.py): task-specific training module of the multi-state GDN-2 synthetic pilot (answer-only loss with a full-sequence switch, `RecallMetrics` logging).
+- [RunSummaryCallback](src/research_lib/training/callbacks/run_summary.py): One JSON per run, written atomically at every stage: config + hash, provenance, timing, stopping, a lifecycle `status` and the outputs of the run's `Collector`s (`metrics_by_prefix`, `param_counts` factories).
+- [LayerStatsCallback](src/research_lib/training/callbacks/layer_stats.py): Collects and logs per-layer statistics during validation/test epochs for any layer following the two-attribute `StatsProvider` convention.
 
 ### Utilities
 - [Optimizer Scheduling Suite](src/research_lib/training/scheduling/README.md): Flexible parameter scheduling system.
     - *Reference:* [r/MachineLearning post](https://www.reddit.com/r/MachineLearning/comments/1rfer1y/p_implementing_better_pytorch_schedulers/) (#2 post of the day: 27-02-26)
 - [Parameter Partitioning Helpers](src/research_lib/training/param_utils.py): Filtering and grouping via PEFT-style pattern matching.
-- [Pilot Statistics](src/research_lib/utils/stats.py): Per-seed difference-in-differences (`did_per_seed`) and percentile `bootstrap_ci` for the multi-state GDN-2 pilot analysis.
+- [Paired Contrasts](src/research_lib/utils/stats.py): Per-unit paired contrasts (`paired_contrast`), the 2×2 interaction / difference-in-differences (`interaction_contrast`, `Factor`) and percentile `bootstrap_ci` of any statistic.
 
 ## Installation (Development)
 

@@ -87,9 +87,17 @@ perfectly while DDP mostly adds communication overhead.
 
 ## Outputs
 
-- `runs/<task>/<run_id>.json` — one JSON per run (config + hash, git /
-  versions / device, parameters and state bytes, timing, stopping,
-  validation/test metrics, mixer statistics). `run_id` is
+- `runs/<task>/<run_id>.json` — one JSON per run, written at the start
+  and end of fitting, at the end of testing and on failure. Top-level
+  sections: `run_id`, `status` (`running` → `fit_done` → `test_done`;
+  `failed` / `interrupted` on an exception, with `error`), `config` +
+  `config_hash` (seed excluded), `seed`, `git`, `versions`, `device`,
+  `timing`, `stopping` (`early_stopped`, `monitor`, `mode`, `best_value`,
+  `best_step`), and the run's collector sections: `params` (total /
+  trainable / the λ group), `state` (`bytes_per_mixer`),
+  `val_final`, `mixer_stats_final`, `test` — plus `lr_resolved` and
+  `decay_scheme`. Runs whose status is not `test_done` are incomplete;
+  the analysis lists them. `run_id` is
   `{tier_}{task}-{layout}-{gate_mode}-{lambda_mode}-d{d}-lr{lr}-s{seed}`.
 - `logs/` — CSV (and optional wandb) logs; `outputs/`, `multirun/` —
   hydra job dirs; `analysis/` — the analysis output. All git-ignored.
