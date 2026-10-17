@@ -285,6 +285,13 @@ def _git_info() -> dict[str, Any]:
 class RunSummaryCallback(L.Callback):
     """Write one JSON summary per run, atomically, at every stage.
 
+    **Lifecycle.** A callback instance serves one run: the best-value
+    tracking is initialised in ``__init__`` and checkpointed through
+    :meth:`state_dict` / :meth:`load_state_dict`, so it survives a fit
+    resumed from a checkpoint. ``timing`` after such a resume measures
+    only the resumed segment (the clock starts at the resumed
+    ``on_fit_start``).
+
     Args:
         runs_dir: Directory the JSON is written to (created if missing).
         run_id: Identifies the run; used by the default filename and
@@ -510,13 +517,23 @@ class RunSummaryCallback(L.Callback):
     # ------------------------------------------------------------------ #
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        # No best-value reset here: a callback instance serves one run,
+        # and a resumed fit must keep the best seen before the
+        # interruption (restored via load_state_dict).
         self._fit_start = time.monotonic()
-        self._best_value = None
-        self._best_step = None
         self._run_stage(Stage.FIT_START, trainer, pl_module)
         self.summary["status"] = "running"
         self._merge_extra()
         self._write(trainer)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Best tracked value / step, so Lightning stores them in checkpoints."""
+        return {"best_value": self._best_value, "best_step": self._best_step}
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore the best tracked value / step (survives a resumed fit)."""
+        self._best_value = state.get("best_value")
+        self._best_step = state.get("best_step")
 
     def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         self._run_stage(Stage.FIT_END, trainer, pl_module)

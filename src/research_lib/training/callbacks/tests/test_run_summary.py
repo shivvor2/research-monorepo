@@ -86,6 +86,25 @@ def tiny_module() -> MGDN2SyntheticRecallModule:
     )
 
 
+class DecreasingVal(L.LightningModule):
+    """Logs ``val/acc = 10 - global_step``: the best value is always in
+    the FIRST fit segment, so a resumed fit must restore it to see the
+    maximum over both segments."""
+
+    def __init__(self):
+        super().__init__()
+        self.layer = torch.nn.Linear(2, 2)
+
+    def training_step(self, batch, batch_idx):
+        return self.layer.weight.sum()
+
+    def validation_step(self, batch, batch_idx):
+        self.log("val/acc", 10.0 - float(self.global_step))
+
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), lr=0.1)
+
+
 def make_loader():
     from torch.utils.data import Dataset
 
@@ -103,7 +122,7 @@ def make_loader():
     return torch.utils.data.DataLoader(_DictDataset(), batch_size=None)
 
 
-def make_trainer(callbacks, max_steps=2):
+def make_trainer(callbacks, max_steps=2, val_check_interval=None):
     return L.Trainer(
         max_steps=max_steps,
         accelerator="cpu",
@@ -111,7 +130,7 @@ def make_trainer(callbacks, max_steps=2):
         enable_progress_bar=False,
         callbacks=callbacks,
         num_sanity_val_steps=0,
-        val_check_interval=max_steps,
+        val_check_interval=val_check_interval or max_steps,
     )
 
 
@@ -578,6 +597,51 @@ class TestStatus:
         # The fresh process tracked nothing: stopping must be the loaded
         # fit-end section, not rewritten with best_value=None.
         assert summary["stopping"] == fit_summary["stopping"]
+
+    def test_best_value_survives_a_resumed_fit(self, tmp_path):
+        """A resumed fit with a fresh callback keeps the best value /
+        step seen before the interruption (restored from the checkpoint,
+        the maximum over both segments)."""
+        module = DecreasingVal()
+        ckpt = tmp_path / "seg1.ckpt"
+        loader = make_loader()
+
+        cb1 = RunSummaryCallback(
+            tmp_path,
+            "resume-best",
+            tiny_config_dict(),
+            monitor="val/acc",
+            mode="max",
+            strict=True,
+        )
+        trainer1 = make_trainer([cb1], max_steps=2, val_check_interval=1)
+        trainer1.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        trainer1.save_checkpoint(ckpt)
+        seg1 = read(tmp_path, "resume-best")
+        # val/acc = 9 at step 1, 8 at step 2: the best is 9 @ 1.
+        assert seg1["stopping"]["best_value"] == 9.0
+        assert seg1["stopping"]["best_step"] == 1
+
+        # Fresh callback + trainer, resumed from the checkpoint. The
+        # resumed segment sees only val/acc = 7 @ 3.
+        cb2 = RunSummaryCallback(
+            tmp_path,
+            "resume-best",
+            tiny_config_dict(),
+            monitor="val/acc",
+            mode="max",
+            strict=True,
+        )
+        trainer2 = make_trainer([cb2], max_steps=3, val_check_interval=1)
+        trainer2.fit(
+            module,
+            train_dataloaders=loader,
+            val_dataloaders=loader,
+            ckpt_path=str(ckpt),
+        )
+        seg2 = read(tmp_path, "resume-best")
+        assert seg2["stopping"]["best_value"] == 9.0  # max over both segments
+        assert seg2["stopping"]["best_step"] == 1
 
 
 # ---------------------------------------------------------------------------
