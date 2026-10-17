@@ -40,6 +40,7 @@ optimizer:
   lr: null                 # null -> frozen_protocol.yaml (task, layout, gate_mode)
   weight_decay: 0.1
   betas: [0.9, 0.95]
+  decay_scheme: grouped    # grouped | uniform (uniform = weight decay everywhere)
 
 training:
   batch_size: 256

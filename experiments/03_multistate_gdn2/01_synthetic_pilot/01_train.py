@@ -44,8 +44,11 @@ from research_lib.data.synthetic import (
     SyntheticRecallDataModule,
 )
 from research_lib.training.callbacks import RunSummaryCallback
-from research_lib.training.configs import OptimizerConfig, ScheduleConfig
-from research_lib.training.modules import SyntheticRecallModule
+from research_lib.training.configs import ScheduleConfig
+from research_lib.training.modules import (
+    SyntheticRecallModule,
+    build_weight_decay_configs,
+)
 from research_lib.training.scheduling import WarmupStableDecaySchedule
 
 logger = logging.getLogger(__name__)
@@ -166,14 +169,10 @@ def build_model(cfg: DictConfig) -> ZoologyLM:
 
 def build_module(cfg: DictConfig, model: ZoologyLM, lr: float) -> SyntheticRecallModule:
     """The training module with the two AdamW weight-decay groups."""
-    betas = tuple(cfg.optimizer.betas)
-    matrix_optimizer_config = OptimizerConfig(
-        torch.optim.AdamW,
-        {"lr": 0.0, "weight_decay": cfg.optimizer.weight_decay, "betas": betas},
-    )
-    vector_optimizer_config = OptimizerConfig(
-        torch.optim.AdamW,
-        {"lr": 0.0, "weight_decay": 0.0, "betas": betas},
+    matrix_optimizer_config, vector_optimizer_config = build_weight_decay_configs(
+        str(cfg.optimizer.get("decay_scheme", "grouped")),
+        weight_decay=cfg.optimizer.weight_decay,
+        betas=tuple(cfg.optimizer.betas),
     )
     # Cosine from the peak to 0 over max_steps, no warmup (protocol §2):
     # the optimizer starts at lr=0 and the scheduler sets the peak for
@@ -208,8 +207,13 @@ def build_module(cfg: DictConfig, model: ZoologyLM, lr: float) -> SyntheticRecal
 def make_run_id(cfg: DictConfig, lr: float) -> str:
     run_id = (
         f"{cfg.task.name}-{cfg.model.layout}-{cfg.model.gate_mode}"
-        f"-{cfg.model.lambda_mode}-d{cfg.model.d_model}-lr{lr:g}-s{cfg.seed}"
+        f"-{cfg.model.lambda_mode}-d{cfg.model.d_model}-lr{lr:g}"
     )
+    # A non-default weight-decay scheme is part of the run's identity.
+    scheme = str(cfg.optimizer.get("decay_scheme", "grouped"))
+    if scheme != "grouped":
+        run_id += f"-wd-{scheme}"
+    run_id += f"-s{cfg.seed}"
     tier = cfg.experiment.get("tier", None)
     if tier:
         run_id = f"{tier}_{run_id}"
@@ -229,7 +233,12 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
             runs_dir=Path(cfg.output.runs_dir),
             run_id=run_id,
             config=OmegaConf.to_container(cfg, resolve=True),
-            extra={"lr_resolved": lr_resolved.get("value")},
+            extra={
+                "lr_resolved": lr_resolved.get("value"),
+                # Also recorded via the config; kept top-level so analyses
+                # need not dig for it (one JSON per run, rsync-able).
+                "decay_scheme": str(cfg.optimizer.get("decay_scheme", "grouped")),
+            },
         ),
         LearningRateMonitor(logging_interval="step"),
     ]

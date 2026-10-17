@@ -15,6 +15,10 @@ MQAR / repeated-key overwrite (``06_experiment_protocol.md``):
   epoch only; the per-slot means are logged as
   ``mixer/layer{i}/lambda_mean/slot{l}`` etc.
 
+The module's two optimizer groups are built by
+:func:`build_weight_decay_configs` (``grouped``: weight decay on the
+matrix group only; ``uniform``: Zoology's decay-everything setup).
+
 Run tests with::
 
     pytest src/research_lib/training/tests/test_synthetic_recall_module.py -v
@@ -28,13 +32,64 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from torch.optim import Optimizer
 
 from research_lib.data.synthetic.metrics import RecallMetrics
+from research_lib.training.configs import OptimizerConfig
 from research_lib.training.modules.dual_optimizer import DualOptimizerModule
 
 logger = logging.getLogger(__name__)
 
 _LOSS_ON = ("answers", "all")
+_DECAY_SCHEMES = ("grouped", "uniform")
+
+
+def build_weight_decay_configs(
+    decay_scheme: str = "grouped",
+    *,
+    weight_decay: float = 0.1,
+    betas: Sequence[float] = (0.9, 0.95),
+    optimizer_class: type[Optimizer] = torch.optim.AdamW,
+) -> tuple[OptimizerConfig, OptimizerConfig]:
+    """The two optimizer configs of the pilot's weight-decay schemes.
+
+    Both groups use the same optimizer class and betas; the LR is 0 at
+    construction (the schedule sets the peak for step 0).
+
+    Args:
+        decay_scheme: ``"grouped"`` (default) — ``weight_decay`` applies
+            to the matrix group (the 2-D linear weights) only; the vector
+            group (embeddings, LM head, norms, biases, conv filters,
+            ``A_log``/``dt_bias``, λ-mixer parameters) is exempt.
+            ``"uniform"`` — ``weight_decay`` applies to every parameter in
+            both groups (Zoology's setup, which decays everything).
+        weight_decay: The matrix group's weight decay (the protocol's
+            0.1; the vector group's value under ``uniform``).
+        betas: Adam betas for both groups.
+        optimizer_class: The optimizer class for both groups (the
+            protocol's AdamW).
+
+    Returns:
+        tuple: ``(matrix_optimizer_config, vector_optimizer_config)``.
+
+    Raises:
+        ValueError: Unknown ``decay_scheme``.
+    """
+    if decay_scheme not in _DECAY_SCHEMES:
+        raise ValueError(
+            f"decay_scheme must be one of {_DECAY_SCHEMES}, got {decay_scheme!r}"
+        )
+    betas = tuple(betas)
+    vector_weight_decay = weight_decay if decay_scheme == "uniform" else 0.0
+    matrix_optimizer_config = OptimizerConfig(
+        optimizer_class,
+        {"lr": 0.0, "weight_decay": weight_decay, "betas": betas},
+    )
+    vector_optimizer_config = OptimizerConfig(
+        optimizer_class,
+        {"lr": 0.0, "weight_decay": vector_weight_decay, "betas": betas},
+    )
+    return matrix_optimizer_config, vector_optimizer_config
 
 
 class SyntheticRecallModule(DualOptimizerModule):
