@@ -1,0 +1,313 @@
+"""
+Tests for the pilot analysis: tier-based row selection.
+
+Target: experiments/03_multistate_gdn2/01_synthetic_pilot/02_analyze.py
+Run with: pytest experiments/03_multistate_gdn2/01_synthetic_pilot/test_02_analyze.py -v
+
+Every statistic must select its rows by tier: several tiers repeat core
+configurations (the matched-state tier, the lambda controls, R1 and the
+long-sequence tier), so to the per-seed DiD pairing those rows read as
+duplicated cells and would drop seeds; calibration tiers and smoke runs
+must never enter any statistic. The synthetic table below has rows from
+EVERY tier.
+"""
+
+import importlib.util
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+_SRC = Path(__file__).resolve().parents[3] / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+_SPEC = importlib.util.spec_from_file_location(
+    "pilot_analyze", Path(__file__).resolve().parent / "02_analyze.py"
+)
+analyze = importlib.util.module_from_spec(_SPEC)
+_SPEC.loader.exec_module(analyze)
+
+N_RESAMPLES = 200
+ALPHA = 0.05
+
+# Core-tier accuracy constants (no seed dependence, so the per-seed DiD is
+# hand-computable): Delta_int(ll) = (0.70 - 0.50) - (0.50 - 0.40) = 0.10,
+# Delta_int(ws) = (0.60 - 0.45) - 0.10 = 0.05.
+CORE_ACC = {
+    "single": {"full": 0.50, "kda": 0.40},
+    "ws": {"full": 0.60, "kda": 0.45},
+    "ll": {"full": 0.70, "kda": 0.50},
+}
+# R1 runs the core grid under uniform decay with its own constants.
+R1_ACC = {
+    "single": {"full": 0.80, "kda": 0.70},
+    "ws": {"full": 0.85, "kda": 0.75},
+    "ll": {"full": 0.90, "kda": 0.80},
+}
+# Long-T runs the core grid on the long MQAR variant.
+LONG_ACC = {
+    "single": {"full": 0.40, "kda": 0.30},
+    "ws": {"full": 0.50, "kda": 0.35},
+    "ll": {"full": 0.60, "kda": 0.40},
+}
+# Every other tier gets sentinel values: if any of these rows leaked into a
+# statistic, the seed count or the mean would change.
+SENTINEL = 0.99
+
+PRIMARY = "test/acc/slice=32/class=distant"
+SINGLE_CLASS = "test/acc/slice=32/class=single"
+DISTANT_LEAK = "test/leak/slice=32/class=distant"
+
+
+def _row(tier, task, layout, gate, seed, acc, **extra):
+    row = {
+        "run_id": f"{tier}-{task}-{layout}-{gate}-s{seed}",
+        "json_path": f"runs/{task}/{tier}-{task}-{layout}-{gate}-s{seed}.json",
+        "task": task,
+        "layout": layout,
+        "gate_mode": gate,
+        "lambda_mode": extra.get("lambda_mode", "mlp"),
+        "d_model": extra.get("d_model", 32),
+        "num_heads": extra.get("num_heads", 2),
+        "head_dim": extra.get("head_dim"),
+        "seed": seed,
+        "tier": tier,
+        "decay_scheme": extra.get("decay_scheme", "grouped"),
+        "steps_completed": 100,
+        "best_val_acc": acc,
+        "stopped": False,
+        "test/acc": acc,
+        "test/acc/slice=32": acc,
+        PRIMARY: acc,
+        SINGLE_CLASS: acc,
+        DISTANT_LEAK: 0.0,
+    }
+    return row
+
+
+@pytest.fixture
+def table() -> pd.DataFrame:
+    """A synthetic run table containing rows from EVERY tier."""
+    rows = []
+
+    def add(tier, task, layouts, gates, seeds, accs, **extra):
+        for seed in seeds:
+            for layout in layouts:
+                for gate in gates:
+                    rows.append(
+                        _row(
+                            tier, task, layout, gate, seed, accs[layout][gate], **extra
+                        )
+                    )
+
+    # Core tier: seeds 0-9 (the primary statistic's ten seeds).
+    add(
+        "tier1_core",
+        "overwrite",
+        ("single", "ws", "ll"),
+        ("full", "kda"),
+        range(10),
+        CORE_ACC,
+    )
+    # Gate decomposition, frozen control, lambda controls, matched bytes:
+    # seeds 0-4, sentinel values, same configurations as the core tier.
+    add(
+        "tier2_gates",
+        "overwrite",
+        ("single", "ws", "ll"),
+        ("b_only", "w_only"),
+        range(5),
+        dict.fromkeys(CORE_ACC, {"b_only": SENTINEL, "w_only": SENTINEL}),
+    )
+    add(
+        "tier3_frozen",
+        "overwrite",
+        ("fs",),
+        ("full", "kda"),
+        range(5),
+        {"fs": {"full": SENTINEL, "kda": SENTINEL}},
+    )
+    add(
+        "tier4_lambda",
+        "overwrite",
+        ("ws", "ll"),
+        ("full",),
+        range(5),
+        dict.fromkeys(("ws", "ll"), {"full": SENTINEL}),
+        lambda_mode="static",
+    )
+    add(
+        "tier4_lambda",
+        "overwrite",
+        ("ws", "ll"),
+        ("full",),
+        range(5),
+        dict.fromkeys(("ws", "ll"), {"full": SENTINEL}),
+        lambda_mode="lin",
+    )
+    add(
+        "tier5_matched_bytes",
+        "overwrite",
+        ("single",),
+        ("full",),
+        range(5),
+        {"single": {"full": SENTINEL}},
+    )
+    # R1: the core grid under uniform decay, seeds 0-4.
+    add(
+        "R1",
+        "overwrite",
+        ("single", "ws", "ll"),
+        ("full", "kda"),
+        range(5),
+        R1_ACC,
+        decay_scheme="uniform",
+    )
+    # Long-sequence tier: the core grid on the long MQAR variant, seeds 0-9.
+    add(
+        "tier_longT",
+        "mqar",
+        ("single", "ws", "ll"),
+        ("full", "kda"),
+        range(10),
+        LONG_ACC,
+    )
+    # Anchors: gdn x {single, ll} x d in {16, 32, 64}, seeds 0-4.
+    for d_model, num_heads in ((16, 1), (32, 2), (64, 2)):
+        add(
+            "tier6_anchors",
+            "mqar",
+            ("single", "ll"),
+            ("gdn",),
+            range(5),
+            dict.fromkeys(("single", "ll"), {"gdn": SENTINEL}),
+            d_model=d_model,
+            num_heads=num_heads,
+        )
+    # Calibration tiers: seeds 100-101, core configurations with sentinel
+    # values (a leak adds seeds 100/101 to any statistic).
+    for tier in ("calib_dmodel", "calib_harness", "calib_lr", "calib_lr_anchors"):
+        add(
+            tier,
+            "overwrite",
+            ("single", "ws", "ll"),
+            ("full", "kda"),
+            (100, 101),
+            dict.fromkeys(CORE_ACC, {"full": SENTINEL, "kda": SENTINEL}),
+        )
+        add(
+            tier,
+            "mqar",
+            ("single", "ws", "ll"),
+            ("full", "kda"),
+            (100, 101),
+            dict.fromkeys(CORE_ACC, {"full": SENTINEL, "kda": SENTINEL}),
+        )
+    # A smoke run (tier None) must never enter a statistic either.
+    rows.append(_row(None, "overwrite", "ws", "full", 0, SENTINEL))
+    return pd.DataFrame(rows)
+
+
+class TestTierSelection:
+    """Rows are selected by tier, never by excluding tiers."""
+
+    def test_primary_uses_exactly_the_ten_core_seeds(self, table):
+        primary = analyze.analyze_primary(table, N_RESAMPLES, ALPHA)
+        assert set(primary["layout"]) == {"ll", "ws"}
+        for _, record in primary.iterrows():
+            assert record["n_seeds"] == 10, record.to_dict()
+        # Hand-computed means: Delta_int(ll) = 0.10, Delta_int(ws) = 0.05.
+        ll = primary[primary["layout"] == "ll"].iloc[0]
+        ws = primary[primary["layout"] == "ws"].iloc[0]
+        assert ll["mean"] == pytest.approx(0.10, abs=1e-12)
+        assert ws["mean"] == pytest.approx(0.05, abs=1e-12)
+
+    def test_r1_reports_five_seeds_next_to_the_main_result(self, table):
+        r1 = analyze.analyze_r1(table, N_RESAMPLES, ALPHA)
+        assert set(r1["layout"]) == {"ll", "ws"}
+        for _, record in r1.iterrows():
+            assert record["n_seeds"] == 5, record.to_dict()
+        # Hand-computed: Delta_int(ll) = (0.90 - 0.80) - 0.10 = 0.00,
+        # Delta_int(ws) = (0.85 - 0.75) - 0.10 = 0.00.
+        for _, record in r1.iterrows():
+            assert record["mean"] == pytest.approx(0.0, abs=1e-12)
+
+    def test_long_t_gets_its_own_table(self, table):
+        long_t = analyze.analyze_long_t(table, N_RESAMPLES, ALPHA)
+        assert not long_t.empty
+        acc_rows = long_t[long_t["metric"] == "test/acc"]
+        assert set(acc_rows["layout"]) == {"ll", "ws"}
+        for _, record in acc_rows.iterrows():
+            assert record["n_seeds"] == 10, record.to_dict()
+        # Hand-computed: Delta_int(ll) = (0.60 - 0.40) - (0.40 - 0.30) = 0.10.
+        ll = acc_rows[acc_rows["layout"] == "ll"].iloc[0]
+        assert ll["mean"] == pytest.approx(0.10, abs=1e-12)
+
+    def test_all_cells_uses_the_core_tier_only(self, table):
+        cells = analyze.analyze_all_cells(table)
+        # tier4 / tier5 / R1 repeat core configurations with sentinel values;
+        # if they leaked in, their seeds (0-4) would drop as duplicates and
+        # the seed count would fall below ten.
+        distant = cells[cells["metric"] == PRIMARY]
+        assert set(distant["layout"]) == {"ws", "ll"}
+        for _, record in distant.iterrows():
+            assert record["n_seeds"] == 10, record.to_dict()
+
+    def test_predictions_pair_their_own_tiers_with_the_core(self, table):
+        predictions = analyze.analyze_predictions(table, N_RESAMPLES, ALPHA)
+        names = set(predictions["prediction"])
+        gates = set(predictions["gate_mode"])
+        # P1 exists (tier 2 joined to core): b_only/w_only recovered
+        # fractions, laid out per layout.
+        p1 = predictions[predictions["prediction"].str.startswith("P1")]
+        assert not p1.empty
+        assert set(p1["gate_mode"]) == {"b_only", "w_only"}
+        assert set(p1["layout"]) == {"ws", "ll"}
+        # P2/P3 exist (tier 3 fs joined to core ws), P4 exists (tier 4
+        # static joined to core single-full).
+        assert any(n.startswith("P2") for n in names)
+        assert any(n.startswith("P3") for n in names)
+        assert any(n.startswith("P4") for n in names)
+        # Gates never mix: the predictions carry their own tiers' gates.
+        assert gates <= {"b_only", "w_only", "full", "kda"}
+        # Every prediction pairs by seed: tier 2-4 have seeds 0-4 only.
+        for _, record in predictions.iterrows():
+            assert record["n_seeds"] <= 5, record.to_dict()
+
+    def test_calibration_tiers_never_enter_any_statistic(self, table):
+        # Sentinel-valued calib rows at seeds 100/101 share the core
+        # configurations; any leak would add seeds to the primary table.
+        primary = analyze.analyze_primary(table, N_RESAMPLES, ALPHA)
+        for _, record in primary.iterrows():
+            assert record["n_seeds"] == 10
+            assert record["ci_low"] <= record["mean"] <= record["ci_high"]
+        r1 = analyze.analyze_r1(table, N_RESAMPLES, ALPHA)
+        for _, record in r1.iterrows():
+            assert record["n_seeds"] == 5
+        long_t = analyze.analyze_long_t(table, N_RESAMPLES, ALPHA)
+        for _, record in long_t.iterrows():
+            assert record["n_seeds"] == 10
+
+
+class TestRenderSummary:
+    """summary.md renders the R1 table next to the main result."""
+
+    def test_summary_contains_r1_and_long_t_sections(self, table):
+        primary = analyze.analyze_primary(table, N_RESAMPLES, ALPHA)
+        r1 = analyze.analyze_r1(table, N_RESAMPLES, ALPHA)
+        long_t = analyze.analyze_long_t(table, N_RESAMPLES, ALPHA)
+        cells = analyze.analyze_all_cells(table)
+        predictions = analyze.analyze_predictions(table, N_RESAMPLES, ALPHA)
+        anchors = analyze.analyze_anchors(table)
+        missing = analyze.analyze_missing_runs(table)
+        summary = analyze.render_summary(
+            primary, r1, long_t, cells, predictions, anchors, missing
+        )
+        assert "## Primary endpoint" in summary
+        assert "### Under uniform weight decay (tier R1)" in summary
+        assert "## Long-sequence tier" in summary
+        # The R1 table carries n_seeds, mean and CI columns.
+        assert "n_seeds" in summary
+        assert "ci_low" in summary

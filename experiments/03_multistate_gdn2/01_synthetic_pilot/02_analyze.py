@@ -121,19 +121,23 @@ def head_dim_of(row: pd.Series) -> float:
     return float(row["d_model"]) / float(row["num_heads"])
 
 
-def default_scheme(table: pd.DataFrame) -> pd.DataFrame:
-    """Runs under the default (grouped) weight-decay scheme.
+TIER_CORE = "tier1_core"
+TIER_R1 = "R1"
+TIER_LONG_T = "tier_longT"
 
-    The uniform-scheme R1 rows replicate the core grid (same layout /
-    gate_mode / seed, different weight decay), so to the per-seed DiD
-    pairing they read as duplicated cells and would drop every seed.
-    The scheme comparison (scheme x layout) is a robustness check,
-    reported separately from the pre-registered statistic; runs recorded
-    before the scheme switch carry no field and count as grouped.
+
+def tier_rows(table: pd.DataFrame, tier: str) -> pd.DataFrame:
+    """The rows of one protocol tier.
+
+    Every statistic selects its rows by tier, never by excluding tiers:
+    several tiers repeat core configurations (the matched-state tier, the
+    λ controls, R1 and the long-sequence tier), so to the per-seed DiD
+    pairing those rows read as duplicated cells and would drop seeds.
+    Calibration tiers (and smoke runs) never enter any statistic.
     """
-    if "decay_scheme" not in table.columns:
-        return table
-    return table[table["decay_scheme"].fillna("grouped") == "grouped"]
+    if "tier" not in table.columns:
+        return table.iloc[0:0]
+    return table[table["tier"] == tier]
 
 
 # --------------------------------------------------------------------------- #
@@ -205,15 +209,11 @@ def did_table_for(
 # --------------------------------------------------------------------------- #
 
 
-def analyze_primary(
-    table: pd.DataFrame, n_resamples: int, alpha: float
-) -> pd.DataFrame:
-    """The primary endpoint: overwrite, class distant, K = 2 d_k."""
+def _primary_records(
+    overwrite: pd.DataFrame, n_resamples: int, alpha: float
+) -> list[dict]:
+    """Δ_int records at the primary endpoint for one tier's overwrite rows."""
     records = []
-    overwrite = default_scheme(table)
-    overwrite = overwrite[
-        (overwrite["task"] == "overwrite") & (overwrite["tier"].notna())
-    ]
     for (d_model, num_heads, head_dim), group in overwrite.groupby(
         ["d_model", "num_heads", "head_dim"], dropna=False
     ):
@@ -246,14 +246,75 @@ def analyze_primary(
                     "reading": decision_rule(low, high, primary=True),
                 }
             )
+    return records
+
+
+def analyze_primary(
+    table: pd.DataFrame, n_resamples: int, alpha: float
+) -> pd.DataFrame:
+    """Δ_int at the primary endpoint, core tier rows only."""
+    overwrite = tier_rows(table, TIER_CORE)
+    overwrite = overwrite[overwrite["task"] == "overwrite"]
+    return pd.DataFrame(_primary_records(overwrite, n_resamples, alpha))
+
+
+def analyze_r1(table: pd.DataFrame, n_resamples: int, alpha: float) -> pd.DataFrame:
+    """Δ_int at the primary endpoint under uniform weight decay (tier R1).
+
+    Reported next to the main result: how much the weight-decay exemption
+    of the vector group (λ, ``A_log``, ``dt_bias``, …) matters to the
+    interaction. R1 rows never enter the pre-registered statistic.
+    """
+    overwrite = tier_rows(table, TIER_R1)
+    overwrite = overwrite[overwrite["task"] == "overwrite"]
+    return pd.DataFrame(_primary_records(overwrite, n_resamples, alpha))
+
+
+def analyze_long_t(table: pd.DataFrame, n_resamples: int, alpha: float) -> pd.DataFrame:
+    """Δ_int on the long-sequence tier, per accuracy cell.
+
+    The long-sequence tier repeats the core grid on the long, sparse MQAR
+    variant; its own table, never mixed into the T=256 statistic.
+    """
+    records = []
+    long_t = tier_rows(table, TIER_LONG_T)
+    if long_t.empty:
+        return pd.DataFrame()
+    acc_columns = [
+        c
+        for c in long_t.columns
+        if c == "test/acc" or (c.startswith("test/acc/slice=") and "/class=" not in c)
+    ]
+    for column in acc_columns:
+        sub = long_t[long_t[column].notna()]
+        if sub.empty:
+            continue
+        for layout in ("ws", "ll"):
+            deltas = did_per_seed(sub, column, layout)
+            if deltas.empty:
+                continue
+            mean, low, high = bootstrap_ci(
+                deltas.values, n_resamples=n_resamples, alpha=alpha
+            )
+            records.append(
+                {
+                    "layout": layout,
+                    "metric": column,
+                    "n_seeds": int(deltas.size),
+                    "mean": mean,
+                    "ci_low": low,
+                    "ci_high": high,
+                    "reading": decision_rule(low, high, primary=False),
+                }
+            )
     return pd.DataFrame(records)
 
 
 def analyze_all_cells(table: pd.DataFrame) -> pd.DataFrame:
-    """Delta_int for every (task, slice, class) cell with four core cells."""
+    """Delta_int for every measured cell, core tier rows only."""
     frames = []
     acc_columns = [c for c in table.columns if c.startswith("test/acc")]
-    core = default_scheme(table)
+    core = tier_rows(table, TIER_CORE)
     core = core[core["gate_mode"].isin(["full", "kda"])]
     for task in core["task"].dropna().unique():
         sub = core[core["task"] == task]
@@ -272,7 +333,11 @@ def analyze_all_cells(table: pd.DataFrame) -> pd.DataFrame:
 def analyze_predictions(
     table: pd.DataFrame, n_resamples: int, alpha: float
 ) -> pd.DataFrame:
-    """Predictions 1-4 (tiers 2-4) with per-seed bootstrap CIs."""
+    """Predictions 1-4, each computed on its own tier, joined to the core
+    tier rows wherever it needs the core cells (P1: gate-decomposition
+    tier + core; P2/P3: frozen-control tier + core ``ws``; P4: lambda tier
+    + core ``single`` rows).
+    """
     records = []
 
     def _add(name, layout, gate, values, extra=None):
@@ -294,9 +359,14 @@ def analyze_predictions(
             record.update(extra)
         records.append(record)
 
-    # ---- P1: b_only recovers most of Delta_int, w_only little (tier 2).
-    overwrite = default_scheme(table)
-    overwrite = overwrite[overwrite["task"] == "overwrite"]
+    # ---- P1: b_only recovers most of Delta_int, w_only little.
+    # Effect: (layout, b/w_only) - (single, b/w_only) on the
+    # gate-decomposition tier; reference: (layout, full) - (single, full)
+    # on the core tier; joined by seed.
+    core = tier_rows(table, TIER_CORE)
+    core_ow = core[core["task"] == "overwrite"]
+    t2 = tier_rows(table, "tier2_gates")
+    t2_ow = t2[t2["task"] == "overwrite"]
     distant = [
         c
         for c in table.columns
@@ -304,9 +374,9 @@ def analyze_predictions(
     ]
     for column in distant:
         for layout in ("ws", "ll"):
-            reference = paired_diff(overwrite, column, layout, "full")
+            reference = paired_diff(core_ow, column, layout, "full")
             for gate in ("b_only", "w_only"):
-                effect = paired_diff(overwrite, column, layout, gate)
+                effect = paired_diff(t2_ow, column, layout, gate)
                 if effect.empty or reference.empty:
                     continue
                 common = effect.index.intersection(reference.index)
@@ -324,81 +394,68 @@ def analyze_predictions(
                     recovered.values,
                 )
 
-    # ---- P2: transported >> frozen on cross-block overwrite; FS errors on
-    # the stale value (tier 3): ws - fs on distant accuracy and leakage.
+    # ---- P2: transported >> frozen on cross-block overwrite, with FS's
+    # errors concentrated on the stale value. ws rows from the core tier,
+    # fs rows from the frozen-control tier, paired by seed.
     leak = [
         c
         for c in table.columns
         if c.startswith("test/leak/slice=") and c.endswith("/class=distant")
     ]
+    t3 = tier_rows(table, "tier3_frozen")
+    t3_ow = t3[t3["task"] == "overwrite"]
+    core_ow = core[core["task"] == "overwrite"]
+
+    def _ws_fs_diff(ws_rows: pd.DataFrame, fs_rows: pd.DataFrame, column: str) -> list:
+        values = []
+        seeds = sorted(set(ws_rows["seed"].dropna()) & set(fs_rows["seed"].dropna()))
+        for seed in seeds:
+            cell_ws = ws_rows[(ws_rows["seed"] == seed)][column]
+            cell_fs = fs_rows[(fs_rows["seed"] == seed)][column]
+            if len(cell_ws) == 1 and len(cell_fs) == 1:
+                values.append(float(cell_ws.iloc[0]) - float(cell_fs.iloc[0]))
+        return values
+
     for gate in ("full", "kda"):
+        ws_rows = core_ow[(core_ow["gate_mode"] == gate) & (core_ow["layout"] == "ws")]
+        fs_rows = t3_ow[(t3_ow["gate_mode"] == gate) & (t3_ow["layout"] == "fs")]
         for column in distant + leak:
-            rows = overwrite[overwrite["gate_mode"] == gate]
-            per_seed = {}
-            for seed in rows["seed"].dropna().unique():
-                cell_ws = rows[(rows["layout"] == "ws") & (rows["seed"] == seed)][
-                    column
-                ]
-                cell_fs = rows[(rows["layout"] == "fs") & (rows["seed"] == seed)][
-                    column
-                ]
-                if len(cell_ws) == 1 and len(cell_fs) == 1:
-                    per_seed[int(seed)] = float(cell_ws.iloc[0]) - float(
-                        cell_fs.iloc[0]
-                    )
             _add(
                 f"P2 ws - fs ({column})",
                 "ws-fs",
                 gate,
-                list(per_seed.values()),
+                _ws_fs_diff(ws_rows, fs_rows, column),
             )
 
-    # ---- P3: frozen >= transported on single-class recall, smaller gap
-    # under GDN-2 gates than under KDA gates (tier 3).
-    single = [
+    # ---- P3: frozen >= transported on never-overwritten keys, with a
+    # smaller gap under GDN-2 gates than under KDA gates. Core-tier ws
+    # rows against frozen-control fs rows on single-class accuracy.
+    single_cols = [
         c
         for c in table.columns
         if c.startswith("test/acc/slice=") and c.endswith("/class=single")
     ]
     for gate in ("full", "kda"):
-        for column in single:
-            rows = overwrite[overwrite["gate_mode"] == gate]
-            per_seed = {}
-            for seed in rows["seed"].dropna().unique():
-                cell_ws = rows[(rows["layout"] == "ws") & (rows["seed"] == seed)][
-                    column
-                ]
-                cell_fs = rows[(rows["layout"] == "fs") & (rows["seed"] == seed)][
-                    column
-                ]
-                if len(cell_ws) == 1 and len(cell_fs) == 1:
-                    per_seed[int(seed)] = float(cell_ws.iloc[0]) - float(
-                        cell_fs.iloc[0]
-                    )
+        ws_rows = core_ow[(core_ow["gate_mode"] == gate) & (core_ow["layout"] == "ws")]
+        fs_rows = t3_ow[(t3_ow["gate_mode"] == gate) & (t3_ow["layout"] == "fs")]
+        for column in single_cols:
             _add(
                 f"P3 ws - fs ({column})",
                 "ws-fs",
                 gate,
-                list(per_seed.values()),
+                _ws_fs_diff(ws_rows, fs_rows, column),
             )
 
     # ---- P4: lambda-static gives no gain over single-state GDN-2 once the
-    # number of keys exceeds d_k (tier 4 + tier 1 single rows).
+    # number of keys exceeds d_k. Lambda-control tier (static) rows against
+    # the core tier's single-state `full` rows, paired by seed.
+    t4 = tier_rows(table, "tier4_lambda")
+    t4_ow = t4[t4["task"] == "overwrite"]
+    base = core_ow[(core_ow["layout"] == "single") & (core_ow["gate_mode"] == "full")]
     for layout in ("ws", "ll"):
-        static = table[
-            (table["task"] == "overwrite")
-            & (table["lambda_mode"] == "static")
-            & (table["layout"] == layout)
-        ]
-        base = table[
-            (table["task"] == "overwrite")
-            & (table["lambda_mode"] == "mlp")
-            & (table["layout"] == "single")
-            & (table["gate_mode"] == "full")
-        ]
+        static = t4_ow[(t4_ow["lambda_mode"] == "static") & (t4_ow["layout"] == layout)]
         for column in distant:
-            if static.empty or base.empty:
-                break
+            values = []
             for seed in sorted(
                 set(static["seed"].dropna()) & set(base["seed"].dropna())
             ):
@@ -407,12 +464,8 @@ def analyze_predictions(
                 ][column]
                 cell_s = base[(base["seed"] == seed)][column]
                 if len(cell_x) == 1 and len(cell_s) == 1:
-                    _add(
-                        f"P4 static - single-full ({column})",
-                        layout,
-                        "full",
-                        [float(cell_x.iloc[0]) - float(cell_s.iloc[0])],
-                    )
+                    values.append(float(cell_x.iloc[0]) - float(cell_s.iloc[0]))
+            _add(f"P4 static - single-full ({column})", layout, "full", values)
     return pd.DataFrame(records)
 
 
@@ -506,26 +559,39 @@ def _markdown_table(frame: pd.DataFrame, digits: int = 4) -> str:
 
 def render_summary(
     primary: pd.DataFrame,
+    r1: pd.DataFrame,
+    long_t: pd.DataFrame,
     cells: pd.DataFrame,
     predictions: pd.DataFrame,
     anchors: pd.DataFrame,
     missing: pd.DataFrame,
 ) -> str:
     lines = ["# Synthetic pilot analysis", ""]
-    lines.append("## Primary endpoint (overwrite, distant, K = 2 d_k)")
+    lines.append("## Primary endpoint (core tier, overwrite, distant, K = 2 d_k)")
     lines.append("")
     if primary.empty:
-        lines.append("_No runs with the primary endpoint present._")
+        lines.append("_No core-tier runs with the primary endpoint present._")
     else:
         lines.append(_markdown_table(primary))
         lines.append("")
-    lines.append("## Delta_int on every measured cell")
+    lines.append("### Under uniform weight decay (tier R1)")
+    lines.append("")
+    if r1.empty:
+        lines.append("_No R1 runs present._")
+    else:
+        lines.append(_markdown_table(r1))
+    lines.append("")
+    lines.append("## Delta_int on every measured cell (core tier)")
     lines.append("")
     lines.append(_markdown_table(cells))
     lines.append("")
-    lines.append("## Predictions 1-4")
+    lines.append("## Predictions 1-4 (each on its own tier)")
     lines.append("")
     lines.append(_markdown_table(predictions))
+    lines.append("")
+    lines.append("## Long-sequence tier (Delta_int)")
+    lines.append("")
+    lines.append(_markdown_table(long_t))
     lines.append("")
     lines.append("## Anchors next to Log-Linear Table 2")
     lines.append("")
@@ -550,11 +616,11 @@ def render_summary(
         "are omitted by RecallMetrics), not zero."
     )
     lines.append(
-        "- Uniform-weight-decay runs (tier R1) are excluded from the "
-        "Delta_int and prediction pairings above: they replicate the core "
-        "grid under a different decay scheme (recorded as `decay_scheme`). "
-        "Compare schemes as a scheme x layout robustness check, separately "
-        "from the pre-registered statistic."
+        "- Every statistic above selects its rows by tier: several tiers "
+        "repeat core configurations (matched bytes, the lambda controls, "
+        "R1, the long-sequence tier), so filtering by configuration alone "
+        "would create duplicated cells. Calibration tiers and smoke runs "
+        "never enter any statistic."
     )
     return "\n".join(lines) + "\n"
 
@@ -583,6 +649,8 @@ def main() -> None:
     logger.info("Loaded %d runs from %s", len(table), runs_dir)
 
     primary = analyze_primary(table, args.n_resamples, args.alpha)
+    r1 = analyze_r1(table, args.n_resamples, args.alpha)
+    long_t = analyze_long_t(table, args.n_resamples, args.alpha)
     cells = analyze_all_cells(table)
     predictions = analyze_predictions(table, args.n_resamples, args.alpha)
     anchors = analyze_anchors(table)
@@ -590,12 +658,14 @@ def main() -> None:
     missing = analyze_missing_runs(table)
 
     primary.to_csv(out_dir / "primary_endpoint.csv", index=False)
+    r1.to_csv(out_dir / "r1_primary_endpoint.csv", index=False)
+    long_t.to_csv(out_dir / "long_t_did.csv", index=False)
     cells.to_csv(out_dir / "did_all_cells.csv", index=False)
     predictions.to_csv(out_dir / "predictions.csv", index=False)
     anchors.to_csv(out_dir / "anchors.csv", index=False)
     mixer.to_csv(out_dir / "mixer_stats.csv", index=False)
     missing.to_csv(out_dir / "missing_runs.csv", index=False)
-    summary = render_summary(primary, cells, predictions, anchors, missing)
+    summary = render_summary(primary, r1, long_t, cells, predictions, anchors, missing)
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")
     logger.info("Wrote analysis to %s", out_dir)
 
