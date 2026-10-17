@@ -87,16 +87,88 @@ def load_frozen_protocol() -> DictConfig:
     return OmegaConf.load(path)
 
 
-def resolve_lr(cfg: DictConfig, frozen: DictConfig) -> float:
-    """The peak LR: cfg.optimizer.lr, else the frozen-protocol entry.
+def lr_source(cfg: DictConfig) -> tuple[str, str, str, str | None]:
+    """The frozen-table lookup key of a run, after LR inheritance.
 
-    Fails loudly if neither exists.
+    The core configurations look themselves up unchanged. The other
+    tiers inherit (no other LR is tuned):
+
+    - ``b_only`` / ``w_only`` use the LR of ``(layout, full)``;
+    - ``fs`` uses ``(ws, same gate)``;
+    - λ ``static`` / ``lin`` use the λ-``mlp`` LR of the same
+      ``(layout, gate)`` (the table is keyed by gate mode only, so the
+      λ-``mlp`` entry *is* the ``(layout, gate)`` entry);
+    - matched bytes uses ``(single, full)`` (its own configuration);
+    - R1 and the long-sequence tier run the core configurations, so they
+      use the core entries unchanged;
+    - the anchors use their own entries, keyed by ``d_model`` (gate ``gdn``
+      is never calibrated in the main table).
+
+    Returns:
+        tuple: ``(task, layout, gate_mode, anchor_d_model)`` — the
+        table key, with ``anchor_d_model`` set (to the run's ``d_model``)
+        for anchor runs, else ``None`` (main LR table).
+
+    Raises:
+        RuntimeError: If an anchor run's ``tier`` is not ``tier6_anchors``
+            while ``gate_mode`` is ``gdn`` (uncalibrated gate, no entry).
     """
-    if cfg.optimizer.lr is not None:
-        return float(cfg.optimizer.lr)
     task = str(cfg.task.name)
     layout = str(cfg.model.layout)
     gate_mode = str(cfg.model.gate_mode)
+    tier = str(cfg.experiment.get("tier", None) or "")
+    if tier == "tier6_anchors":
+        return task, layout, gate_mode, int(cfg.model.d_model)
+    if gate_mode == "gdn":
+        raise RuntimeError(
+            f"gate_mode='gdn' outside the anchor tier (tier={tier!r}) has no "
+            f"LR entry; the anchors are the only gdn runs and use the anchor "
+            f"table keyed by d_model (run the anchor LR sweep "
+            f"conf/sweep/calib_lr_anchors.yaml)"
+        )
+    # Inheritance: b_only/w_only -> full; fs -> ws (same gate). Everything
+    # else (lambdas, matched bytes, R1, long-T) uses its own key.
+    gate_mode = "full" if gate_mode in ("b_only", "w_only") else gate_mode
+    layout = "ws" if layout == "fs" else layout
+    return task, layout, gate_mode, None
+
+
+def resolve_lr(cfg: DictConfig, frozen: DictConfig) -> float:
+    """The peak LR: cfg.optimizer.lr, else the frozen-protocol entry.
+
+    Non-core tiers inherit from the core entries; see :func:`lr_source`.
+    Logs which entry was used. Fails loudly if no entry exists.
+    """
+    if cfg.optimizer.lr is not None:
+        lr = float(cfg.optimizer.lr)
+        logger.info("Learning rate %g from optimizer.lr (config)", lr)
+        return lr
+    task, layout, gate_mode, anchor_d_model = lr_source(cfg)
+    requested_layout = str(cfg.model.layout)
+    requested_gate = str(cfg.model.gate_mode)
+    if anchor_d_model is not None:
+        try:
+            value = frozen.anchor_lr[anchor_d_model][layout]
+        except (KeyError, AttributeError) as e:
+            raise RuntimeError(
+                f"optimizer.lr is null and no anchor LR entry exists for "
+                f"(d_model={anchor_d_model}, layout={layout!r}); run the anchor "
+                f"LR sweep (conf/sweep/calib_lr_anchors.yaml) and fill in "
+                f"conf/frozen_protocol.yaml, or pass optimizer.lr=<value>"
+            ) from e
+        if value is None:
+            raise RuntimeError(
+                f"the anchor LR entry for (d_model={anchor_d_model}, "
+                f"layout={layout!r}) is empty; fill in conf/frozen_protocol.yaml "
+                f"at the end of calibration, or pass optimizer.lr=<value>"
+            )
+        logger.info(
+            "Learning rate %g from the anchor table (d_model=%s, layout=%s)",
+            float(value),
+            anchor_d_model,
+            layout,
+        )
+        return float(value)
     try:
         value = frozen.lr_table[task][layout][gate_mode]
     except (KeyError, AttributeError) as e:
@@ -111,6 +183,26 @@ def resolve_lr(cfg: DictConfig, frozen: DictConfig) -> float:
             f"the frozen-protocol LR entry for (task={task!r}, layout={layout!r}, "
             f"gate_mode={gate_mode!r}) is empty; fill in conf/frozen_protocol.yaml "
             f"at the end of calibration, or pass optimizer.lr=<value>"
+        )
+    if (layout, gate_mode) != (requested_layout, requested_gate):
+        logger.info(
+            "Learning rate %g inherited from entry (task=%s, layout=%s, "
+            "gate=%s) for requested (layout=%s, gate=%s)",
+            float(value),
+            task,
+            layout,
+            gate_mode,
+            requested_layout,
+            requested_gate,
+        )
+    else:
+        logger.info(
+            "Learning rate %g from the frozen LR table (task=%s, layout=%s, "
+            "gate=%s)",
+            float(value),
+            task,
+            layout,
+            gate_mode,
         )
     return float(value)
 

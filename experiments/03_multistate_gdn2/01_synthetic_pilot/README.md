@@ -41,6 +41,25 @@ python 01_train.py --config-name=debug --multirun
    python 01_train.py +sweep=tier1_core --multirun
    ```
 
+### Learning-rate inheritance
+
+Only the core configurations (gate {kda, full} × layout {single, ws, ll},
+both tasks) and the anchors are LRs swept. Every other tier inherits, and
+no other LR is tuned:
+
+| tier | LR entry used |
+|---|---|
+| gate decomposition (`b_only`, `w_only`) | `(layout, full)` of the same task |
+| frozen control (`fs`) | `(ws, same gate)` |
+| λ controls (`static`, `lin`) | the λ-`mlp` entry of `(layout, gate)` |
+| matched bytes | `(single, full)` (its own configuration) |
+| R1, long sequences | the core entries unchanged |
+| anchors | their own entries, keyed by `d_model` (gate `gdn` is never calibrated in the main table) |
+
+`01_train.py` resolves the entry, logs which one was used, and fails
+loudly when a run requests an entry that does not exist (e.g. `gdn`
+outside the anchor tier).
+
 3. **Phase 3 — tiers 2–6** (gate decomposition, frozen control, λ
    controls, matched bytes, anchors): `+sweep=tier2_gates`,
    `+sweep=tier3_frozen`, `+sweep=tier4_lambda`,

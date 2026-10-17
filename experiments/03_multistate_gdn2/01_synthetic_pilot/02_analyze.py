@@ -48,6 +48,7 @@ EXPECTED_RUNS = {
     "calib_dmodel": 4,
     "calib_harness": 4,
     "calib_lr": 72,
+    "calib_lr_anchors": 36,
     "tier1_core": 120,
     "tier2_gates": 60,
     "tier3_frozen": 20,

@@ -29,3 +29,12 @@ lr_table:
     ws: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
     fs: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
     ll: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+
+# Anchor LRs (tier 6), keyed by d_model, then layout. The anchors use gate
+# gdn (never calibrated in lr_table) and get their own sweep,
+# conf/sweep/calib_lr_anchors.yaml (36 short runs: layouts {single, ll} x
+# d_model {16, 32, 64} x 3 LRs x seeds 100-101).
+anchor_lr:
+  16: {single: null, ll: null}
+  32: {single: null, ll: null}
+  64: {single: null, ll: null}
