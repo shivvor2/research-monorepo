@@ -29,7 +29,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from research_lib.utils.stats import bootstrap_ci, did_per_seed
+from research_lib.utils.stats import (
+    Factor,
+    bootstrap_ci,
+    interaction_contrast,
+    paired_contrast,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -166,18 +171,36 @@ def decision_rule(low: float, high: float, primary: bool) -> str:
     return "CI includes 0: uninformative about the hypothesis on this cell"
 
 
+def did(table: pd.DataFrame, metric: str, layout: str) -> pd.Series:
+    """Delta_int per seed for one multi-state layout.
+
+    The experiment's statistic: the 2x2 interaction of the layout factor
+    (``layout`` vs ``single``) with the gate factor (``full`` vs ``kda``).
+    ``layout="single"`` raises (the factor's levels coincide), so the
+    all-cells loop skips it naturally.
+    """
+    return interaction_contrast(
+        table,
+        metric,
+        Factor("layout", layout, "single"),
+        Factor("gate_mode", "full", "kda"),
+        name=f"did_{layout}",
+    )
+
+
 def paired_diff(
     table: pd.DataFrame, metric: str, layout: str, gate_mode: str
 ) -> pd.Series:
     """Per-seed paired difference ``(layout-gate) - (single-gate)``."""
-    rows = table[(table["gate_mode"] == gate_mode)]
-    out = {}
-    for seed in sorted(rows["seed"].dropna().unique()):
-        cell_x = rows[(rows["layout"] == layout) & (rows["seed"] == seed)][metric]
-        cell_s = rows[(rows["layout"] == "single") & (rows["seed"] == seed)][metric]
-        if len(cell_x) == 1 and len(cell_s) == 1:
-            out[int(seed)] = float(cell_x.iloc[0]) - float(cell_s.iloc[0])
-    return pd.Series(out, dtype=float)
+    return paired_contrast(
+        table,
+        metric,
+        [
+            ({"layout": layout, "gate_mode": gate_mode}, 1.0),
+            ({"layout": "single", "gate_mode": gate_mode}, -1.0),
+        ],
+        name=f"diff_{layout}_{gate_mode}",
+    )
 
 
 def did_table_for(
@@ -188,7 +211,7 @@ def did_table_for(
     for layout in layouts:
         sub = table[table[metric].notna()]
         try:
-            deltas = did_per_seed(sub, metric, layout)
+            deltas = did(sub, metric, layout)
         except ValueError:
             continue
         if deltas.empty:
@@ -232,7 +255,7 @@ def _primary_records(
             continue
         for layout in ("ll", "ws"):
             sub = group[group[key].notna()]
-            deltas = did_per_seed(sub, key, layout)
+            deltas = did(sub, key, layout)
             if deltas.empty:
                 continue
             mean, low, high = bootstrap_ci(
@@ -294,7 +317,7 @@ def analyze_long_t(table: pd.DataFrame, n_resamples: int, alpha: float) -> pd.Da
         if sub.empty:
             continue
         for layout in ("ws", "ll"):
-            deltas = did_per_seed(sub, column, layout)
+            deltas = did(sub, column, layout)
             if deltas.empty:
                 continue
             mean, low, high = bootstrap_ci(

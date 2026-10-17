@@ -1,18 +1,20 @@
-"""Statistics helpers for the multi-state GDN-2 pilot analysis.
+"""Paired contrasts and bootstrap intervals over tabular data.
 
-Per-seed difference-in-differences
-:func:`did_per_seed` computes the protocol's primary statistic
-(``06_experiment_protocol.md`` §6):
+The general setting: a table with one row per experimental unit's
+condition, a column identifying the unit (``unit``, e.g. a seed: the
+same unit is observed under several conditions), and a numeric outcome
+column. Pairing by unit cancels unit-level noise.
 
-.. math::
-
-    \\Delta_i = (a_i^{X\\text{-full}} - a_i^{X\\text{-kda}})
-              - (a_i^{\\text{single-full}} - a_i^{\\text{single-kda}})
-
-for a multi-state layout ``X``, pairing runs by seed (seed ``i`` fixes
-the parameter init and the data stream, so cell values with the same
-``i`` share data).  :func:`bootstrap_ci` gives the percentile bootstrap
-CI over the per-seed values.
+- :func:`paired_contrast` computes, per unit, the weighted sum
+  ``Σ coefficient · value(cell)`` over a set of cells; each cell is a
+  ``(column == value filters, coefficient)`` pair selecting one row of
+  the unit. A contrast over two cells is a difference; a one-cell
+  contrast with coefficient 1 is the value itself.
+- :func:`interaction_contrast` is the common 2×2 case: a
+  difference-in-differences over two binary factors,
+  ``(a_t,b_t − a_c,b_t) − (a_t,b_c − a_c,b_c)``, per unit.
+- :func:`bootstrap_ci` gives the percentile bootstrap interval of any
+  statistic over the per-unit values.
 
 Run tests with::
 
@@ -22,87 +24,165 @@ Run tests with::
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any, NamedTuple
 
 import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-_REQUIRED_COLUMNS = ("layout", "gate_mode", "seed")
 
-
-def did_per_seed(table: pd.DataFrame, metric: str, layout: str) -> pd.Series:
-    """Per-seed Δ_int for a multi-state layout.
-
-    For each seed ``i`` present in ``table``:
-
-    .. math::
-
-        \\Delta_i = (a_i^{X\\text{-full}} - a_i^{X\\text{-kda}})
-                  - (a_i^{\\text{single-full}} - a_i^{\\text{single-kda}})
-
-    with ``X = layout``.  Seeds missing any of the four cells (or with a
-    duplicated cell) are dropped and reported in a log message.
+class Factor(NamedTuple):
+    """A binary factor of a contrast.
 
     Args:
-        table: One row per run with columns ``layout``, ``gate_mode``,
-            ``seed`` and the metric column.
-        metric: Name of the metric column (e.g. a ``RecallMetrics`` key
-            such as ``"acc"``).
-        layout: The multi-state layout ``X`` (``"ws"`` / ``"fs"`` /
-            ``"ll"``).
+        column: The table column the factor varies over.
+        treated: The treated level.
+        control: The control level (distinct from ``treated``).
+    """
+
+    column: str
+    treated: Any
+    control: Any
+
+
+def paired_contrast(
+    table: pd.DataFrame,
+    metric: str,
+    cells: Sequence[tuple[Mapping[str, Any], float]],
+    *,
+    unit: str = "seed",
+    name: str | None = None,
+) -> pd.Series:
+    """Per unit: ``Σ coefficient · value(cell)``, indexed by unit, sorted.
+
+    A unit contributes its contrast only when every cell selects exactly
+    one row for it; a unit missing any cell, or with a duplicated cell,
+    is dropped and reported with a warning naming this function, the
+    metric and the dropped units.
+
+    Args:
+        table: One row per unit and condition.
+        metric: Name of the numeric outcome column.
+        cells: ``(filters, coefficient)`` pairs. ``filters`` is a mapping
+            of ``column == value`` conditions selecting the cell's rows
+            (they may be empty, selecting every row); the cell's
+            contribution is ``coefficient *`` its metric value.
+        unit: The column identifying the paired units.
+        name: A label for the contrast (the returned Series' name and
+            the log messages); defaults to ``"contrast"``.
 
     Returns:
-        pd.Series: Δ per seed, indexed by seed, named
-        ``"did_{layout}"``.
+        pd.Series: One contrast value per kept unit, sorted by unit.
 
     Raises:
-        ValueError: Missing required columns, unknown metric column, or
-            ``layout == "single"`` (the single-state rows are the shared
-            baseline of the statistic).
+        ValueError: ``metric``, ``unit`` or a filter column missing from
+            ``table``, or ``cells`` empty.
     """
-    layout = str(layout)
-    if layout == "single":
-        raise ValueError(
-            "layout must be a multi-state layout (ws/fs/ll); the single-state "
-            "rows are the shared baseline of the statistic"
-        )
-    for column in (*_REQUIRED_COLUMNS, metric):
-        if column not in table.columns:
-            raise ValueError(f"table is missing the required column {column!r}")
-    deltas: dict[int, float] = {}
-    dropped: list[int] = []
-    for seed in sorted(table["seed"].unique()):
-        cells = {}
-        for lay, gate in (
-            (layout, "full"),
-            (layout, "kda"),
-            ("single", "full"),
-            ("single", "kda"),
-        ):
-            rows = table[
-                (table["layout"] == lay)
-                & (table["gate_mode"] == gate)
-                & (table["seed"] == seed)
-            ]
-            cells[(lay, gate)] = rows[metric]
-        if any(len(values) != 1 for values in cells.values()):
-            dropped.append(seed)
-            continue
-        x_full = float(cells[(layout, "full")].iloc[0])
-        x_kda = float(cells[(layout, "kda")].iloc[0])
-        s_full = float(cells[("single", "full")].iloc[0])
-        s_kda = float(cells[("single", "kda")].iloc[0])
-        deltas[int(seed)] = (x_full - x_kda) - (s_full - s_kda)
+    label = name if name is not None else "paired_contrast"
+    if not cells:
+        raise ValueError("cells must be non-empty")
+    filter_columns = sorted({column for filters, _ in cells for column in filters})
+    required = [unit, metric, *filter_columns]
+    missing = [column for column in required if column not in table.columns]
+    if missing:
+        raise ValueError(f"table is missing the required columns {missing}")
+    contrasts: dict[Any, float] = {}
+    dropped: list[Any] = []
+    for u in sorted(table[unit].dropna().unique()):
+        rows = table[table[unit] == u]
+        values: list[float] = []
+        ok = True
+        for filters, coefficient in cells:
+            selected = rows
+            for column, value in filters.items():
+                selected = selected[selected[column] == value]
+            if len(selected) != 1:
+                ok = False
+                break
+            values.append(coefficient * float(selected[metric].iloc[0]))
+        if ok:
+            contrasts[u] = sum(values)
+        else:
+            dropped.append(u)
     if dropped:
         logger.warning(
-            "did_per_seed(layout=%r, metric=%r): dropped seeds missing or "
-            "duplicating one of the four cells: %s",
-            layout,
+            "%s(metric=%r): dropped units missing or duplicating a cell: %s",
+            label,
             metric,
             dropped,
         )
-    return pd.Series(deltas, dtype=float, name=f"did_{layout}").sort_index()
+    return pd.Series(
+        contrasts, name=name if name is not None else "contrast"
+    ).sort_index()
+
+
+def interaction_contrast(
+    table: pd.DataFrame,
+    metric: str,
+    factor_a: Factor,
+    factor_b: Factor,
+    *,
+    unit: str = "seed",
+    name: str | None = None,
+) -> pd.Series:
+    """2×2 difference-in-differences, per unit.
+
+    ``(a_t, b_t − a_c, b_t) − (a_t, b_c − a_c, b_c)`` for the treated /
+    control levels of the two factors: whether the effect of factor A
+    differs between the levels of factor B. A thin wrapper over
+    :func:`paired_contrast` with the four cells and coefficients
+    ``+1, −1, −1, +1``.
+
+    Args:
+        table: One row per unit and condition.
+        metric: Name of the numeric outcome column.
+        factor_a: The first binary factor (its difference is taken).
+        factor_b: The second binary factor (its levels split the two
+            differences).
+        unit: The column identifying the paired units.
+        name: A label for the contrast; defaults to
+            ``"interaction_contrast"``.
+
+    Returns:
+        pd.Series: One difference-in-differences per kept unit, sorted
+        by unit.
+
+    Raises:
+        ValueError: A factor's treated and control levels are equal
+            (the contrast would vanish), or any validation of
+            :func:`paired_contrast`.
+    """
+    if factor_a.treated == factor_a.control:
+        raise ValueError(f"factor_a's treated and control levels are equal: {factor_a}")
+    if factor_b.treated == factor_b.control:
+        raise ValueError(f"factor_b's treated and control levels are equal: {factor_b}")
+    cells = [
+        (
+            {factor_a.column: factor_a.treated, factor_b.column: factor_b.treated},
+            1.0,
+        ),
+        (
+            {factor_a.column: factor_a.control, factor_b.column: factor_b.treated},
+            -1.0,
+        ),
+        (
+            {factor_a.column: factor_a.treated, factor_b.column: factor_b.control},
+            -1.0,
+        ),
+        (
+            {factor_a.column: factor_a.control, factor_b.column: factor_b.control},
+            1.0,
+        ),
+    ]
+    return paired_contrast(
+        table,
+        metric,
+        cells,
+        unit=unit,
+        name=name if name is not None else "interaction_contrast",
+    )
 
 
 def bootstrap_ci(
@@ -110,22 +190,28 @@ def bootstrap_ci(
     n_resamples: int = 10_000,
     alpha: float = 0.05,
     seed: int = 0,
+    statistic: Callable[..., Any] = np.mean,
 ) -> tuple[float, float, float]:
-    """Mean and percentile bootstrap CI over the given per-seed values.
+    """Point estimate and percentile bootstrap CI over per-unit values.
 
     Args:
-        values: 1-D array-like of per-seed values.
-        n_resamples: Number of bootstrap resamples. Defaults to 10,000
-            (the protocol's choice).
+        values: 1-D array-like of per-unit values.
+        n_resamples: Number of bootstrap resamples. Defaults to 10,000.
         alpha: Two-sided level: the CI covers ``1 - alpha``. Defaults to
             0.05.
         seed: Seed of the resampling RNG (fixed, so the reported CI is
             reproducible). Defaults to 0.
+        statistic: The statistic to interval-estimate. It must accept an
+            ``axis`` keyword, as numpy reductions do: it is applied as
+            ``statistic(values)`` for the point estimate and
+            ``statistic(resamples, axis=1)`` for the bootstrap
+            distribution.
 
     Returns:
-        tuple: ``(mean, low, high)`` — the sample mean and the
-        ``alpha/2`` / ``1 - alpha/2`` percentiles of the bootstrap mean
-        distribution.  The CI of a constant series is degenerate.
+        tuple: ``(estimate, low, high)`` — the statistic's value on
+        ``values`` and the ``alpha/2`` / ``1 - alpha/2`` percentiles of
+        its bootstrap distribution. The CI of a constant series is
+        degenerate.
 
     Raises:
         ValueError: Empty ``values``, non-positive ``n_resamples`` or
@@ -138,9 +224,9 @@ def bootstrap_ci(
         raise ValueError(f"n_resamples must be >= 1, got {n_resamples}")
     if not 0.0 < alpha < 1.0:
         raise ValueError(f"alpha must be in (0, 1), got {alpha}")
-    mean = float(values.mean())
+    estimate = float(statistic(values))
     rng = np.random.default_rng(seed)
     index = rng.integers(0, values.size, size=(n_resamples, values.size))
-    means = values[index].mean(axis=1)
-    low, high = np.quantile(means, [alpha / 2.0, 1.0 - alpha / 2.0])
-    return mean, float(low), float(high)
+    distribution = np.asarray(statistic(values[index], axis=1))
+    low, high = np.quantile(distribution, [alpha / 2.0, 1.0 - alpha / 2.0])
+    return estimate, float(low), float(high)

@@ -1,8 +1,10 @@
-"""Utility helpers (secrets, analysis statistics)."""
+"""Utility helpers (secrets, paired contrasts, bootstrap intervals)."""
 
-from .stats import bootstrap_ci, did_per_seed
+from .stats import Factor, bootstrap_ci, interaction_contrast, paired_contrast
 
 __all__ = [
+    "Factor",
     "bootstrap_ci",
-    "did_per_seed",
+    "interaction_contrast",
+    "paired_contrast",
 ]
