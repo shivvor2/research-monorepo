@@ -254,13 +254,39 @@ def check_overwrite_k(cfg: DictConfig, frozen: DictConfig) -> None:
     )
 
 
+# The protocol's tiers: every calibration tier plus every tier the
+# analysis's expected-runs table counts (02_analyze.py EXPECTED_RUNS).
+# check_frozen_choices applies to these ONLY: tooling configs (the smoke
+# and debug configs, or no tier at all) are not protocol runs and must
+# not trip the gate - an allow-list is safer than exempting them one by
+# one, because the next tooling config would hit the same problem.
+PROTOCOL_TIERS: frozenset[str] = frozenset(
+    {
+        "calib_dmodel",
+        "calib_harness",
+        "calib_lr",
+        "calib_lr_anchors",
+        "tier1_core",
+        "tier2_gates",
+        "tier3_frozen",
+        "tier4_lambda",
+        "tier5_matched_bytes",
+        "tier6_anchors",
+        "tier_longT",
+        "R1",
+    }
+)
+
+
 def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
     """Assert the run uses the frozen calibration choices (width, harness).
 
-    The run's config stays the record: the frozen file is checked against
-    it, never used as a second source that silently overrides the config.
-    Each check applies in every phase, but only once the frozen field is
-    filled (so ``calib_lr`` is checked against ``d_model`` as soon as
+    Applies to :data:`PROTOCOL_TIERS` only - the smoke and debug configs
+    and tier-less runs are tooling, not protocol runs. The run's config
+    stays the record: the frozen file is checked against it, never used as
+    a second source that silently overrides the config. Each check applies
+    in every phase, but only once the frozen field is filled (so
+    ``calib_lr`` is checked against ``d_model`` as soon as
     ``calib_dmodel`` has been recorded, before ``frozen: true``).
 
     Exemptions: ``calib_dmodel`` (chooses the width) and
@@ -275,6 +301,8 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
             and the fix.
     """
     tier = str(cfg.experiment.get("tier", None) or "")
+    if tier not in PROTOCOL_TIERS:
+        return
 
     frozen_d_model = frozen.get("d_model", None)
     if frozen_d_model is not None and tier not in (

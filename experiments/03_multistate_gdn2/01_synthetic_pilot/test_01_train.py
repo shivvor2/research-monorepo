@@ -431,7 +431,9 @@ class TestFrozenChoices:
         )
 
     def test_d_model_match_passes(self):
-        train.check_frozen_choices(make_cfg(d_model=64), self.frozen(d_model=64))
+        train.check_frozen_choices(
+            make_cfg(d_model=64, tier="tier1_core"), self.frozen(d_model=64)
+        )
 
     def test_d_model_mismatch_names_the_fix(self):
         with pytest.raises(RuntimeError) as exc:
@@ -457,14 +459,14 @@ class TestFrozenChoices:
 
     def test_harness_match_passes(self):
         train.check_frozen_choices(
-            make_cfg(layer_pattern="mixer_x2", state_mixer="mlp"),
+            make_cfg(tier="tier1_core", layer_pattern="mixer_x2", state_mixer="mlp"),
             self.frozen(layer_pattern="mixer_x2", state_mixer="mlp"),
         )
 
     def test_harness_mismatch_names_the_fix(self):
         with pytest.raises(RuntimeError) as exc:
             train.check_frozen_choices(
-                make_cfg(layer_pattern="zoology"),
+                make_cfg(tier="tier1_core", layer_pattern="zoology"),
                 self.frozen(layer_pattern="mixer_x2"),
             )
         message = str(exc.value)
@@ -487,11 +489,85 @@ class TestFrozenChoices:
             self.frozen(layer_pattern="mixer_x2", state_mixer="mlp"),
         )
 
+    def test_tooling_configs_skip_the_check(self):
+        """The smoke and debug configs are tooling, not protocol tiers:
+        the frozen choices must not apply to them, or filling in the
+        frozen file breaks the end-to-end smoke test and
+        --config-name=debug (both run at d_model 16)."""
+        from hydra import compose, initialize_config_dir
+
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        frozen = self.frozen(d_model=64, layer_pattern="mixer_x2", state_mixer="mlp")
+        with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+            for name in ("test", "debug"):
+                cfg = compose(config_name=name)
+                assert str(cfg.model.d_model) == "16"  # contradicts frozen
+                train.check_frozen_choices(cfg, frozen)  # no raise
+
+    def test_protocol_tiers_are_still_checked(self):
+        # The allow-list must not disable the check for protocol tiers.
+        with pytest.raises(RuntimeError, match="d_model"):
+            train.check_frozen_choices(
+                make_cfg(d_model=32, tier="tier1_core"), self.frozen(d_model=64)
+            )
+
     def test_null_frozen_fields_skip_every_check(self):
         train.check_frozen_choices(
-            make_cfg(d_model=32, layer_pattern="zoology", state_mixer="none"),
+            make_cfg(
+                tier="tier1_core",
+                d_model=32,
+                layer_pattern="zoology",
+                state_mixer="none",
+            ),
             self.frozen(),
         )
+
+
+class TestSmokePathIndependentOfFrozenProtocol:
+    """The smoke path (config-name=test) must not depend on the frozen
+    file's choices, so filling conf/frozen_protocol.yaml in can never
+    break the suite."""
+
+    def test_smoke_path_passes_with_a_fully_filled_frozen_protocol(self):
+        from hydra import compose, initialize_config_dir
+
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        # Worst case: every frozen field filled, contradicting the smoke
+        # config's own choices everywhere.
+        lr_table = {
+            task: {
+                layout: {gate: 0.01 for gate in ("kda", "full")}
+                for layout in ("single", "ws", "fs", "ll")
+            }
+            for task in ("mqar", "overwrite")
+        }
+        frozen = OmegaConf.create(
+            {
+                "frozen": True,
+                "d_model": 64,
+                "harness": {
+                    "layer_pattern": "mixer_x2",
+                    "state_mixer": "mlp",
+                },
+                "lr_table": lr_table,
+                "anchor_lr": {d: {"single": 0.01, "ll": 0.01} for d in (16, 32, 64)},
+                "overwrite_task_by_d_model": {
+                    32: "overwrite",
+                    64: "overwrite_dk32",
+                },
+            }
+        )
+        with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+            cfg = compose(config_name="test")
+        # The frozen-file-dependent steps of main(), in order.
+        # 1. The phase gate: the smoke config is phase 1 regardless.
+        assert int(cfg.experiment.phase) < 2
+        # 2. The frozen-choice gate: smoke is not a protocol tier.
+        train.check_frozen_choices(cfg, frozen)
+        # 3. The LR: the smoke config sets its own.
+        assert train.resolve_lr(cfg, frozen) == pytest.approx(0.003)
+        # 4. The overwrite-K check: mqar is untouched.
+        train.check_overwrite_k(cfg, frozen)
 
 
 class TestSweepConfigsCompose:
