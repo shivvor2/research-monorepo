@@ -390,17 +390,25 @@ def model_cfg(**overrides):
     return OmegaConf.create({"model": model})
 
 
-def first_sweeper_value(value) -> str:
-    """The first value of a --multirun sweeper parameter.
+def sweeper_values(value) -> list[str]:
+    """Every value of a --multirun sweeper parameter, in order.
 
-    ``"a,b,c"`` -> ``"a"``; ``"range(0,10)"`` -> ``"0"``; a single value
-    passes through.
+    ``"a,b,c"`` -> ``["a", "b", "c"]``; ``"range(0,5)"`` ->
+    ``["0", ..., "4"]``; a single value passes through.
     """
     value = str(value)
     if value.startswith("range("):
         inner = value[value.index("(") + 1 : value.rindex(")")]
-        return inner.split(",")[0].strip()
-    return value.split(",")[0].strip()
+        parts = [p.strip() for p in inner.split(",")]
+        start, stop = int(parts[0]), int(parts[1])
+        step = int(parts[2]) if len(parts) > 2 else 1
+        return [str(v) for v in range(start, stop, step)]
+    return [v.strip() for v in value.split(",")]
+
+
+def first_sweeper_value(value) -> str:
+    """The first value of a --multirun sweeper parameter."""
+    return sweeper_values(value)[0]
 
 
 class TestSweepConfigsCompose:
@@ -434,6 +442,46 @@ class TestSweepConfigsCompose:
             # override (this is what --multirun submits first).
             with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
                 compose(config_name="config", overrides=overrides)
+
+
+class TestRunIdUniqueness:
+    """No two runs of one sweep tier may share a run ID.
+
+    ``make_run_id`` must carry every identity dimension the sweep varies:
+    two runs that differ only in a key it omits would overwrite each
+    other's run JSON and checkpoint (``calib_harness`` sweeps
+    ``layer_pattern``, which the ID did not carry).
+    """
+
+    @pytest.mark.slow
+    def test_every_sweep_combination_has_a_unique_run_id(self):
+        # ~75 s: every combination of every sweep file composes.
+        import itertools
+
+        from hydra import compose, initialize_config_dir
+
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        placeholder_lr = 0.003
+        for path in sorted((conf_dir / "sweep").glob("*.yaml")):
+            stem = path.stem
+            params = OmegaConf.select(
+                OmegaConf.load(path), "hydra.sweeper.params", default={}
+            )
+            names = list(params.keys())
+            grids = [sweeper_values(params[name]) for name in names]
+            seen: set[str] = set()
+            with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+                for combo in itertools.product(*grids):
+                    overrides = [f"+sweep={stem}"] + [
+                        f"{name}={value}" for name, value in zip(names, combo)
+                    ]
+                    cfg = compose(config_name="config", overrides=overrides)
+                    lr = cfg.optimizer.lr
+                    run_id = train.make_run_id(
+                        cfg, placeholder_lr if lr is None else float(lr)
+                    )
+                    assert run_id not in seen, (stem, combo, run_id)
+                    seen.add(run_id)
 
 
 class TestBuildModel:

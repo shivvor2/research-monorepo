@@ -1,10 +1,10 @@
+# @package _global_
 # Phase 1 calibration: d_model selection (protocol §10 rule 2).
 # single-state `full` on MQAR at d in {32, 64}, selection seeds 100-101.
 # Pick the smallest d whose MQAR accuracy lands in [0.5, 0.95];
 # fallback 32.
 # Run: python 01_train.py +sweep=calib_dmodel --multirun
 
-# @package _global_
 experiment:
   phase: 1
   tier: calib_dmodel

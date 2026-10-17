@@ -369,10 +369,18 @@ def make_run_id(cfg: DictConfig, lr: float) -> str:
         f"{cfg.task.name}-{cfg.model.layout}-{cfg.model.gate_mode}"
         f"-{cfg.model.lambda_mode}-d{cfg.model.d_model}-lr{lr:g}"
     )
-    # A non-default weight-decay scheme is part of the run's identity.
+    # Every non-default value that the base ID leaves out is part of the
+    # run's identity too: two runs that differ only in such a key would
+    # overwrite each other's run JSON and checkpoint.
     scheme = str(cfg.optimizer.decay_scheme)
     if scheme != "grouped":
         run_id += f"-wd-{scheme}"
+    if str(cfg.model.layer_pattern) != "zoology":
+        run_id += f"-pat-{cfg.model.layer_pattern}"
+    if str(cfg.model.state_mixer) != "none":
+        run_id += f"-sm-{cfg.model.state_mixer}"
+    if float(cfg.model.expand_v) != 1.0:
+        run_id += f"-ev{cfg.model.expand_v:g}"
     run_id += f"-s{cfg.seed}"
     tier = cfg.experiment.get("tier", None)
     if tier:

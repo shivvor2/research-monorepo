@@ -1,3 +1,4 @@
+# @package _global_
 # Phase 1 calibration: anchor LR selection (protocol section 10, step 4).
 # The anchors use gate gdn, which the main LR sweep never calibrates, so
 # they get their own sweep: layouts {single, ll} x d_model {16, 32, 64}
@@ -6,7 +7,6 @@
 # conf/frozen_protocol.yaml under anchor_lr (keyed by d_model, layout).
 # Run: python 01_train.py +sweep=calib_lr_anchors --multirun
 
-# @package _global_
 experiment:
   phase: 1
   tier: calib_lr_anchors

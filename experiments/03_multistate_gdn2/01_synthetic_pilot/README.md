@@ -98,7 +98,13 @@ perfectly while DDP mostly adds communication overhead.
   `val_final`, `mixer_stats_final`, `test` — plus `lr_resolved` and
   `decay_scheme`. Runs whose status is not `test_done` are incomplete;
   the analysis lists them. `run_id` is
-  `{tier_}{task}-{layout}-{gate_mode}-{lambda_mode}-d{d}-lr{lr}-s{seed}`.
+  `{tier_}{task}-{layout}-{gate_mode}-{lambda_mode}-d{d}-lr{lr}-s{seed}`,
+  plus a suffix for every non-default value the base ID leaves out:
+  `-wd-{scheme}` (weight-decay scheme other than `grouped`),
+  `-pat-{value}` (`layer_pattern` other than `zoology`),
+  `-sm-{value}` (`state_mixer` other than `none`) and
+  `-ev{value}` (`expand_v` other than `1`); the suffixes go before
+  `-s{seed}`, in that order.
 - `logs/` — CSV (and optional wandb) logs; `outputs/`, `multirun/` —
   hydra job dirs; `analysis/` — the analysis output. All git-ignored.
 - Final checkpoints are **on** by default (`output.save_final_checkpoint`,

@@ -1,6 +1,6 @@
+# @package _global_
 # Anchor dimension override: d = 16, 1 head (Log-Linear head counts).
 
-# @package _global_
 model:
   d_model: 16
   num_heads: 1

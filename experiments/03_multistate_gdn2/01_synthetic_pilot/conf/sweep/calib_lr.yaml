@@ -1,10 +1,10 @@
+# @package _global_
 # Phase 1 calibration: LR selection (protocol §10 rule 4, D24).
 # 6 core configs x 3 LRs x 2 selection seeds (100, 101) x 2 tasks = 72
 # short runs. Per core config, pick the LR with the best validation
 # accuracy on seeds 100-101; use it for seeds 0-9.
 # Run: python 01_train.py +sweep=calib_lr --multirun
 
-# @package _global_
 experiment:
   phase: 1
   tier: calib_lr
