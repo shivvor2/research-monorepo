@@ -28,11 +28,22 @@ python 01_train.py --config-name=debug --multirun
    frozen yet, so the sweeps set explicit LRs):
    ```bash
    python 01_train.py +sweep=calib_dmodel --multirun    # d_model in {32, 64}
+   ```
+   Record the chosen `d_model` in `conf/frozen_protocol.yaml` **and** set
+   `model.d_model` in `conf/config.yaml`: once the frozen file names a
+   width, `01_train.py` checks every run against it (only `calib_dmodel`,
+   `calib_lr_anchors` and `tier6_anchors` are exempt - they set their own).
+   ```bash
    python 01_train.py +sweep=calib_harness --multirun  # zoology vs mixer_x2
+   ```
+   The same for the harness switches (`harness.layer_pattern` /
+   `harness.state_mixer` in the frozen protocol; `model.layer_pattern` /
+   `model.state_mixer` in `config.yaml`). The anchors are **not** exempt
+   from the harness: it is shared by every tier. Only then:
+   ```bash
    python 01_train.py +sweep=calib_lr --multirun       # LR per core config
    ```
-   Then fill in `conf/frozen_protocol.yaml` (the chosen `d_model`, the
-   harness switches, the LR table), set `frozen: true`, and commit it.
+   Finally fill in the LR table, set `frozen: true`, and commit it.
    `01_train.py` refuses any run with `experiment.phase >= 2` until the
    protocol is frozen.
 

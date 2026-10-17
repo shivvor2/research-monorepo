@@ -42,6 +42,8 @@ def make_cfg(
     num_heads=2,
     head_dim=None,
     num_keys=(8, 16, 32),
+    layer_pattern="zoology",
+    state_mixer="none",
 ):
     return OmegaConf.create(
         {
@@ -53,6 +55,8 @@ def make_cfg(
                 "d_model": d_model,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "layer_pattern": layer_pattern,
+                "state_mixer": state_mixer,
             },
             "experiment": {"tier": tier},
         }
@@ -409,6 +413,85 @@ def sweeper_values(value) -> list[str]:
 def first_sweeper_value(value) -> str:
     """The first value of a --multirun sweeper parameter."""
     return sweeper_values(value)[0]
+
+
+class TestFrozenChoices:
+    """The frozen calibration choices (width, harness) are checked against
+    the run's config, in every phase, once the frozen field is filled."""
+
+    def frozen(self, d_model=None, layer_pattern=None, state_mixer=None):
+        return OmegaConf.create(
+            {
+                "d_model": d_model,
+                "harness": {
+                    "layer_pattern": layer_pattern,
+                    "state_mixer": state_mixer,
+                },
+            }
+        )
+
+    def test_d_model_match_passes(self):
+        train.check_frozen_choices(make_cfg(d_model=64), self.frozen(d_model=64))
+
+    def test_d_model_mismatch_names_the_fix(self):
+        with pytest.raises(RuntimeError) as exc:
+            train.check_frozen_choices(
+                make_cfg(d_model=32, tier="tier1_core"), self.frozen(d_model=64)
+            )
+        message = str(exc.value)
+        assert "d_model" in message
+        assert "32" in message and "64" in message
+        assert (
+            "set `model.d_model: 64` in conf/config.yaml, "
+            "or pass `model.d_model=64`" in message
+        )
+
+    @pytest.mark.parametrize(
+        "tier", ["calib_dmodel", "calib_lr_anchors", "tier6_anchors"]
+    )
+    def test_d_model_exemptions(self, tier):
+        # These tiers choose or override the width themselves.
+        train.check_frozen_choices(
+            make_cfg(d_model=32, tier=tier), self.frozen(d_model=64)
+        )
+
+    def test_harness_match_passes(self):
+        train.check_frozen_choices(
+            make_cfg(layer_pattern="mixer_x2", state_mixer="mlp"),
+            self.frozen(layer_pattern="mixer_x2", state_mixer="mlp"),
+        )
+
+    def test_harness_mismatch_names_the_fix(self):
+        with pytest.raises(RuntimeError) as exc:
+            train.check_frozen_choices(
+                make_cfg(layer_pattern="zoology"),
+                self.frozen(layer_pattern="mixer_x2"),
+            )
+        message = str(exc.value)
+        assert "layer_pattern" in message
+        assert "zoology" in message and "mixer_x2" in message
+        assert "set `model.layer_pattern: mixer_x2` in conf/config.yaml" in message
+
+    def test_anchors_are_not_exempt_from_the_harness(self):
+        # The harness is shared by every tier, so the anchor numbers are
+        # read in the same harness as the main grid.
+        with pytest.raises(RuntimeError, match="layer_pattern"):
+            train.check_frozen_choices(
+                make_cfg(tier="tier6_anchors", layer_pattern="zoology"),
+                self.frozen(layer_pattern="mixer_x2"),
+            )
+
+    def test_calib_harness_is_exempt(self):
+        train.check_frozen_choices(
+            make_cfg(tier="calib_harness", layer_pattern="zoology"),
+            self.frozen(layer_pattern="mixer_x2", state_mixer="mlp"),
+        )
+
+    def test_null_frozen_fields_skip_every_check(self):
+        train.check_frozen_choices(
+            make_cfg(d_model=32, layer_pattern="zoology", state_mixer="none"),
+            self.frozen(),
+        )
 
 
 class TestSweepConfigsCompose:

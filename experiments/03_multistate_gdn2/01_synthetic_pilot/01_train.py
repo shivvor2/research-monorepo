@@ -254,6 +254,58 @@ def check_overwrite_k(cfg: DictConfig, frozen: DictConfig) -> None:
     )
 
 
+def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
+    """Assert the run uses the frozen calibration choices (width, harness).
+
+    The run's config stays the record: the frozen file is checked against
+    it, never used as a second source that silently overrides the config.
+    Each check applies in every phase, but only once the frozen field is
+    filled (so ``calib_lr`` is checked against ``d_model`` as soon as
+    ``calib_dmodel`` has been recorded, before ``frozen: true``).
+
+    Exemptions: ``calib_dmodel`` (chooses the width) and
+    ``calib_lr_anchors`` / ``tier6_anchors`` (the anchors set their own
+    width) skip the ``d_model`` check; ``calib_harness`` skips the harness
+    checks. The anchors are NOT exempt from the harness: it is shared by
+    every tier, so the anchor numbers are read in the same harness as the
+    main grid.
+
+    Raises:
+        RuntimeError: Naming the key, the run's value, the frozen value
+            and the fix.
+    """
+    tier = str(cfg.experiment.get("tier", None) or "")
+
+    frozen_d_model = frozen.get("d_model", None)
+    if frozen_d_model is not None and tier not in (
+        "calib_dmodel",
+        "calib_lr_anchors",
+        "tier6_anchors",
+    ):
+        if int(cfg.model.d_model) != int(frozen_d_model):
+            raise RuntimeError(
+                f"the frozen protocol's d_model is {frozen_d_model}, but this "
+                f"run uses model.d_model={cfg.model.d_model} (tier={tier!r}); "
+                f"set `model.d_model: {frozen_d_model}` in conf/config.yaml, "
+                f"or pass `model.d_model={frozen_d_model}`"
+            )
+
+    harness = frozen.get("harness", None)
+    if harness is not None:
+        for key in ("layer_pattern", "state_mixer"):
+            frozen_value = harness.get(key, None)
+            if frozen_value is None or tier == "calib_harness":
+                continue
+            if str(cfg.model[key]) != str(frozen_value):
+                raise RuntimeError(
+                    f"the frozen protocol's harness uses {key}={frozen_value!r}, "
+                    f"but this run uses model.{key}={cfg.model[key]!r} "
+                    f"(tier={tier!r}; the anchors are not exempt - the harness "
+                    f"is shared by every tier); set `model.{key}: {frozen_value}` "
+                    f"in conf/config.yaml, or pass `model.{key}={frozen_value}`"
+                )
+
+
 def build_task_config(cfg: DictConfig):
     """The generator config for the selected task."""
     name = str(cfg.task.name)
@@ -499,6 +551,10 @@ def main(cfg: DictConfig) -> None:
             f"finish calibration, fill in and commit the frozen protocol "
             f"before running experiment tiers"
         )
+
+    # 1b. The run must use the frozen calibration choices (width and
+    # harness), once they are recorded in the frozen protocol.
+    check_frozen_choices(cfg, frozen)
 
     # 2. Learning rate.
     lr = resolve_lr(cfg, frozen)
