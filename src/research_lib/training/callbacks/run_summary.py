@@ -292,6 +292,22 @@ class RunSummaryCallback(L.Callback):
     only the resumed segment (the clock starts at the resumed
     ``on_fit_start``).
 
+    **Run identity.** The identity of a record is its
+    ``(config_hash, seed)`` pair: the hash covers every resolved config
+    key, so two records share an identity only if they are the same run
+    (all seeds of one configuration differ in ``seed``). Constructing the
+    callback against a path that already holds a **different** run's
+    record raises :class:`FileExistsError` before anything is built, and
+    so do the test-only and failure loads (``on_test_end`` /
+    ``on_exception``) instead of merging another run's sections; a
+    relaunch of the same run (same config and seed, e.g. after a
+    failure) overwrites its own record, as before. A path that exists
+    but is not valid JSON raises :class:`ValueError` rather than being
+    overwritten silently. The hash covers every resolved config key, so
+    this protection only works if every experiment-varying option is a
+    config key (true for this repository's experiments; run IDs alone
+    are not the identity).
+
     Args:
         runs_dir: Directory the JSON is written to (created if missing).
         run_id: Identifies the run; used by the default filename and
@@ -389,6 +405,9 @@ class RunSummaryCallback(L.Callback):
         self._fit_start: float | None = None
         self._best_value: float | None = None
         self._best_step: int | None = None
+        # A path that already holds a different run's record must fail
+        # the run here, before any data or model is built.
+        self._check_existing_record()
 
     # ------------------------------------------------------------------ #
     # File
@@ -525,10 +544,58 @@ class RunSummaryCallback(L.Callback):
             self.summary[collector.section] = section
 
     def _load_existing(self) -> None:
-        """Load a previously written file (test-only launch into a fresh summary)."""
+        """Load a previously written file (test-only launch into a fresh summary).
+
+        Refuses (``FileExistsError``) to merge a record of a different
+        run, and raises (``ValueError``) on a file that is not valid JSON
+        instead of overwriting it silently.
+        """
         if self.path.exists():
+            record = self._read_record()
+            self._check_identity(record)
+            self.summary.update(record)
+
+    # ------------------------------------------------------------------ #
+    # Run identity: a record belongs to (config_hash, seed)
+    # ------------------------------------------------------------------ #
+
+    def _identity(self) -> tuple[str, Any]:
+        """The record's identity: ``(config_hash, seed)``."""
+        return (config_hash(self.config), self.config.get("seed"))
+
+    def _read_record(self) -> dict[str, Any]:
+        """The existing record at ``self.path``; raises if unreadable."""
+        try:
             with open(self.path, encoding="utf-8") as f:
-                self.summary.update(json.load(f))
+                return json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"{self.path} exists but is not valid JSON ({e}); "
+                f"refusing to overwrite it"
+            ) from e
+
+    def _check_identity(self, record: Mapping[str, Any]) -> None:
+        """Refuse to touch a record of a different run.
+
+        Raises:
+            FileExistsError: Naming the path and both identities. The same
+                identity (a relaunch of the same run) is allowed.
+        """
+        existing = (record.get("config_hash"), record.get("seed"))
+        if existing != self._identity():
+            raise FileExistsError(
+                f"{self.path} already holds a record of a different run: "
+                f"existing (config_hash, seed) = {existing}, "
+                f"this run would be {self._identity()}. Give this run a "
+                f"distinct run_id / filename, or reuse the same config "
+                f"and seed to relaunch the recorded run."
+            )
+
+    def _check_existing_record(self) -> None:
+        """At construction: refuse a path holding another run's record."""
+        if not self.path.exists():
+            return
+        self._check_identity(self._read_record())
 
     # ------------------------------------------------------------------ #
     # Hooks (one per Stage, plus tracking and exception handling)

@@ -646,6 +646,67 @@ class TestStatus:
 
 
 # ---------------------------------------------------------------------------
+# Run identity: a record belongs to (config_hash, seed)
+# ---------------------------------------------------------------------------
+
+
+class TestRunIdentity:
+    """The identity of a record is ``(config_hash, seed)``: constructing
+    against another run's record, or loading one, must raise instead of
+    clobbering or merging it; the same run may overwrite its own record."""
+
+    def _fit(self, tmp_path, run_id, cb, module=None):
+        trainer = make_trainer([cb])
+        trainer.fit(
+            module or tiny_module(),
+            train_dataloaders=make_loader(),
+            val_dataloaders=make_loader(),
+        )
+        return read(tmp_path, run_id)
+
+    def test_different_config_at_same_path_raises(self, tmp_path):
+        self._fit(
+            tmp_path, "id", RunSummaryCallback(tmp_path, "id", {"seed": 0, "a": 1})
+        )
+        with pytest.raises(FileExistsError, match="config_hash"):
+            RunSummaryCallback(tmp_path, "id", {"seed": 0, "a": 2})
+
+    def test_same_config_and_seed_relaunch_overwrites(self, tmp_path):
+        first = self._fit(
+            tmp_path, "id", RunSummaryCallback(tmp_path, "id", {"seed": 0, "a": 1})
+        )
+        second = self._fit(
+            tmp_path, "id", RunSummaryCallback(tmp_path, "id", {"seed": 0, "a": 1})
+        )
+        assert second["config_hash"] == first["config_hash"]
+        assert second["status"] == "fit_done"  # its own record, overwritten
+
+    def test_test_only_launch_against_another_runs_file_raises(self, tmp_path):
+        # The fresh callback is built while the path is still empty (so
+        # construction passes); another run's record appears before its
+        # test-only launch: the load must refuse to merge it.
+        cb2 = RunSummaryCallback(tmp_path, "id", {"seed": 0, "a": 1})
+        other = self._fit(
+            tmp_path, "id", RunSummaryCallback(tmp_path, "id", {"seed": 0, "a": 2})
+        )
+        assert other["status"] == "fit_done"
+        trainer2 = L.Trainer(
+            accelerator="cpu",
+            logger=False,
+            enable_progress_bar=False,
+            callbacks=[cb2],
+            limit_val_batches=0,
+        )
+        with pytest.raises(FileExistsError, match="config_hash"):
+            trainer2.test(tiny_module(), dataloaders=make_loader())
+
+    def test_corrupt_json_file_raises(self, tmp_path):
+        (tmp_path / "id.json").write_text("{not json")
+        with pytest.raises(ValueError, match="not valid JSON"):
+            RunSummaryCallback(tmp_path, "id", {"seed": 0})
+
+
+# ---------------------------------------------------------------------------
 # Early-stopping flag (current Lightning initialises stopping_reason to
 # EarlyStoppingReason.NOT_STOPPED, so a None check marks every run stopped)
 # ---------------------------------------------------------------------------
