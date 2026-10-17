@@ -79,6 +79,7 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 import lightning as L
 import torch
@@ -441,9 +442,17 @@ class RunSummaryCallback(L.Callback):
         # The filename may contain subdirectories; create the file's
         # parent (covers runs_dir itself).
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.summary, f, indent=2, sort_keys=True, default=str)
+        # A writer-unique temp name: two processes writing the same path
+        # (a relaunch racing the old process, or two machines sharing the
+        # runs directory) must not race on one temp file. The temp file is
+        # removed if the write raises, so a crashed write leaves nothing.
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.summary, f, indent=2, sort_keys=True, default=str)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
         os.replace(tmp, path)
         logger.info("RunSummaryCallback: wrote %s", path)
 

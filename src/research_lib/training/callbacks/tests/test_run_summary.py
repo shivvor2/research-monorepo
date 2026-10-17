@@ -646,6 +646,30 @@ class TestStatus:
 
 
 # ---------------------------------------------------------------------------
+# Writer-unique temporary files (no *.tmp left behind)
+# ---------------------------------------------------------------------------
+
+
+class TestTempFiles:
+    """The write is atomic and never leaves a temporary file behind,
+    whatever else is writing the same path (two launches, two machines)."""
+
+    def test_no_temp_files_left_behind(self, tmp_path, monkeypatch):
+        cb = RunSummaryCallback(tmp_path, "tmp", tiny_config_dict(), strict=True)
+        zero = SimpleNamespace(is_global_zero=True)
+        cb._write(zero)
+        assert not list(tmp_path.glob("*.tmp"))
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("dump boom")
+
+        monkeypatch.setattr(json, "dump", boom)
+        with pytest.raises(RuntimeError, match="dump boom"):
+            cb._write(zero)
+        assert not list(tmp_path.glob("*.tmp"))
+
+
+# ---------------------------------------------------------------------------
 # Run identity: a record belongs to (config_hash, seed)
 # ---------------------------------------------------------------------------
 
