@@ -28,7 +28,9 @@ from research_lib.training.callbacks.run_summary import (
     param_counts,
 )
 from research_lib.training.configs import ScheduleConfig
-from research_lib.training.modules.synthetic_recall import SyntheticRecallModule
+from research_lib.training.modules.mgdn2_synthetic_recall import (
+    MGDN2SyntheticRecallModule,
+)
 from research_lib.training.scheduling import WarmupStableDecaySchedule
 
 # ---------------------------------------------------------------------------
@@ -48,7 +50,7 @@ def tiny_config_dict(seed: int = 0) -> dict:
     return {"seed": seed, "model": {"d_model": 16, "layout": "single"}, "task": "mqar"}
 
 
-def tiny_module() -> SyntheticRecallModule:
+def tiny_module() -> MGDN2SyntheticRecallModule:
     schedule = ScheduleConfig(
         global_schedules=[
             WarmupStableDecaySchedule(
@@ -61,10 +63,9 @@ def tiny_module() -> SyntheticRecallModule:
             )
         ]
     )
-    return SyntheticRecallModule(
+    return MGDN2SyntheticRecallModule(
         model=tiny_model(),
         slice_values=(4, 8),
-        collect_mixer_stats=False,
         matrix_optimizer_config=type(
             "C",
             (),

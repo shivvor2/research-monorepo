@@ -45,13 +45,14 @@ from research_lib.data.synthetic import (
 )
 from research_lib.training.callbacks import (
     Collector,
+    LayerStatsCallback,
     RunSummaryCallback,
     Stage,
     metrics_by_prefix,
     param_counts,
 )
 from research_lib.training.configs import ScheduleConfig
-from research_lib.training.modules import SyntheticRecallModule
+from research_lib.training.modules import MGDN2SyntheticRecallModule
 from research_lib.training.presets import build_weight_decay_configs
 from research_lib.training.scheduling import WarmupStableDecaySchedule
 
@@ -304,7 +305,9 @@ def build_model(cfg: DictConfig) -> ZoologyLM:
     return ZoologyLM(model_config)
 
 
-def build_module(cfg: DictConfig, model: ZoologyLM, lr: float) -> SyntheticRecallModule:
+def build_module(
+    cfg: DictConfig, model: ZoologyLM, lr: float
+) -> MGDN2SyntheticRecallModule:
     """The training module with the two AdamW weight-decay groups."""
     matrix_optimizer_config, vector_optimizer_config = build_weight_decay_configs(
         str(cfg.optimizer.get("decay_scheme", "grouped")),
@@ -326,12 +329,11 @@ def build_module(cfg: DictConfig, model: ZoologyLM, lr: float) -> SyntheticRecal
             )
         ]
     )
-    return SyntheticRecallModule(
+    return MGDN2SyntheticRecallModule(
         model=model,
         slice_values=slice_values(cfg),
         with_classes=None,  # auto-detect (True for overwrite batches)
         loss_on=cfg.training.loss_on,
-        collect_mixer_stats=True,
         matrix_optimizer_config=matrix_optimizer_config,
         vector_optimizer_config=vector_optimizer_config,
         matrix_schedule_config=schedule_config,
@@ -367,6 +369,15 @@ def state_bytes_collector(trainer, pl_module):
         return {"bytes_per_mixer": layers[0].state_bytes_per_mixer()}
 
     return fn
+
+
+def per_slot_summary(key, value):
+    """Keep the pilot's mixer metric names: one entry per lambda slot."""
+
+    if key.startswith("lambda_"):
+        per_slot = value.float().mean(dim=0)  # average over heads -> (L,)
+        return {f"{key}/slot{l}": float(v) for l, v in enumerate(per_slot)}
+    return {key: float(value.float().mean())}
 
 
 def create_callbacks(cfg: DictConfig, run_id: str) -> list:
@@ -408,6 +419,8 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
+    if bool(cfg.training.get("collect_mixer_stats", True)):
+        callbacks.append(LayerStatsCallback(prefix="mixer", summarize=per_slot_summary))
     return callbacks
 
 

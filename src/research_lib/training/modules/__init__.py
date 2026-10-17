@@ -5,6 +5,8 @@ This subpackage provides LightningModule implementations for various
 optimizer configurations:
 
 - :class:`DualOptimizerModule`: Training with two optimizers (e.g., Muon + AdamW)
+- :class:`MGDN2SyntheticRecallModule`: The multi-state GDN-2 synthetic-recall
+  training module (task-specific; answer-only loss and recall metrics)
 
 These modules integrate with:
 - The configuration system in :mod:`research_lib.training.configs`
@@ -58,9 +60,10 @@ Example:
 """
 
 from .dual_optimizer import DualOptimizerModule
-from .synthetic_recall import SyntheticRecallModule
+from .mgdn2_synthetic_recall import LossOn, MGDN2SyntheticRecallModule
 
 __all__ = [
     "DualOptimizerModule",
-    "SyntheticRecallModule",
+    "LossOn",
+    "MGDN2SyntheticRecallModule",
 ]

@@ -1,29 +1,31 @@
-"""Lightning training module for the synthetic recall tasks.
+"""Lightning training module for the multi-state GDN-2 synthetic pilot.
 
 A :class:`~research_lib.training.modules.DualOptimizerModule` for
 :class:`~research_lib.architectures.zoology_lm.ZoologyLM` trained on
-MQAR / repeated-key overwrite (``06_experiment_protocol.md``):
+MQAR / repeated-key overwrite:
 
 - **Loss on answer positions only** (labels are ``-100`` except at
   answers — the inherited ``compute_loss`` is reused unchanged), with a
-  ``loss_on="all"`` config switch for full-sequence cross-entropy.
+  ``loss_on="all"`` switch for full-sequence cross-entropy
+  (:class:`LossOn`).
 - **Validation / test:** answer accuracy, per slice and (for overwrite)
   per placement class, via
   :class:`~research_lib.data.synthetic.RecallMetrics`.
-- **Mixer statistics:** with ``collect_mixer_stats`` (default), the
-  gated-delta layers collect λ / erase statistics during the validation
-  epoch only; the per-slot means are logged as
-  ``mixer/layer{i}/lambda_mean/slot{l}`` etc.
+
+Per-layer mixer statistics are collected by
+:class:`~research_lib.training.callbacks.LayerStatsCallback`, not by
+this module.
 
 Run tests with::
 
-    pytest src/research_lib/training/tests/test_synthetic_recall_module.py -v
+    pytest src/research_lib/training/tests/test_mgdn2_synthetic_recall_module.py -v
 """
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Sequence
+from enum import Enum
 from typing import Any
 
 import torch
@@ -34,11 +36,35 @@ from research_lib.training.modules.dual_optimizer import DualOptimizerModule
 
 logger = logging.getLogger(__name__)
 
-_LOSS_ON = ("answers", "all")
+
+class LossOn(str, Enum):
+    """Where the training loss is computed.
+
+    - ``ANSWERS``: cross-entropy on answer positions only (labels are
+      ``-100`` elsewhere, exactly as Zoology).
+    - ``ALL``: full-sequence cross-entropy on ``input_ids``.
+    """
+
+    ANSWERS = "answers"
+    ALL = "all"
 
 
-class SyntheticRecallModule(DualOptimizerModule):
-    """Train a :class:`ZoologyLM` on the synthetic recall tasks.
+class MGDN2SyntheticRecallModule(DualOptimizerModule):
+    """Train a :class:`ZoologyLM` on the multi-state GDN-2 synthetic tasks.
+
+    **Scope.** This module is task-specific: it is the synthetic-recall
+    training module of the multi-state GDN-2 project (MQAR and the
+    repeated-key overwrite task, via :class:`~research_lib.data.synthetic`
+    batches and :class:`~research_lib.data.synthetic.RecallMetrics`).
+    Convention: in ``research_lib``, a class that inherits directly from
+    :class:`lightning.pytorch.LightningModule` is a general building
+    block; a class that inherits from one of ``research_lib``'s own
+    modules (as this one inherits from
+    :class:`~research_lib.training.modules.DualOptimizerModule`) is a
+    specific instance and may be tied to one task or project. A general
+    synthetic-task module is deferred until a second experiment needs
+    one; when it exists, :class:`MGDN2SyntheticRecallModule` will become
+    that module with fixed init arguments.
 
     The parent's ``training_step`` calls ``self.forward(**batch)`` and the
     synthetic batches carry extra keys (``labels``, ``slice_id``,
@@ -50,19 +76,14 @@ class SyntheticRecallModule(DualOptimizerModule):
             for overwrite; from ``task_config.slices``).
         with_classes: Accumulate class-conditioned metrics;
             ``None`` auto-detects per batch (``True`` for overwrite).
-        loss_on: ``"answers"`` (default) — cross-entropy on answer
-            positions only, exactly as Zoology; ``"all"`` — full-sequence
-            cross-entropy on ``input_ids`` (the protocol's alternative).
-        collect_mixer_stats: If ``True`` (default), enable
-            ``collect_stats`` on the model's gated-delta layers for the
-            validation epoch only and log the averaged λ / erase
-            statistics.
+        loss_on: :class:`LossOn` member or its string value (Hydra passes
+            strings); ``"answers"`` is the default.
         **kwargs: Forwarded to
             :class:`~research_lib.training.modules.DualOptimizerModule`
             (model, optimizer and schedule configs, target modules, …).
 
     Raises:
-        ValueError: Unknown ``loss_on``.
+        ValueError: Unknown ``loss_on`` string.
     """
 
     def __init__(
@@ -70,22 +91,15 @@ class SyntheticRecallModule(DualOptimizerModule):
         *,
         slice_values: Sequence[int],
         with_classes: bool | None = None,
-        loss_on: str = "answers",
-        collect_mixer_stats: bool = True,
+        loss_on: LossOn | str = LossOn.ANSWERS,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if loss_on not in _LOSS_ON:
-            raise ValueError(f"loss_on must be one of {_LOSS_ON}, got {loss_on!r}")
+        self.loss_on = LossOn(loss_on)
         self.slice_values = tuple(slice_values)
         self.with_classes = with_classes
-        self.loss_on = loss_on
-        self.collect_mixer_stats = collect_mixer_stats
         self._val_metrics: RecallMetrics | None = None
         self._test_metrics: RecallMetrics | None = None
-        # Per-layer accumulators of ``latest_stats`` dicts for the epoch:
-        # layer index -> list of dicts (one entry per validation batch).
-        self._mixer_stats: dict[int, list[dict[str, torch.Tensor]]] = {}
 
     # ------------------------------------------------------------------ #
     # Forward / loss
@@ -117,7 +131,7 @@ class SyntheticRecallModule(DualOptimizerModule):
             Scalar loss: answer-positions-only CE (``"answers"``; the
             inherited computation) or full-sequence CE (``"all"``).
         """
-        if self.loss_on == "answers":
+        if self.loss_on is LossOn.ANSWERS:
             return super().compute_loss(model_output, batch)
         logits = model_output
         shift_logits = logits[..., :-1, :].contiguous()
@@ -128,54 +142,6 @@ class SyntheticRecallModule(DualOptimizerModule):
         )
 
     # ------------------------------------------------------------------ #
-    # Mixer statistics (validation epoch only)
-    # ------------------------------------------------------------------ #
-
-    def _collect_mixer_stats(self) -> None:
-        """Snapshot every gated-delta layer's ``latest_stats`` for this batch."""
-        if not self.collect_mixer_stats:
-            return
-        model = self.model
-        layers = getattr(model, "gated_delta_layers", None)
-        if not callable(layers):
-            return
-        for i, layer in enumerate(model.gated_delta_layers()):  # type: ignore[attr-defined]
-            stats = layer.latest_stats
-            if stats is not None:
-                self._mixer_stats.setdefault(i, []).append(stats)
-
-    def _log_mixer_stats(self, prefix: str) -> None:
-        """Log the batch-averaged λ / erase statistics (``prefix="val"``)."""
-        if not self._mixer_stats:
-            return
-        for i, entries in self._mixer_stats.items():
-            # Average over validation batches, then over heads.
-            keys = entries[0].keys()
-            avg = {
-                key: torch.stack(
-                    [e[key].float() for e in entries if key in e], dim=0
-                ).mean(dim=0)
-                for key in keys
-            }
-            for key, value in avg.items():
-                if key.startswith("lambda_"):
-                    per_slot = value.mean(dim=0)  # average over heads -> (L,)
-                    for slot in range(per_slot.numel()):
-                        self.log(
-                            f"mixer/layer{i}/{key}/slot{slot}", float(per_slot[slot])
-                        )
-                else:
-                    self.log(f"mixer/layer{i}/{key}", float(value))
-
-    def _set_collect_stats(self, flag: bool) -> None:
-        model = self.model
-        setter = getattr(model, "set_collect_stats", None)
-        if callable(setter):
-            model.set_collect_stats(flag)  # type: ignore[attr-defined]
-            if flag:
-                self._mixer_stats = {}
-
-    # ------------------------------------------------------------------ #
     # Validation / test
     # ------------------------------------------------------------------ #
 
@@ -183,7 +149,6 @@ class SyntheticRecallModule(DualOptimizerModule):
         self._val_metrics = RecallMetrics(
             self.slice_values, with_classes=self.with_classes
         )
-        self._set_collect_stats(self.collect_mixer_stats)
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
@@ -211,21 +176,17 @@ class SyntheticRecallModule(DualOptimizerModule):
         )
         assert self._val_metrics is not None  # set in on_validation_epoch_start
         self._val_metrics.update(logits, batch)
-        self._collect_mixer_stats()
         return loss
 
     def on_validation_epoch_end(self) -> None:
         assert self._val_metrics is not None
         for key, value in self._val_metrics.compute().items():
             self.log(f"val/{key}", value)
-        self._log_mixer_stats("val")
-        self._set_collect_stats(False)
 
     def on_test_epoch_start(self) -> None:
         self._test_metrics = RecallMetrics(
             self.slice_values, with_classes=self.with_classes
         )
-        self._set_collect_stats(self.collect_mixer_stats)
 
     def test_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """One test batch: loss + RecallMetrics update.
@@ -250,12 +211,9 @@ class SyntheticRecallModule(DualOptimizerModule):
         )
         assert self._test_metrics is not None  # set in on_test_epoch_start
         self._test_metrics.update(logits, batch)
-        self._collect_mixer_stats()
         return loss
 
     def on_test_epoch_end(self) -> None:
         assert self._test_metrics is not None
         for key, value in self._test_metrics.compute().items():
             self.log(f"test/{key}", value)
-        self._log_mixer_stats("test")
-        self._set_collect_stats(False)

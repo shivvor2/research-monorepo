@@ -1,8 +1,8 @@
 """
-Tests for the synthetic recall training module.
+Tests for the multi-state GDN-2 synthetic-recall training module.
 
-Target: src/research_lib/training/modules/synthetic_recall.py
-Run with: pytest src/research_lib/training/tests/test_synthetic_recall_module.py -v
+Target: src/research_lib/training/modules/mgdn2_synthetic_recall.py
+Run with: pytest src/research_lib/training/tests/test_mgdn2_synthetic_recall_module.py -v
 """
 
 import pytest
@@ -18,7 +18,9 @@ from research_lib.data.synthetic import (
     generate_overwrite,
 )
 from research_lib.training.configs import ScheduleConfig
-from research_lib.training.modules.synthetic_recall import SyntheticRecallModule
+from research_lib.training.modules.mgdn2_synthetic_recall import (
+    MGDN2SyntheticRecallModule,
+)
 from research_lib.training.param_utils import partition_parameters_with_names
 from research_lib.training.presets import build_weight_decay_configs
 from research_lib.training.scheduling import WarmupStableDecaySchedule
@@ -83,18 +85,16 @@ def make_module(
     slice_values=(2, 4),
     with_classes=None,
     loss_on="answers",
-    collect_mixer_stats=True,
     decay_scheme: str = "grouped",
-) -> SyntheticRecallModule:
+) -> MGDN2SyntheticRecallModule:
     matrix_config, vector_config = build_weight_decay_configs(
         decay_scheme, weight_decay=0.1, betas=(0.9, 0.95)
     )
-    return SyntheticRecallModule(
+    return MGDN2SyntheticRecallModule(
         model=tiny_model(layout),
         slice_values=slice_values,
         with_classes=with_classes,
         loss_on=loss_on,
-        collect_mixer_stats=collect_mixer_stats,
         matrix_optimizer_config=matrix_config,
         vector_optimizer_config=vector_config,
         matrix_schedule_config=lr_schedule(),
@@ -330,7 +330,7 @@ class TestValidationLogging:
     def fitted_mqar(self):
         import lightning as L
 
-        module = make_module(layout="ws", slice_values=(2, 4), collect_mixer_stats=True)
+        module = make_module(layout="ws", slice_values=(2, 4))
         dm = make_datamodule("mqar", batch_size=8)
         trainer = L.Trainer(
             max_steps=2,
@@ -362,18 +362,12 @@ class TestValidationLogging:
         trainer.fit(module, datamodule=dm)
         return trainer, module
 
-    def test_mqar_logs_slices_and_mixer_stats(self, fitted_mqar):
+    def test_mqar_logs_slices(self, fitted_mqar):
         trainer, module = fitted_mqar
         metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
         assert "val/acc" in metrics
         assert "val/acc/slice=2" in metrics
         assert "val/acc/slice=4" in metrics
-        # mixer statistics were collected during the validation epoch only
-        assert any(k.startswith("mixer/layer0/lambda_mean/slot") for k in metrics)
-        assert any(k.startswith("mixer/layer0/lambda_std/slot") for k in metrics)
-        assert "mixer/layer0/erase_strength" in metrics
-        # and turned off afterwards
-        assert not module.model.gated_delta_layers()[0].collect_stats
 
     def test_overwrite_logs_class_and_distance_keys(self, fitted_overwrite):
         trainer, module = fitted_overwrite
