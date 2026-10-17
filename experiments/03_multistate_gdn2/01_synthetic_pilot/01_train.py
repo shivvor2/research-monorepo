@@ -51,10 +51,8 @@ from research_lib.training.callbacks import (
     param_counts,
 )
 from research_lib.training.configs import ScheduleConfig
-from research_lib.training.modules import (
-    SyntheticRecallModule,
-    build_weight_decay_configs,
-)
+from research_lib.training.modules import SyntheticRecallModule
+from research_lib.training.presets import build_weight_decay_configs
 from research_lib.training.scheduling import WarmupStableDecaySchedule
 
 logger = logging.getLogger(__name__)

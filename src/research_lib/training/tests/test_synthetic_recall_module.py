@@ -18,11 +18,9 @@ from research_lib.data.synthetic import (
     generate_overwrite,
 )
 from research_lib.training.configs import ScheduleConfig
-from research_lib.training.modules.synthetic_recall import (
-    SyntheticRecallModule,
-    build_weight_decay_configs,
-)
+from research_lib.training.modules.synthetic_recall import SyntheticRecallModule
 from research_lib.training.param_utils import partition_parameters_with_names
+from research_lib.training.presets import build_weight_decay_configs
 from research_lib.training.scheduling import WarmupStableDecaySchedule
 
 # ---------------------------------------------------------------------------
@@ -237,56 +235,6 @@ class TestWeightDecayGroups:
         matrix_opt, vector_opt = optimizers
         assert matrix_opt.defaults["weight_decay"] == 0.1
         assert vector_opt.defaults["weight_decay"] == 0.0
-
-
-class TestDecayScheme:
-    """The weight-decay schemes: grouped (default) vs uniform (Zoology)."""
-
-    def test_uniform_decays_every_parameter(self):
-        """With decay_scheme='uniform', every parameter's group has wd 0.1.
-
-        Zoology's setup decays everything; under 'uniform' the vector
-        group (embeddings, head, norms, biases, A_log/dt_bias, lambda
-        mixer, conv filters) carries the same 0.1 as the matrix group.
-        """
-        import lightning as L
-
-        module = make_module(layout="ws", decay_scheme="uniform")
-        dm = make_datamodule("mqar", batch_size=8)
-        trainer = L.Trainer(
-            max_steps=1,
-            accelerator="cpu",
-            logger=False,
-            enable_progress_bar=False,
-            num_sanity_val_steps=0,
-            limit_val_batches=0,
-        )
-        trainer.fit(module, datamodule=dm)
-
-        seen = []
-        for opt in module.optimizers():
-            assert opt.defaults["weight_decay"] == pytest.approx(0.1)
-            for group in opt.param_groups:
-                assert group["weight_decay"] == pytest.approx(0.1)
-                seen.extend(group["params"])
-        # Every model parameter sits in exactly one decayed group.
-        params = list(module.model.parameters())
-        assert len(seen) == len(params)
-        assert {id(p) for p in seen} == {id(p) for p in params}
-
-    def test_factory_grouped_default(self):
-        """The factory's default scheme exempts the vector group."""
-        matrix_config, vector_config = build_weight_decay_configs(
-            "grouped", weight_decay=0.1, betas=(0.9, 0.95)
-        )
-        assert matrix_config.optimizer_kwargs["weight_decay"] == 0.1
-        assert vector_config.optimizer_kwargs["weight_decay"] == 0.0
-        assert matrix_config.optimizer_kwargs["betas"] == (0.9, 0.95)
-        assert vector_config.optimizer_kwargs["betas"] == (0.9, 0.95)
-
-    def test_invalid_scheme_rejected(self):
-        with pytest.raises(ValueError):
-            build_weight_decay_configs("sparse")
 
 
 class TestCosineSchedule:

@@ -58,10 +58,9 @@ Example:
 """
 
 from .dual_optimizer import DualOptimizerModule
-from .synthetic_recall import SyntheticRecallModule, build_weight_decay_configs
+from .synthetic_recall import SyntheticRecallModule
 
 __all__ = [
     "DualOptimizerModule",
     "SyntheticRecallModule",
-    "build_weight_decay_configs",
 ]
