@@ -76,8 +76,9 @@ def _row(tier, task, layout, gate, seed, acc, **extra):
         "tier": tier,
         "decay_scheme": extra.get("decay_scheme", "grouped"),
         "steps_completed": 100,
-        "best_val_acc": acc,
-        "stopped": False,
+        "best_value": acc,
+        "best_step": 100,
+        "status": "test_done",
         "test/acc": acc,
         "test/acc/slice=32": acc,
         PRIMARY: acc,
@@ -305,13 +306,23 @@ class TestRenderSummary:
         distance = analyze.analyze_distance(table)
         anchors = analyze.analyze_anchors(table)
         missing = analyze.analyze_missing_runs(table)
+        incomplete = analyze.analyze_incomplete(table)
         summary = analyze.render_summary(
-            primary, r1, long_t, cells, predictions, distance, anchors, missing
+            primary,
+            r1,
+            long_t,
+            cells,
+            predictions,
+            distance,
+            anchors,
+            missing,
+            incomplete,
         )
         assert "## Primary endpoint" in summary
         assert "### Under uniform weight decay (tier R1)" in summary
         assert "## Long-sequence tier" in summary
         assert "## Write distance" in summary
+        assert "## Incomplete runs" in summary
         # The R1 table carries n_seeds, mean and CI columns.
         assert "n_seeds" in summary
         assert "ci_low" in summary
@@ -331,3 +342,25 @@ class TestRenderSummary:
             assert record["mean"] == pytest.approx(
                 CORE_ACC[record["layout"]][record["gate_mode"]]
             )
+
+
+class TestIncompleteRuns:
+    """The missing-run report separates incomplete runs by status."""
+
+    def test_incomplete_runs_listed_with_status(self, table):
+        # One core-tier run is "interrupted": it is listed with its
+        # status, and the tier's complete count drops by one (59 of 60).
+        table = table.copy()
+        table.loc[table.index[0], "status"] = "interrupted"
+        incomplete = analyze.analyze_incomplete(table)
+        assert len(incomplete) == 1
+        assert set(incomplete["status"]) == {"interrupted"}
+        assert incomplete.iloc[0]["run_id"] == table.iloc[0]["run_id"]
+        missing = analyze.analyze_missing_runs(table)
+        tier = table.iloc[0]["tier"]
+        row = missing[missing["tier"] == tier].iloc[0]
+        assert row["observed"] == 59
+        assert row["missing"] == row["expected"] - 59
+
+    def test_complete_fixture_has_no_incomplete_runs(self, table):
+        assert analyze.analyze_incomplete(table).empty

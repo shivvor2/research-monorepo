@@ -99,8 +99,9 @@ def load_runs(runs_dir: Path) -> pd.DataFrame:
             "tier": (cfg.get("experiment") or {}).get("tier"),
             "phase": (cfg.get("experiment") or {}).get("phase"),
             "steps_completed": (summary.get("timing") or {}).get("steps_completed"),
-            "best_val_acc": (summary.get("stopping") or {}).get("best_val_acc"),
-            "stopped": (summary.get("stopping") or {}).get("stopped"),
+            "best_value": (summary.get("stopping") or {}).get("best_value"),
+            "best_step": (summary.get("stopping") or {}).get("best_step"),
+            "status": summary.get("status"),
             # The weight-decay scheme (grouped | uniform). Prefer the
             # top-level field recorded by the run JSON; fall back to the
             # config (None = recorded before the scheme switch = grouped).
@@ -512,8 +513,15 @@ def analyze_mixer_stats(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def analyze_missing_runs(table: pd.DataFrame) -> pd.DataFrame:
-    """Missing runs per tier against the protocol's expected counts."""
+    """Missing runs per tier against the protocol's expected counts.
+
+    Only complete runs (``status == "test_done"``) count as observed; a
+    run whose status is anything else is listed by
+    :func:`analyze_incomplete` instead.
+    """
     records = []
+    if "status" in table.columns:
+        table = table[table["status"].fillna("unknown") == "test_done"]
     observed = table.groupby("tier")["run_id"].count()
     for tier, expected in EXPECTED_RUNS.items():
         got = int(observed.get(tier, 0))
@@ -531,6 +539,18 @@ def analyze_missing_runs(table: pd.DataFrame) -> pd.DataFrame:
                 {"tier": tier, "expected": None, "observed": got, "missing": None}
             )
     return pd.DataFrame(records)
+
+
+def analyze_incomplete(table: pd.DataFrame) -> pd.DataFrame:
+    """Runs whose status is not 'test_done', with their status."""
+    if "status" not in table.columns:
+        return pd.DataFrame()
+    incomplete = table[table["status"].fillna("unknown") != "test_done"]
+    if incomplete.empty:
+        return pd.DataFrame()
+    return incomplete[
+        ["run_id", "task", "tier", "layout", "gate_mode", "seed", "status"]
+    ].sort_values(["tier", "run_id"])
 
 
 def analyze_distance(table: pd.DataFrame) -> pd.DataFrame:
@@ -605,6 +625,7 @@ def render_summary(
     distance: pd.DataFrame,
     anchors: pd.DataFrame,
     missing: pd.DataFrame,
+    incomplete: pd.DataFrame,
 ) -> str:
     lines = ["# Synthetic pilot analysis", ""]
     lines.append("## Primary endpoint (core tier, overwrite, distant, K = 2 d_k)")
@@ -644,6 +665,10 @@ def render_summary(
     lines.append("## Missing runs per tier")
     lines.append("")
     lines.append(_markdown_table(missing))
+    lines.append("")
+    lines.append("## Incomplete runs (status is not test_done)")
+    lines.append("")
+    lines.append(_markdown_table(incomplete))
     lines.append("")
     lines.append("## Notes and limitations")
     lines.append("")
@@ -693,6 +718,7 @@ def main() -> None:
     anchors = analyze_anchors(table)
     mixer = analyze_mixer_stats(table)
     missing = analyze_missing_runs(table)
+    incomplete = analyze_incomplete(table)
 
     primary.to_csv(out_dir / "primary_endpoint.csv", index=False)
     r1.to_csv(out_dir / "r1_primary_endpoint.csv", index=False)
@@ -703,8 +729,9 @@ def main() -> None:
     anchors.to_csv(out_dir / "anchors.csv", index=False)
     mixer.to_csv(out_dir / "mixer_stats.csv", index=False)
     missing.to_csv(out_dir / "missing_runs.csv", index=False)
+    incomplete.to_csv(out_dir / "incomplete_runs.csv", index=False)
     summary = render_summary(
-        primary, r1, long_t, cells, predictions, distance, anchors, missing
+        primary, r1, long_t, cells, predictions, distance, anchors, missing, incomplete
     )
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")
     logger.info("Wrote analysis to %s", out_dir)

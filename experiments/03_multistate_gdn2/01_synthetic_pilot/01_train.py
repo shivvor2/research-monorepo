@@ -43,7 +43,13 @@ from research_lib.data.synthetic import (
     OverwriteConfig,
     SyntheticRecallDataModule,
 )
-from research_lib.training.callbacks import RunSummaryCallback
+from research_lib.training.callbacks import (
+    Collector,
+    RunSummaryCallback,
+    Stage,
+    metrics_by_prefix,
+    param_counts,
+)
 from research_lib.training.configs import ScheduleConfig
 from research_lib.training.modules import (
     SyntheticRecallModule,
@@ -353,6 +359,18 @@ def make_run_id(cfg: DictConfig, lr: float) -> str:
     return run_id
 
 
+def state_bytes_collector(trainer, pl_module):
+    """Recurrent-state bytes of one gated-delta layer, in fp32."""
+
+    def fn(trainer, pl_module):
+        layers = pl_module.model.gated_delta_layers()
+        if not layers:
+            return {}
+        return {"bytes_per_mixer": layers[0].state_bytes_per_mixer()}
+
+    return fn
+
+
 def create_callbacks(cfg: DictConfig, run_id: str) -> list:
     """Early stopping (99% answer accuracy), the run summary, LR logging."""
     callbacks = [
@@ -363,9 +381,26 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
             patience=10**9,
         ),
         RunSummaryCallback(
-            runs_dir=Path(cfg.output.runs_dir),
-            run_id=run_id,
-            config=OmegaConf.to_container(cfg, resolve=True),
+            Path(cfg.output.runs_dir),
+            run_id,
+            OmegaConf.to_container(cfg, resolve=True),
+            # Distribution names of the packages this script imports.
+            packages=("torch", "lightning", "hydra-core", "omegaconf"),
+            monitor="val/acc",
+            mode="max",
+            collectors=(
+                Collector(
+                    "params",
+                    param_counts({"lambda": ["lambda_mixer"]}),
+                    Stage.FIT_START,
+                ),
+                Collector("state", state_bytes_collector(), Stage.FIT_START),
+                Collector("val_final", metrics_by_prefix("val"), Stage.FIT_END),
+                Collector(
+                    "mixer_stats_final", metrics_by_prefix("mixer"), Stage.FIT_END
+                ),
+                Collector("test", metrics_by_prefix("test"), Stage.TEST_END),
+            ),
             extra={
                 "lr_resolved": lr_resolved.get("value"),
                 # Also recorded via the config; kept top-level so analyses
