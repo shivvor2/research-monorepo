@@ -468,14 +468,32 @@ class RunSummaryCallback(L.Callback):
         }
 
     def _update_stopping(self, trainer: L.Trainer) -> None:
-        """Early-stopping flag and the best monitored value / step."""
-        early_stopped = False
-        for cb in trainer.callbacks:
-            if isinstance(cb, EarlyStopping):
-                early_stopped = getattr(cb, "stopping_reason", None) is not None
-                break
+        """Early-stopping flag and the best monitored value / step.
+
+        ``early_stopped`` is ``True`` / ``False``, or ``None`` when the
+        ``EarlyStopping`` callback does not expose a ``stopping_reason``
+        (unknown). The reason is compared **by name**: current Lightning
+        initialises ``stopping_reason`` to ``EarlyStoppingReason
+        .NOT_STOPPED``, which is never ``None``, so a ``None`` check
+        would record every run as early-stopped.
+        """
+        stopping_cb = next(
+            (cb for cb in trainer.callbacks if isinstance(cb, EarlyStopping)), None
+        )
+        if stopping_cb is None:
+            early_stopped = False
+            reason_name = None
+        else:
+            reason = getattr(stopping_cb, "stopping_reason", None)
+            if reason is None:  # a Lightning without stopping_reason
+                early_stopped = None
+                reason_name = None
+            else:
+                reason_name = getattr(reason, "name", str(reason))
+                early_stopped = reason_name != "NOT_STOPPED"
         self.summary["stopping"] = {
             "early_stopped": early_stopped,
+            "early_stop_reason": reason_name,
             "monitor": self.monitor,
             "mode": self.mode,
             "best_value": self._best_value,

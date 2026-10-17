@@ -12,6 +12,7 @@ from typing import Any, cast
 import lightning as L
 import pytest
 import torch
+from lightning.pytorch.callbacks import EarlyStopping
 
 from research_lib.architectures.config import ZoologyLMConfig
 from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
@@ -642,6 +643,52 @@ class TestStatus:
         seg2 = read(tmp_path, "resume-best")
         assert seg2["stopping"]["best_value"] == 9.0  # max over both segments
         assert seg2["stopping"]["best_step"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Early-stopping flag (current Lightning initialises stopping_reason to
+# EarlyStoppingReason.NOT_STOPPED, so a None check marks every run stopped)
+# ---------------------------------------------------------------------------
+
+
+class TestEarlyStoppingFlag:
+    def _fit(self, tmp_path, run_id, early_stopping, module=None):
+        cb = RunSummaryCallback(tmp_path, run_id, tiny_config_dict(), strict=True)
+        trainer = make_trainer([cb, early_stopping], val_check_interval=1)
+        trainer.fit(
+            module or DecreasingVal(),
+            train_dataloaders=make_loader(),
+            val_dataloaders=make_loader(),
+        )
+        return read(tmp_path, run_id)
+
+    def test_unreachable_threshold_records_not_stopped(self, tmp_path):
+        es = EarlyStopping(
+            monitor="val/acc", mode="max", stopping_threshold=99.0, patience=10**9
+        )
+        summary = self._fit(tmp_path, "es-no", es)
+        assert summary["stopping"]["early_stopped"] is False
+        assert summary["stopping"]["early_stop_reason"] == "NOT_STOPPED"
+
+    def test_threshold_reached_records_stopping_threshold(self, tmp_path):
+        # DecreasingVal logs val/acc = 10 - step >= 9: the threshold is
+        # reached on the first validation and the fit stops there.
+        es = EarlyStopping(
+            monitor="val/acc", mode="max", stopping_threshold=1.0, patience=10**9
+        )
+        summary = self._fit(tmp_path, "es-yes", es)
+        assert summary["stopping"]["early_stopped"] is True
+        assert summary["stopping"]["early_stop_reason"] == "STOPPING_THRESHOLD"
+
+    def test_callback_without_stopping_reason_records_unknown(self, tmp_path):
+        cb = RunSummaryCallback(tmp_path, "es-old", tiny_config_dict(), strict=True)
+        es = EarlyStopping(
+            monitor="val/acc", mode="max", stopping_threshold=99.0, patience=10**9
+        )
+        del es.stopping_reason  # a Lightning without the attribute
+        cb._update_stopping(cast(Any, SimpleNamespace(callbacks=[es])))
+        assert cb.summary["stopping"]["early_stopped"] is None
+        assert cb.summary["stopping"]["early_stop_reason"] is None
 
 
 # ---------------------------------------------------------------------------
