@@ -514,6 +514,42 @@ class TestD11WriteDistanceMetrics:
         assert "acc/slice=8/dist=16-32" not in result
         assert "acc/slice=16/dist=0-16" not in result
 
+    def test_distances_below_the_first_edge_are_excluded(self):
+        """The bins are half-open ``[lo, hi)`` with the last running to
+        infinity: a distance below ``bins[0]`` is in no bin (the default
+        bins start at 0, so the pilot is unaffected)."""
+        T, V = 6, 8
+        labels = torch.full((1, T), -100, dtype=torch.long)
+        old_labels = torch.full((1, T), -100, dtype=torch.long)
+        key_class = torch.full((1, T), -1, dtype=torch.long)
+        write_distance = torch.full((1, T), -1, dtype=torch.long)
+        logits = torch.zeros(1, T, V, dtype=torch.float64)
+        # A leaked answer at distance 3: below the first edge (8).
+        labels[0, 3], old_labels[0, 3], key_class[0, 3] = 4, 5, 0
+        write_distance[0, 3] = 3
+        logits[0, 2, 5] = 10.0  # predicts the old label -> leaked
+        # A correct answer at distance 10: inside [8, 16).
+        labels[0, 5], old_labels[0, 5], key_class[0, 5] = 6, 7, 1
+        write_distance[0, 5] = 10
+        logits[0, 4, 6] = 10.0
+        batch = {
+            "input_ids": torch.zeros(1, T, dtype=torch.long),
+            "labels": labels,
+            "old_labels": old_labels,
+            "key_class": key_class,
+            "write_distance": write_distance,
+            "slice_id": torch.tensor([8], dtype=torch.long),
+        }
+        metrics = RecallMetrics(slice_values=(8,), distance_bins=(8, 16))
+        metrics.update(logits, batch)
+        result = metrics.compute()
+        # Only the distance-10 answer is in the bin; the distance-3
+        # answer is not counted in bin 0 (it would drag acc to 0.5).
+        assert result["acc/dist=8-16"] == pytest.approx(1.0)
+        assert result["leak/dist=8-16"] == pytest.approx(0.0)
+        assert result["acc/slice=8/dist=8-16"] == pytest.approx(1.0)
+        assert result["leak/slice=8/dist=8-16"] == pytest.approx(0.0)
+
     def test_overall_accuracy_unchanged_by_distance_bins(self):
         batch, logits = self._hand_batch()
         with_distance = RecallMetrics(slice_values=(8, 16))

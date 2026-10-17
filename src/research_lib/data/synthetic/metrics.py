@@ -125,7 +125,8 @@ class RecallMetrics:
         distance_bins: bin edges for the write-distance metrics (the token
             distance between a key's two writes, from ``batch[
             "write_distance"]``, only overwritten keys), as half-open
-            ``[lo, hi)`` bins with the last running to infinity.
+            ``[lo, hi)`` bins with the last running to infinity; a
+            distance below the first edge is in no bin.
             ``DEFAULT_DISTANCE_BINS`` = ``(0, 16, 32, 64, 128, 256, inf)``
             by default; ``None`` disables the distance metrics. Batches
             without ``write_distance`` (MQAR) never accumulate them.
@@ -282,7 +283,12 @@ class RecallMetrics:
                 )
                 self._has_distance_batches = True
             distances = batch["write_distance"].to(device)[:, 1:]
-            valid = (distances >= 0) & mask & known
+            # A distance below the first edge is in no bin ([lo, hi) bins,
+            # the last running to infinity). bins[0] >= 0 is validated at
+            # construction, so this subsumes the >= 0 check; it compares
+            # against a Python scalar, so update() stays free of host
+            # synchronization.
+            valid = (distances >= bins[0]) & mask & known
             bin_idx = torch.zeros_like(distances)
             for edge in bins[1:-1]:
                 bin_idx += (distances >= edge).to(bin_idx.dtype)
