@@ -1,0 +1,18 @@
+# @package _global_
+# Tier 4 lambda controls (prediction 4): lambda {static, lin} x gate
+# full x layout {ws, ll} x seeds 0-4, both tasks. 40 runs.
+# Run: python 01_train.py +sweep=tier4_lambda --multirun
+
+experiment:
+  phase: 2
+  tier: tier4_lambda
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mqar,overwrite
+      model.gate_mode: full
+      model.layout: ws,ll
+      model.lambda_mode: static,lin
+      seed: range(0,5)

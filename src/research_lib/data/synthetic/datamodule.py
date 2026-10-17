@@ -9,12 +9,14 @@ functions of a seed).
   batches (dicts of stacked int64 tensors). Batch ``i`` is generated from
   ``np.random.SeedSequence([train_seed, i])``, so the stream is
   deterministic per ``(train_seed, batch index)`` and independent of the
-  worker count: worker ``w`` produces the batches ``w, w + num_workers, ...``
-  (each batch index exactly once, never duplicated). Under DDP (world size
-  ``W``, rank ``r``), the same holds per rank over the LOCAL index: worker
-  ``w`` of rank ``r`` yields the global indices ``(local) * W + r`` with
-  ``local = w, w + num_workers, ...``, so the ranks' global indices are
-  disjoint and together cover the stream in lockstep.
+  worker count: worker ``w`` of rank ``r`` yields the stream positions
+  ``n + w, n + w + num_workers, ...`` starting at the rank's next local
+  index ``n`` (at a fresh start ``n = 0`` this is the classic ``w, w +
+  num_workers, ...`` sharding), and the GLOBAL batch index of a local
+  index is ``(local) * world_size + rank``, so the ranks' global indices
+  are disjoint and together cover the stream in lockstep, and after a
+  resume the fetch order continues the stream exactly (next, next+1,
+  ..., for any worker count).
 - **Validation / test:** generated once in :meth:`setup`:
   ``num_val_per_slice`` / ``num_test_per_slice`` examples per slice value
   (``D`` for MQAR, ``K`` for overwrite), concatenated into one fixed set,
@@ -97,14 +99,15 @@ class _SyntheticTrainDataset(IterableDataset):
     (via :func:`_batch_seed`) and carries its global batch index in the
     ``"batch_index"`` key (int64 scalar tensor). The dataset keeps a
     per-rank LOCAL counter ``next_local_idx``; worker ``w`` of
-    ``num_workers`` produces the local indices ``w', w' + num_workers, ...``
-    where ``w'`` is the smallest local index ``>= next_local_idx``
-    congruent to ``w (mod num_workers)``, and the GLOBAL batch index of a
-    local index is ``local * world_size + rank`` (world size / rank from
+    ``num_workers`` yields the local indices ``next_local_idx + w +
+    k * num_workers`` (at a fresh start: ``w, w + num_workers, ...``, the
+    same as owning the indices ≡ ``w (mod num_workers)``), so after a
+    resume the DataLoader's fetch order continues the stream exactly —
+    next, next+1, … — and every batch's content depends only on its
+    global index ``local * world_size + rank`` (world size / rank from
     :func:`_distributed_world_size_and_rank`, i.e. 1 / 0 without a process
     group, so global == local in single-process runs). No (rank, worker)
-    pair ever produces the same global index twice and every batch's
-    content depends only on its global index.
+    pair ever produces the same global index twice.
     """
 
     def __init__(
@@ -143,10 +146,19 @@ class _SyntheticTrainDataset(IterableDataset):
         info = torch.utils.data.get_worker_info()
         worker_id = info.id if info is not None else 0
         num_workers = info.num_workers if info is not None else 1
-        # Worker w owns local indices ≡ w (mod num_workers); start at the
-        # smallest owned index >= next_local_idx. The global batch index of
-        # a local index is local * world_size + rank.
-        local = self.next_local_idx + ((worker_id - self.next_local_idx) % num_workers)
+        # Worker w yields the stream positions next_local_idx + w + k*W.
+        # At a fresh start (next_local_idx == 0) this is exactly "worker w
+        # owns the local indices ≡ w (mod W)", as before.  After a resume it
+        # also aligns the DataLoader's round-robin (worker 0's batch is
+        # fetched first) with the stream position, so the consumed global
+        # batch sequence continues in exact order - next, next+1, ... -
+        # with no replay and no skip, for any worker count and world size
+        # (with the previous "smallest owned index >= next_local_idx" start,
+        # a resume at a position not divisible by num_workers would fetch
+        # the batches in a rotated order and skip one index per rotation;
+        # the contents per index are unchanged either way). The global
+        # batch index of a local index is local * world_size + rank.
+        local = self.next_local_idx + worker_id
         while True:
             batch = self.generate_batch(local * world_size + rank)
             if info is None:

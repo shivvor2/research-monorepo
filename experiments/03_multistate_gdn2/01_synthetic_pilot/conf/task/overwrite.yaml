@@ -1,0 +1,22 @@
+# Repeated-key overwrite task (protocol §4).
+#
+# K distinct keys; each key gets a placement class (same / adjacent /
+# distant / single, 1/4 each); two-token writes live in the region before
+# the final 2K query block; target = the latest value; filler excludes
+# this sequence's keys and values. Loss on answer positions only.
+
+name: overwrite
+vocab_size: 8192
+seq_len: 256
+num_keys: [8, 16, 32]              # K drawn per example (slices)
+class_probs: [0.25, 0.25, 0.25, 0.25]
+block_size: 16                      # B = C (D13)
+distant_min_blocks: 4
+max_placement_attempts: 100
+
+# Longest sequence the model will see on this task.
+max_seq_len: 256
+
+# Held-out evaluation seeds (must differ from train seed = run seed).
+val_seed: 1000003
+test_seed: 2000003

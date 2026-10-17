@@ -1,0 +1,26 @@
+# @package _global_
+# Tier R1: uniform weight decay (robustness of the Delta_int grid).
+#
+# Zoology's train.py applies weight decay to every parameter; the pilot's
+# default "grouped" scheme exempts the vector group (embeddings, LM head,
+# norms, biases, conv filters, A_log/dt_bias, lambda_mixer) because decay
+# would pull lambda away from its lambda = 1 anchor. R1 re-runs the core
+# overwrite grid under the uniform scheme, so any interaction between the
+# decay grouping and Delta_int shows up as a scheme x layout effect.
+# 30 runs: gate {kda, full} x layout {single, ws, ll} x seeds 0-4.
+#
+# Run: python 01_train.py +sweep=tier_R1_uniform_decay --multirun
+
+experiment:
+  phase: 2
+  tier: R1
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: overwrite
+      optimizer.decay_scheme: uniform
+      model.gate_mode: kda,full
+      model.layout: single,ws,ll
+      seed: range(0,5)

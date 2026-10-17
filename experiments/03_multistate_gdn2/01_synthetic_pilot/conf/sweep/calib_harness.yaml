@@ -1,0 +1,23 @@
+# @package _global_
+# Phase 1 calibration: harness switches (protocol §10 rule 3).
+# single-state `gdn` with the default harness (zoology pattern) vs
+# mixer_x2, selection seeds 100-101. Keep the default unless it lands
+# far outside the Log-Linear Table 2 range.
+# Run: python 01_train.py +sweep=calib_harness --multirun
+
+experiment:
+  phase: 1
+  tier: calib_harness
+
+optimizer:
+  lr: 0.003
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mqar
+      model.gate_mode: gdn
+      model.layout: single
+      model.layer_pattern: zoology,mixer_x2
+      seed: range(100,102)

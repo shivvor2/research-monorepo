@@ -1,0 +1,6 @@
+# @package _global_
+# Anchor dimension override: d = 32, 2 heads.
+
+model:
+  d_model: 32
+  num_heads: 2

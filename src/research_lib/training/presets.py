@@ -32,9 +32,11 @@ See Also:
 
 from __future__ import annotations
 
-from typing import Tuple
+from enum import Enum
+from typing import Tuple, Type
 
 import torch.optim
+from torch.optim import Optimizer
 
 from .configs import OptimizerConfig, ScheduleConfig
 from .scheduling import WarmupStableDecaySchedule
@@ -200,3 +202,61 @@ def default_sgd_config(
     )
 
     return optimizer_config, schedule_config
+
+
+class DecayScheme(str, Enum):
+    """Which parameter groups carry weight decay.
+
+    - ``GROUPED``: the matrix group (e.g. the 2-D linear weights) only.
+    - ``UNIFORM``: every parameter in both groups.
+    """
+
+    GROUPED = "grouped"
+    UNIFORM = "uniform"
+
+
+def build_weight_decay_configs(
+    decay_scheme: DecayScheme | str = DecayScheme.GROUPED,
+    *,
+    weight_decay: float = 0.1,
+    betas: Tuple[float, ...] = (0.9, 0.95),
+    optimizer_class: Type[Optimizer] = torch.optim.AdamW,
+) -> Tuple[OptimizerConfig, OptimizerConfig]:
+    """The two optimizer configs of a weight-decay scheme.
+
+    Both groups use the same optimizer class and betas; the LR is 0 at
+    construction (the schedule sets the peak for step 0).
+
+    This builder only sets the two groups' hyperparameters. Which
+    parameters land in which group is decided by the
+    ``matrix_target_modules`` / ``vector_target_modules`` patterns given
+    to :class:`~research_lib.training.modules.DualOptimizerModule`,
+    which the experiment owns.
+
+    Args:
+        decay_scheme: ``"grouped"`` (default) — ``weight_decay`` applies
+            to the matrix group only; the vector group (whatever the
+            experiment's patterns route there) is exempt.
+            ``"uniform"`` — ``weight_decay`` applies to every parameter
+            in both groups. The enum member or its string value (Hydra
+            passes strings); anything else fails with a ``ValueError``.
+        weight_decay: The matrix group's weight decay (the vector group's
+            value under ``uniform``).
+        betas: Adam betas for both groups.
+        optimizer_class: The optimizer class for both groups.
+
+    Returns:
+        Tuple: ``(matrix_optimizer_config, vector_optimizer_config)``.
+    """
+    decay_scheme = DecayScheme(decay_scheme)
+    betas = tuple(betas)
+    vector_weight_decay = weight_decay if decay_scheme is DecayScheme.UNIFORM else 0.0
+    matrix_optimizer_config = OptimizerConfig(
+        optimizer_class,
+        {"lr": 0.0, "weight_decay": weight_decay, "betas": betas},
+    )
+    vector_optimizer_config = OptimizerConfig(
+        optimizer_class,
+        {"lr": 0.0, "weight_decay": vector_weight_decay, "betas": betas},
+    )
+    return matrix_optimizer_config, vector_optimizer_config

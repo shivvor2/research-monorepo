@@ -8,12 +8,15 @@ from research_lib.training.configs import (
     ScheduleConfig,
     build_optimizer,
 )
+from research_lib.training.modules import DualOptimizerModule
 from research_lib.training.presets import (
+    DecayScheme,
+    build_weight_decay_configs,
     default_adamw_config,
     default_muon_config,
     default_sgd_config,
 )
-from research_lib.training.scheduling import ParamScheduler
+from research_lib.training.scheduling import ParamScheduler, WarmupStableDecaySchedule
 
 # =============================================================================
 # default_adamw_config Tests
@@ -213,3 +216,109 @@ class TestDefaultSGDConfig:
         model = torch.nn.Linear(10, 10)
         optimizer = build_optimizer(opt_config, model.parameters())
         assert isinstance(optimizer, torch.optim.SGD)
+
+
+class TestBuildWeightDecayConfigs:
+    """The weight-decay schemes: grouped (default) vs uniform."""
+
+    def test_factory_grouped_default(self):
+        """The default scheme exempts the vector group."""
+        matrix_config, vector_config = build_weight_decay_configs(
+            DecayScheme.GROUPED, weight_decay=0.1, betas=(0.9, 0.95)
+        )
+        assert matrix_config.optimizer_kwargs["weight_decay"] == 0.1
+        assert vector_config.optimizer_kwargs["weight_decay"] == 0.0
+        assert matrix_config.optimizer_kwargs["betas"] == (0.9, 0.95)
+        assert vector_config.optimizer_kwargs["betas"] == (0.9, 0.95)
+
+    def test_omitted_scheme_defaults_to_grouped(self):
+        """``decay_scheme`` is optional; the default is ``"grouped"``."""
+        matrix_config, vector_config = build_weight_decay_configs()
+        assert matrix_config.optimizer_kwargs["weight_decay"] == 0.1
+        assert vector_config.optimizer_kwargs["weight_decay"] == 0.0
+
+    def test_string_values_accepted(self):
+        """The enum's string values work too (Hydra passes strings)."""
+        _, vector_config = build_weight_decay_configs("grouped")
+        assert vector_config.optimizer_kwargs["weight_decay"] == 0.0
+        _, vector_config = build_weight_decay_configs("uniform")
+        assert vector_config.optimizer_kwargs["weight_decay"] == 0.1
+
+    def test_invalid_scheme_rejected(self):
+        with pytest.raises(ValueError):
+            build_weight_decay_configs("sparse")
+
+    def test_uniform_decays_every_parameter(self):
+        """With decay_scheme='uniform', every parameter's group has wd 0.1.
+
+        The builder only sets the groups' hyperparameters; the partition
+        comes from the target-module patterns (here: 'norm' -> vector).
+        Under uniform both groups carry the same weight decay.
+        """
+        import lightning as L
+
+        matrix_config, vector_config = build_weight_decay_configs(
+            "uniform", weight_decay=0.1
+        )
+
+        class _Wrap(torch.nn.Module):
+            """Ignores the extra batch keys the module's forward passes."""
+
+            def __init__(self):
+                super().__init__()
+                self.net = torch.nn.Linear(4, 4)
+                # Named 'norm' so the vector pattern "norm" matches it
+                # (PEFT-style component matching on parameter names).
+                self.norm = torch.nn.LayerNorm(4)
+
+            def forward(self, input_ids, **kwargs):
+                return self.norm(self.net(input_ids))
+
+        model = _Wrap()
+        schedule = ScheduleConfig(
+            global_schedules=[
+                WarmupStableDecaySchedule(
+                    param_name="lr",
+                    warmup_frac=0.0,
+                    cooldown_frac=1.0,
+                    min_value=0.0,
+                    max_value=1e-3,
+                    decay_type="cosine",
+                )
+            ]
+        )
+        module = DualOptimizerModule(
+            model=model,
+            matrix_optimizer_config=matrix_config,
+            vector_optimizer_config=vector_config,
+            matrix_schedule_config=schedule,
+            vector_schedule_config=schedule,
+            vector_target_modules=["norm"],
+        )
+        loader = torch.utils.data.DataLoader(
+            [
+                {
+                    "input_ids": torch.zeros(2, 3, 4),
+                    "labels": torch.zeros(2, 3, dtype=torch.long),
+                }
+            ],
+            batch_size=None,
+        )
+        trainer = L.Trainer(
+            max_steps=1,
+            accelerator="cpu",
+            logger=False,
+            enable_progress_bar=False,
+            num_sanity_val_steps=0,
+        )
+        trainer.fit(module, train_dataloaders=loader)
+
+        seen = []
+        for opt in module.optimizers():
+            for group in opt.param_groups:
+                assert group["weight_decay"] == pytest.approx(0.1)
+                seen.extend(group["params"])
+        # Every model parameter sits in exactly one decayed group.
+        params = list(model.parameters())
+        assert len(seen) == len(params)
+        assert {id(p) for p in seen} == {id(p) for p in params}

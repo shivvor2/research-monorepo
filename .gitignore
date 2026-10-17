@@ -15,6 +15,11 @@ results
 logs/*
 checkpoints/*
 
+# Experiment run outputs (run JSONs, analysis, hydra multirun)
+**/runs/
+**/multirun/
+**/analysis/
+
 
 # Training Data
 data/*

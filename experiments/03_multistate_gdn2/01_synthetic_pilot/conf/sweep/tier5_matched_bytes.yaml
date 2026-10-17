@@ -1,0 +1,19 @@
+# @package _global_
+# Tier 5 matched bytes (flag 5): single-state full with the value dim
+# expanded to the 10 multi-state slots (expand_v = 10 = W + 2 ws slots
+# = ll slots at T = 256). Seeds 0-4, both tasks. 10 runs.
+# Run: python 01_train.py +sweep=tier5_matched_bytes --multirun
+
+experiment:
+  phase: 2
+  tier: tier5_matched_bytes
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mqar,overwrite
+      model.gate_mode: full
+      model.layout: single
+      model.expand_v: 10
+      seed: range(0,5)

@@ -298,9 +298,11 @@ def test_D08_batch_index_ignored_by_loss():
 
 
 def test_D08_resume_sharded_with_workers():
-    """Resuming mid-stream with workers: worker w starts at the smallest owned
-    index >= the saved position; the union over workers covers exactly the
-    indices >= the saved position, each once."""
+    """Resuming mid-stream with workers: worker w yields the stream positions
+    saved + w + k*W, so the DataLoader's round-robin fetch order (worker 0
+    first) continues the stream exactly — saved, saved+1, ... — and the
+    union over workers covers exactly the indices >= the saved position,
+    each once."""
     num_workers = 2
     saved = 5
     produced = {}
@@ -314,10 +316,9 @@ def test_D08_resume_sharded_with_workers():
             return_value=SimpleNamespace(id=worker_id, num_workers=num_workers),
         ):
             worker_batches = _take(iter(dataset), 3)
-        # Worker w owns indices ≡ w (mod num_workers), starting at the
-        # smallest owned index >= saved.
-        start = saved + ((worker_id - saved) % num_workers)
-        indices = [start + num_workers * j for j in range(3)]
+        # Worker w yields positions saved + w + k*W (aligned with the
+        # DataLoader's fetch order after a resume).
+        indices = [saved + worker_id + num_workers * j for j in range(3)]
         for index, batch in zip(indices, worker_batches, strict=True):
             assert index not in produced, "batch index produced twice"
             assert index >= saved

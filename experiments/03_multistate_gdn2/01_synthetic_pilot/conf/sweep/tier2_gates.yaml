@@ -1,0 +1,18 @@
+# @package _global_
+# Tier 2 gate decomposition (prediction 1): b_only recovers most of
+# Delta_int, w_only little. gate {b_only, w_only} x layout {single, ws,
+# ll} x seeds 0-4, both tasks. 60 runs.
+# Run: python 01_train.py +sweep=tier2_gates --multirun
+
+experiment:
+  phase: 2
+  tier: tier2_gates
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mqar,overwrite
+      model.gate_mode: b_only,w_only
+      model.layout: single,ws,ll
+      seed: range(0,5)

@@ -1,0 +1,18 @@
+# @package _global_
+# Tier 1 core: the Delta_int grid (protocol §7).
+# gate {kda, full} x layout {single, ws, ll} x seeds 0-9, both tasks.
+# 120 runs. Requires phase 2 (frozen protocol).
+# Run: python 01_train.py +sweep=tier1_core --multirun
+
+experiment:
+  phase: 2
+  tier: tier1_core
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mqar,overwrite
+      model.gate_mode: kda,full
+      model.layout: single,ws,ll
+      seed: range(0,10)

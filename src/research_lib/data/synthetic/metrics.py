@@ -46,6 +46,7 @@ Python floats.
 from __future__ import annotations
 
 import logging
+import math
 from collections.abc import Sequence
 
 import torch
@@ -60,6 +61,11 @@ CLASS_NAMES: tuple[str, ...] = tuple(c.name.lower() for c in OverwriteClass)
 
 _NO_CLASS_BUCKET = 4
 """Column of the count tensor's class axis used when class metrics are off."""
+
+DEFAULT_DISTANCE_BINS: tuple[float, ...] = (0, 16, 32, 64, 128, 256, math.inf)
+"""Default bin edges for the write-distance metrics: the token distance
+between a key's two writes, binned half-open ``[lo, hi)`` (the last bin
+runs to infinity). Only overwritten keys carry a distance."""
 
 
 def answer_predictions(
@@ -116,9 +122,19 @@ class RecallMetrics:
             :meth:`compute`.
         with_classes: accumulate class-conditioned metrics. ``None``
             (default) auto-detects per batch from the ``key_class`` key.
+        distance_bins: bin edges for the write-distance metrics (the token
+            distance between a key's two writes, from ``batch[
+            "write_distance"]``, only overwritten keys), as half-open
+            ``[lo, hi)`` bins with the last running to infinity; a
+            distance below the first edge is in no bin.
+            ``DEFAULT_DISTANCE_BINS`` = ``(0, 16, 32, 64, 128, 256, inf)``
+            by default; ``None`` disables the distance metrics. Batches
+            without ``write_distance`` (MQAR) never accumulate them.
 
     Raises:
-        ValueError: empty ``slice_values``, negative or duplicate entries.
+        ValueError: empty ``slice_values``, negative or duplicate entries;
+            invalid ``distance_bins`` (fewer than two edges, non-increasing
+            or starting below zero).
 
     Example:
         >>> metrics = RecallMetrics(slice_values=(4, 8, 16))
@@ -133,6 +149,7 @@ class RecallMetrics:
         self,
         slice_values: Sequence[int],
         with_classes: bool | None = None,
+        distance_bins: Sequence[float] | None = DEFAULT_DISTANCE_BINS,
     ) -> None:
         values = tuple(slice_values)
         if not values:
@@ -150,6 +167,17 @@ class RecallMetrics:
         for row, value in enumerate(values):
             lookup[value] = row
         self._slice_row_lookup = lookup
+        if distance_bins is None:
+            self._distance_bins = None
+        else:
+            bins = tuple(float(b) for b in distance_bins)
+            if len(bins) < 2:
+                raise ValueError(f"distance_bins needs >= 2 edges, got {bins}")
+            if any(bins[i] >= bins[i + 1] for i in range(len(bins) - 1)):
+                raise ValueError(f"distance_bins must be increasing, got {bins}")
+            if bins[0] < 0:
+                raise ValueError(f"distance_bins must start >= 0, got {bins}")
+            self._distance_bins = bins
         self.reset()
 
     def reset(self) -> None:
@@ -160,7 +188,12 @@ class RecallMetrics:
         # of the first update; the unknown-slice counter is a scalar.
         self._counts: torch.Tensor | None = None
         self._unknown: torch.Tensor | None = None
+        # Write-distance counts, one more axis: (num_slices, num_bins, 3)
+        # for (answers, correct, leaked) per (slice, distance bin). Only
+        # accumulated for batches that carry ``write_distance``.
+        self._distance_counts: torch.Tensor | None = None
         self._has_class_batches = False
+        self._has_distance_batches = False
 
     # ------------------------------------------------------------------ #
     # Update (no host synchronization)
@@ -233,19 +266,57 @@ class RecallMetrics:
         flat.index_add_(0, idx * 3 + 1, (correct & known).reshape(-1).long())
         flat.index_add_(0, idx * 3 + 2, (leak & known).reshape(-1).long())
 
+        # Write-distance bins, one more axis: (num_slices, num_bins, 3),
+        # the same index_add_ mechanism over a combined flat index. Only
+        # batches that carry ``write_distance`` (overwrite) and only
+        # overwritten keys (single-class answers carry NO_DISTANCE = -1).
+        # The bin index counts the satisfied inner edges (comparisons
+        # against Python scalars), so update() creates no tensors and
+        # stays free of host synchronization (torch.tensor(..., device)
+        # or torch.bucketize with device-created boundaries would sync).
+        if self._distance_bins is not None and "write_distance" in batch:
+            bins = self._distance_bins
+            num_bins = len(bins) - 1
+            if self._distance_counts is None:
+                self._distance_counts = torch.zeros(
+                    (self._num_slices, num_bins, 3), dtype=torch.long, device=device
+                )
+                self._has_distance_batches = True
+            distances = batch["write_distance"].to(device)[:, 1:]
+            # A distance below the first edge is in no bin ([lo, hi) bins,
+            # the last running to infinity). bins[0] >= 0 is validated at
+            # construction, so this subsumes the >= 0 check; it compares
+            # against a Python scalar, so update() stays free of host
+            # synchronization.
+            valid = (distances >= bins[0]) & mask & known
+            bin_idx = torch.zeros_like(distances)
+            for edge in bins[1:-1]:
+                bin_idx += (distances >= edge).to(bin_idx.dtype)
+            dist_flat_idx = (row_pos * num_bins + bin_idx).reshape(-1) * 3
+            dist_flat = self._distance_counts.view(-1)
+            dist_flat.index_add_(0, dist_flat_idx + 0, valid.reshape(-1).long())
+            dist_flat.index_add_(
+                0, dist_flat_idx + 1, (correct & valid).reshape(-1).long()
+            )
+            dist_flat.index_add_(
+                0, dist_flat_idx + 2, (leak & valid).reshape(-1).long()
+            )
+
     # ------------------------------------------------------------------ #
     # Compute
     # ------------------------------------------------------------------ #
 
-    def _global_counts(self) -> tuple[torch.Tensor, torch.Tensor]:
-        """(counts, unknown) with a SUM all-reduce across ranks when a
-        distributed process group with world size > 1 is initialized.
+    def _global_counts(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+        """(counts, unknown, distance_counts) with a SUM all-reduce across
+        ranks when a distributed process group with world size > 1 is
+        initialized.
 
         Reduces clones, so the accumulator itself is unchanged and further
         updates / repeated compute() calls stay correct.
         """
         assert self._counts is not None and self._unknown is not None
         counts, unknown = self._counts, self._unknown
+        distance_counts = self._distance_counts
         if (
             torch.distributed.is_available()
             and torch.distributed.is_initialized()
@@ -255,7 +326,12 @@ class RecallMetrics:
             unknown = unknown.clone()
             torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(unknown, op=torch.distributed.ReduceOp.SUM)
-        return counts, unknown
+            if distance_counts is not None:
+                distance_counts = distance_counts.clone()
+                torch.distributed.all_reduce(
+                    distance_counts, op=torch.distributed.ReduceOp.SUM
+                )
+        return counts, unknown, distance_counts
 
     def compute(self) -> dict[str, float]:
         """Return the accumulated metrics as Python floats.
@@ -269,6 +345,11 @@ class RecallMetrics:
         ``'other/class={c}'`` per observed class and
         ``'acc/slice={n}/class={c}'``, ``'leak/slice={n}/class={c}'``,
         ``'other/slice={n}/class={c}'`` per observed (slice, class) cell.
+        If write-distance batches were accumulated: ``'acc/dist={lo}-{hi}'``
+        and ``'leak/dist={lo}-{hi}'`` per observed distance bin (the token
+        distance between the two writes, binned ``[lo, hi)``, the last bin
+        to infinity), and ``'acc/slice={n}/dist={lo}-{hi}'``,
+        ``'leak/slice={n}/dist={lo}-{hi}'`` per observed (slice, bin) cell.
 
         Cells with no answers are OMITTED (never emitted as 0.0, which
         would be indistinguishable from a real zero accuracy downstream):
@@ -283,8 +364,9 @@ class RecallMetrics:
         if self._counts is None or self._unknown is None:
             counts = torch.zeros((self._num_slices, 5, 3), dtype=torch.long)
             unknown = torch.zeros((), dtype=torch.long)
+            distance_counts = self._distance_counts
         else:
-            counts, unknown = self._global_counts()
+            counts, unknown, distance_counts = self._global_counts()
         num_unknown = int(unknown)
         if num_unknown != 0:
             raise ValueError(
@@ -332,4 +414,29 @@ class RecallMetrics:
                     out[f"acc/slice={value}/class={name}"] = acc_nc
                     out[f"leak/slice={value}/class={name}"] = leak_nc
                     out[f"other/slice={value}/class={name}"] = other_nc
+
+        # Write-distance bins (one more axis on the counts): accuracy and
+        # old-value leakage per bin, overall and per (slice, bin), for
+        # overwritten keys only (single-class answers carry no distance).
+        # Empty bins and (slice, bin) cells are omitted, never emitted 0.0.
+        if distance_counts is not None:
+            bins = self._distance_bins
+            labels = []
+            for lo, hi in zip(bins[:-1], bins[1:]):
+                hi_label = "inf" if math.isinf(hi) else f"{hi:g}"
+                labels.append(f"{lo:g}-{hi_label}")
+            for b, label in enumerate(labels):
+                stats = distance_counts[:, b, :].sum(dim=0)
+                if int(stats[0]) == 0:
+                    continue
+                acc_b, leak_b, _ = _ratio(stats)
+                out[f"acc/dist={label}"] = acc_b
+                out[f"leak/dist={label}"] = leak_b
+                for row, value in enumerate(self._slice_values):
+                    stats = distance_counts[row, b, :]
+                    if int(stats[0]) == 0:
+                        continue
+                    acc_nb, leak_nb, _ = _ratio(stats)
+                    out[f"acc/slice={value}/dist={label}"] = acc_nb
+                    out[f"leak/slice={value}/dist={label}"] = leak_nb
         return out

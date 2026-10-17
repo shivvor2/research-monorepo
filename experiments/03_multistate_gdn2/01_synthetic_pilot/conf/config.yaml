@@ -1,0 +1,90 @@
+# =============================================================================
+# Multi-State GDN-2 Synthetic Pilot Config
+# =============================================================================
+# Usage:
+#   python 01_train.py                                # defaults (mqar)
+#   python 01_train.py task=overwrite                # overwrite task
+#   python 01_train.py +sweep=tier1_core             # one tier grid
+#   python 01_train.py --config-name=test            # tiny CPU smoke config
+#   python 01_train.py --config-name=debug            # one step, every layout
+# =============================================================================
+
+seed: 0
+
+experiment:
+  name: multistate_gdn2_synthetic_pilot
+  phase: 1                 # 1 = calibration; >= 2 needs frozen_protocol.frozen
+  tier: null               # set by sweep configs, recorded in the run JSON
+
+defaults:
+  - task: mqar
+  - _self_
+
+model:                     # -> ZoologyLMConfig
+  vocab_size: 8192
+  d_model: 32
+  n_layer: 2
+  layer_pattern: zoology   # layer 0 BaseConv, layer 1 the layer under test
+  state_mixer: none
+  num_heads: 2
+  head_dim: null           # null -> d_model // num_heads
+  expand_v: 1.0            # value-dim multiplier (tier 5 sets 10)
+  ff_mult: 4               # feed-forward hidden-dim multiplier
+  base_conv_kernel: 3      # the Zoology layer-0 short-conv kernel size
+  gate_mode: full
+  layout: single
+  lambda_mode: mlp
+  window: 8
+  chunk_size: 16
+  t_max: ${task.max_seq_len}   # ll slot count = bitlen(t_max) + 1
+  output_gate_activation: silu
+  mixer_mode: chunk
+
+optimizer:
+  lr: null                 # null -> frozen_protocol.yaml (task, layout, gate_mode)
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  decay_scheme: grouped    # grouped | uniform (uniform = weight decay everywhere)
+
+training:
+  batch_size: 256
+  collect_mixer_stats: true  # per-layer lambda/erase statistics during validation
+  max_steps: 20000
+  val_check_interval: 500
+  early_stop_threshold: 0.99
+  precision: 32-true
+  grad_clip_val: null
+  loss_on: answers         # answers | all (full-sequence CE, the D18 switch)
+  compile: false
+  log_every_n_steps: 50
+
+data:
+  num_workers: 2
+  num_val_per_slice: 1000
+  num_test_per_slice: 1000
+
+output:
+  runs_dir: ${hydra:runtime.cwd}/runs/${task.name}
+  # Every run's final checkpoint, saved next to its run JSON
+  # (runs/<task>/<run_id>.pt, git-ignored) so the mechanism probes and
+  # finer breakdowns can be computed afterwards without retraining.
+  # About 2 MB per run at the pilot size.
+  save_final_checkpoint: true
+
+logging:
+  csv:
+    enabled: true
+    save_dir: logs/csv
+  wandb:
+    enabled: false
+    project: MultistateGDN2
+    entity: null
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: "${hydra:job.num}"
+  job:
+    chdir: true

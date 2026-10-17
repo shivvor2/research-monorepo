@@ -1,0 +1,25 @@
+# Repeated-key overwrite task at d_k = 32 (d_model = 64, num_heads = 2).
+#
+# The primary endpoint is defined at K = 2 * d_k = 64, which needs T = 512
+# (worst case K = 64: 16 single keys (32 tokens) + 48 double keys (192
+# tokens) + 128 query tokens = 352 <= 512, and the 384-token write region
+# spans 24 blocks, enough for `distant`).
+#
+# Same generator as conf/task/overwrite.yaml (the task name is identical);
+# only the sequence length and the key counts differ.
+
+name: overwrite
+vocab_size: 8192
+seq_len: 512
+num_keys: [16, 32, 64]             # K drawn per example (slices)
+class_probs: [0.25, 0.25, 0.25, 0.25]
+block_size: 16                      # B = C (D13)
+distant_min_blocks: 4
+max_placement_attempts: 100
+
+# Longest sequence the model will see on this task.
+max_seq_len: 512
+
+# Held-out evaluation seeds (must differ from train seed = run seed).
+val_seed: 1000003
+test_seed: 2000003

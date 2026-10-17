@@ -342,8 +342,11 @@ def test_D09_two_rank_reduction_matches_combined():
     combined.update(logits2, half2)
 
     # The all_reduce(SUM) of the per-rank counts, applied to rank 0.
+    # (The distance counts are reduced the same way in _global_counts.)
     rank0._counts += rank1._counts
     rank0._unknown += rank1._unknown
+    assert rank0._distance_counts is not None
+    rank0._distance_counts += rank1._distance_counts
     assert rank0.compute() == combined.compute()
 
 
@@ -433,3 +436,142 @@ def test_D10_loss_equals_answer_mean_mqar():
     ans_b, ans_p = (labels != IGNORE).nonzero(as_tuple=True)
     manual = F.cross_entropy(logits[ans_b, ans_p - 1], labels[ans_b, ans_p])
     assert torch.allclose(repo_loss, manual, atol=1e-10, rtol=1e-10)
+
+
+class TestD11WriteDistanceMetrics:
+    """Accuracy and old-value leakage binned by the write distance."""
+
+    def _hand_batch(self):
+        """Two hand-built examples with known answers, classes, distances.
+
+        Example 0 (slice 8): answers at label positions 3, 6, 9 (predicted
+        from 2, 5, 8): correct, leaked, other; classes same/distant/single;
+        distances 8, 40, -1 (the single key has no distance).
+        Example 1 (slice 16): answers at 3, 6: leaked, correct; classes
+        adjacent/same; distances 20, 100.
+        """
+        T, V = 10, 8
+        labels = torch.full((2, T), -100, dtype=torch.long)
+        old_labels = torch.full((2, T), -100, dtype=torch.long)
+        key_class = torch.full((2, T), -1, dtype=torch.long)
+        write_distance = torch.full((2, T), -1, dtype=torch.long)
+        logits = torch.zeros(2, T, V, dtype=torch.float64)
+
+        def answer(ex, pos, target, old, cls, dist, pred):
+            labels[ex, pos] = target
+            old_labels[ex, pos] = old
+            key_class[ex, pos] = cls
+            write_distance[ex, pos] = dist
+            logits[ex, pos - 1, pred] = 10.0  # predicted from pos - 1
+
+        # Example 0: correct (dist 8 -> bin 0-16), leaked (dist 40 -> bin
+        # 32-64), other (single class, no distance).
+        answer(0, 3, target=4, old=5, cls=0, dist=8, pred=4)
+        answer(0, 6, target=4, old=5, cls=2, dist=40, pred=5)
+        answer(0, 9, target=4, old=5, cls=3, dist=-1, pred=6)
+        # Example 1: leaked (dist 20 -> bin 16-32... no: 20 < 32 -> bin
+        # 16-32? no: bins are [0,16), [16,32), ... so 20 -> bin 16-32),
+        # correct (dist 100 -> bin 64-128).
+        answer(1, 3, target=4, old=6, cls=1, dist=20, pred=6)
+        answer(1, 6, target=5, old=4, cls=0, dist=100, pred=5)
+
+        return {
+            "input_ids": torch.zeros(2, T, dtype=torch.long),
+            "labels": labels,
+            "old_labels": old_labels,
+            "key_class": key_class,
+            "write_distance": write_distance,
+            "slice_id": torch.tensor([8, 16], dtype=torch.long),
+        }, logits
+
+    def test_exact_binned_values(self):
+        batch, logits = self._hand_batch()
+        metrics = RecallMetrics(slice_values=(8, 16))
+        metrics.update(logits, batch)
+        result = metrics.compute()
+        # Distances: 8 -> bin 0-16 (example 0, correct), 40 -> bin 32-64
+        # (example 0, leaked), 20 -> bin 16-32 (example 1, leaked),
+        # 100 -> bin 64-128 (example 1, correct). The single-class answer
+        # (distance -1) never enters the distance metrics.
+        assert result["acc/dist=0-16"] == pytest.approx(1.0)
+        assert result["leak/dist=0-16"] == pytest.approx(0.0)
+        assert result["acc/dist=16-32"] == pytest.approx(0.0)
+        assert result["leak/dist=16-32"] == pytest.approx(1.0)
+        assert result["acc/dist=32-64"] == pytest.approx(0.0)
+        assert result["leak/dist=32-64"] == pytest.approx(1.0)
+        assert result["acc/dist=64-128"] == pytest.approx(1.0)
+        assert result["leak/dist=64-128"] == pytest.approx(0.0)
+        # Empty bins are omitted, not emitted as 0.0.
+        assert "acc/dist=128-256" not in result
+        assert "acc/dist=256-inf" not in result
+        # Per (slice, bin): slice 8 owns distances 8 and 40; slice 16 owns
+        # 20 and 100.
+        assert result["acc/slice=8/dist=0-16"] == pytest.approx(1.0)
+        assert result["leak/slice=8/dist=32-64"] == pytest.approx(1.0)
+        assert result["leak/slice=16/dist=16-32"] == pytest.approx(1.0)
+        assert result["acc/slice=16/dist=64-128"] == pytest.approx(1.0)
+        # Cross cells are absent (each slice has one answer per bin here).
+        assert "acc/slice=8/dist=16-32" not in result
+        assert "acc/slice=16/dist=0-16" not in result
+
+    def test_distances_below_the_first_edge_are_excluded(self):
+        """The bins are half-open ``[lo, hi)`` with the last running to
+        infinity: a distance below ``bins[0]`` is in no bin (the default
+        bins start at 0, so the pilot is unaffected)."""
+        T, V = 6, 8
+        labels = torch.full((1, T), -100, dtype=torch.long)
+        old_labels = torch.full((1, T), -100, dtype=torch.long)
+        key_class = torch.full((1, T), -1, dtype=torch.long)
+        write_distance = torch.full((1, T), -1, dtype=torch.long)
+        logits = torch.zeros(1, T, V, dtype=torch.float64)
+        # A leaked answer at distance 3: below the first edge (8).
+        labels[0, 3], old_labels[0, 3], key_class[0, 3] = 4, 5, 0
+        write_distance[0, 3] = 3
+        logits[0, 2, 5] = 10.0  # predicts the old label -> leaked
+        # A correct answer at distance 10: inside [8, 16).
+        labels[0, 5], old_labels[0, 5], key_class[0, 5] = 6, 7, 1
+        write_distance[0, 5] = 10
+        logits[0, 4, 6] = 10.0
+        batch = {
+            "input_ids": torch.zeros(1, T, dtype=torch.long),
+            "labels": labels,
+            "old_labels": old_labels,
+            "key_class": key_class,
+            "write_distance": write_distance,
+            "slice_id": torch.tensor([8], dtype=torch.long),
+        }
+        metrics = RecallMetrics(slice_values=(8,), distance_bins=(8, 16))
+        metrics.update(logits, batch)
+        result = metrics.compute()
+        # Only the distance-10 answer is in the bin; the distance-3
+        # answer is not counted in bin 0 (it would drag acc to 0.5).
+        assert result["acc/dist=8-16"] == pytest.approx(1.0)
+        assert result["leak/dist=8-16"] == pytest.approx(0.0)
+        assert result["acc/slice=8/dist=8-16"] == pytest.approx(1.0)
+        assert result["leak/slice=8/dist=8-16"] == pytest.approx(0.0)
+
+    def test_overall_accuracy_unchanged_by_distance_bins(self):
+        batch, logits = self._hand_batch()
+        with_distance = RecallMetrics(slice_values=(8, 16))
+        without_distance = RecallMetrics(slice_values=(8, 16), distance_bins=None)
+        with_distance.update(logits, batch)
+        without_distance.update(logits, batch)
+        assert with_distance.compute()["acc"] == without_distance.compute()["acc"]
+        assert "acc/dist=0-16" not in without_distance.compute()
+
+    def test_mqar_batches_have_no_distance_keys(self):
+        config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2,))
+        batch = generate_mqar(config, num_examples=4, seed=0)
+        logits = torch.zeros(4, config.seq_len, config.vocab_size, dtype=torch.float64)
+        metrics = RecallMetrics(slice_values=config.slices)
+        metrics.update(logits, batch)
+        result = metrics.compute()
+        assert not any(key.startswith("acc/dist=") for key in result)
+
+    def test_invalid_distance_bins_rejected(self):
+        with pytest.raises(ValueError):
+            RecallMetrics(slice_values=(8,), distance_bins=(16,))
+        with pytest.raises(ValueError):
+            RecallMetrics(slice_values=(8,), distance_bins=(32, 16, 0))
+        with pytest.raises(ValueError):
+            RecallMetrics(slice_values=(8,), distance_bins=(-1, 16))
