@@ -55,6 +55,7 @@ EXPECTED_RUNS = {
     "tier5_matched_bytes": 10,
     "tier6_anchors": 30,
     "tier_longT": 60,
+    "R1": 30,
 }
 
 
@@ -67,8 +68,8 @@ def load_runs(runs_dir: Path) -> pd.DataFrame:
     """Load every run JSON under runs_dir into one row-per-run DataFrame.
 
     Flattens the run config into scalar columns (task, layout, gate_mode,
-    lambda_mode, d_model, head_dim, seed, tier, phase) and the test
-    metrics into ``test/<key>`` columns.
+    lambda_mode, d_model, head_dim, seed, tier, phase, decay_scheme) and
+    the test metrics into ``test/<key>`` columns.
     """
     records = []
     for path in sorted(runs_dir.glob("**/*.json")):
@@ -97,6 +98,11 @@ def load_runs(runs_dir: Path) -> pd.DataFrame:
             "steps_completed": (summary.get("timing") or {}).get("steps_completed"),
             "best_val_acc": (summary.get("stopping") or {}).get("best_val_acc"),
             "stopped": (summary.get("stopping") or {}).get("stopped"),
+            # The weight-decay scheme (grouped | uniform). Prefer the
+            # top-level field recorded by the run JSON; fall back to the
+            # config (None = recorded before the scheme switch = grouped).
+            "decay_scheme": summary.get("decay_scheme")
+            or (cfg.get("optimizer") or {}).get("decay_scheme"),
         }
         for key, value in (summary.get("test") or {}).items():
             record[f"test/{key}"] = value
@@ -113,6 +119,21 @@ def head_dim_of(row: pd.Series) -> float:
     if row["head_dim"] is not None and not pd.isna(row["head_dim"]):
         return float(row["head_dim"])
     return float(row["d_model"]) / float(row["num_heads"])
+
+
+def default_scheme(table: pd.DataFrame) -> pd.DataFrame:
+    """Runs under the default (grouped) weight-decay scheme.
+
+    The uniform-scheme R1 rows replicate the core grid (same layout /
+    gate_mode / seed, different weight decay), so to the per-seed DiD
+    pairing they read as duplicated cells and would drop every seed.
+    The scheme comparison (scheme x layout) is a robustness check,
+    reported separately from the pre-registered statistic; runs recorded
+    before the scheme switch carry no field and count as grouped.
+    """
+    if "decay_scheme" not in table.columns:
+        return table
+    return table[table["decay_scheme"].fillna("grouped") == "grouped"]
 
 
 # --------------------------------------------------------------------------- #
@@ -189,7 +210,10 @@ def analyze_primary(
 ) -> pd.DataFrame:
     """The primary endpoint: overwrite, class distant, K = 2 d_k."""
     records = []
-    overwrite = table[(table["task"] == "overwrite") & (table["tier"].notna())]
+    overwrite = default_scheme(table)
+    overwrite = overwrite[
+        (overwrite["task"] == "overwrite") & (overwrite["tier"].notna())
+    ]
     for (d_model, num_heads, head_dim), group in overwrite.groupby(
         ["d_model", "num_heads", "head_dim"], dropna=False
     ):
@@ -229,7 +253,8 @@ def analyze_all_cells(table: pd.DataFrame) -> pd.DataFrame:
     """Delta_int for every (task, slice, class) cell with four core cells."""
     frames = []
     acc_columns = [c for c in table.columns if c.startswith("test/acc")]
-    core = table[table["gate_mode"].isin(["full", "kda"])]
+    core = default_scheme(table)
+    core = core[core["gate_mode"].isin(["full", "kda"])]
     for task in core["task"].dropna().unique():
         sub = core[core["task"] == task]
         for column in acc_columns:
@@ -270,7 +295,8 @@ def analyze_predictions(
         records.append(record)
 
     # ---- P1: b_only recovers most of Delta_int, w_only little (tier 2).
-    overwrite = table[(table["task"] == "overwrite")]
+    overwrite = default_scheme(table)
+    overwrite = overwrite[overwrite["task"] == "overwrite"]
     distant = [
         c
         for c in table.columns
@@ -522,6 +548,13 @@ def render_summary(
     lines.append(
         "- Missing keys in a metrics dict mean 'not measured' (empty cells "
         "are omitted by RecallMetrics), not zero."
+    )
+    lines.append(
+        "- Uniform-weight-decay runs (tier R1) are excluded from the "
+        "Delta_int and prediction pairings above: they replicate the core "
+        "grid under a different decay scheme (recorded as `decay_scheme`). "
+        "Compare schemes as a scheme x layout robustness check, separately "
+        "from the pre-registered statistic."
     )
     return "\n".join(lines) + "\n"
 
