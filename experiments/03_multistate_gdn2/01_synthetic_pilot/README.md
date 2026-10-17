@@ -93,9 +93,11 @@ perfectly while DDP mostly adds communication overhead.
   `{tier_}{task}-{layout}-{gate_mode}-{lambda_mode}-d{d}-lr{lr}-s{seed}`.
 - `logs/` — CSV (and optional wandb) logs; `outputs/`, `multirun/` —
   hydra job dirs; `analysis/` — the analysis output. All git-ignored.
-- Final checkpoints are **off** by default; turn
-  `output.save_final_checkpoint=true` on only for the runs needed by the
-  mechanism probes.
+- Final checkpoints are **on** by default (`output.save_final_checkpoint`,
+  about 2 MB per run at the pilot size): every run saves its final weights
+  next to its run JSON (`runs/<task>/<run_id>.pt`), so the mechanism
+  probes and finer λ breakdowns can be computed afterwards without
+  retraining.
 
 ## Disposable-instance rules (rented machines)
 

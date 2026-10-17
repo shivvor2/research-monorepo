@@ -60,7 +60,11 @@ data:
 
 output:
   runs_dir: ${hydra:runtime.cwd}/runs/${task.name}
-  save_final_checkpoint: false
+  # Every run's final checkpoint, saved next to its run JSON
+  # (runs/<task>/<run_id>.pt, git-ignored) so the mechanism probes and
+  # finer breakdowns can be computed afterwards without retraining.
+  # About 2 MB per run at the pilot size.
+  save_final_checkpoint: true
 
 logging:
   csv:
