@@ -76,8 +76,9 @@ def load_runs(runs_dir: Path) -> pd.DataFrame:
     """Load every run JSON under runs_dir into one row-per-run DataFrame.
 
     Flattens the run config into scalar columns (task, layout, gate_mode,
-    lambda_mode, d_model, head_dim, seed, tier, phase, decay_scheme) and
-    the test metrics into ``test/<key>`` columns.
+    lambda_mode, d_model, head_dim, seed, tier, phase, decay_scheme),
+    stopping (early_stopped, best_value, best_step) and the test metrics
+    into ``test/<key>`` columns.
     """
     records = []
     for path in sorted(runs_dir.glob("**/*.json")):
@@ -104,6 +105,7 @@ def load_runs(runs_dir: Path) -> pd.DataFrame:
             "tier": (cfg.get("experiment") or {}).get("tier"),
             "phase": (cfg.get("experiment") or {}).get("phase"),
             "steps_completed": (summary.get("timing") or {}).get("steps_completed"),
+            "early_stopped": (summary.get("stopping") or {}).get("early_stopped"),
             "best_value": (summary.get("stopping") or {}).get("best_value"),
             "best_step": (summary.get("stopping") or {}).get("best_step"),
             "status": summary.get("status"),

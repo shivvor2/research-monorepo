@@ -231,6 +231,12 @@ class TestBuildWeightDecayConfigs:
         assert matrix_config.optimizer_kwargs["betas"] == (0.9, 0.95)
         assert vector_config.optimizer_kwargs["betas"] == (0.9, 0.95)
 
+    def test_omitted_scheme_defaults_to_grouped(self):
+        """``decay_scheme`` is optional; the default is ``"grouped"``."""
+        matrix_config, vector_config = build_weight_decay_configs()
+        assert matrix_config.optimizer_kwargs["weight_decay"] == 0.1
+        assert vector_config.optimizer_kwargs["weight_decay"] == 0.0
+
     def test_string_values_accepted(self):
         """The enum's string values work too (Hydra passes strings)."""
         _, vector_config = build_weight_decay_configs("grouped")

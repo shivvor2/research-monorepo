@@ -216,7 +216,7 @@ class DecayScheme(str, Enum):
 
 
 def build_weight_decay_configs(
-    decay_scheme: DecayScheme | str,
+    decay_scheme: DecayScheme | str = DecayScheme.GROUPED,
     *,
     weight_decay: float = 0.1,
     betas: Tuple[float, ...] = (0.9, 0.95),

@@ -64,7 +64,10 @@ class LayerStatsCallback(L.Callback):
     Collection is on only during the validation and test epochs: the
     providers are found and enabled at each epoch start, snapshotted after
     every batch, and disabled at the epoch end, so training steps are
-    unaffected.
+    unaffected. Each provider's ``latest_stats`` is cleared at each epoch
+    start and after every snapshot, so a provider that does not fill its
+    stats in a batch (or holds a value from a previous epoch) is never
+    snapshotted with stale values.
 
     Args:
         prefix: Metric prefix; entries are logged as
@@ -114,6 +117,9 @@ class LayerStatsCallback(L.Callback):
         self._snapshots = [[] for _ in self._providers]
         for module in self._providers:
             module.collect_stats = True
+            # A stale value from a previous epoch must not be snapshotted
+            # again if this provider's first batches do not fill it.
+            module.latest_stats = None
 
     def on_validation_epoch_start(
         self, trainer: L.Trainer, pl_module: L.LightningModule
@@ -137,6 +143,9 @@ class LayerStatsCallback(L.Callback):
             self._snapshots[i].append(
                 {key: value.detach().clone() for key, value in stats.items()}
             )
+            # Do not re-snapshot this batch's stats if the next batches do
+            # not fill the provider.
+            module.latest_stats = None
 
     def on_validation_batch_end(
         self,

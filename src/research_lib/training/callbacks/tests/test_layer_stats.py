@@ -93,6 +93,45 @@ class TestStatsProvider:
         assert not isinstance(nn.Linear(2, 2), StatsProvider)
 
 
+class SkippingProvider(nn.Module):
+    """A StatsProvider that fills its stats on the first two forwards only
+    (a provider is allowed to skip batches: e.g. a layer whose mode does
+    not touch it every forward)."""
+
+    def __init__(self):
+        super().__init__()
+        self.collect_stats = False
+        self.latest_stats = None
+        self.calls = 0
+
+    def forward(self, x):
+        self.calls += 1
+        if self.collect_stats and self.calls <= 2:
+            self.latest_stats = {"m": torch.tensor(float(self.calls))}
+        return x
+
+
+class SkippingLM(L.LightningModule):
+    """One provider; validation runs the data through it."""
+
+    def __init__(self):
+        super().__init__()
+        self.p = SkippingProvider()
+        self.weight = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        return self.p(x)
+
+    def training_step(self, batch, batch_idx):
+        return self.weight * batch[0].sum()
+
+    def validation_step(self, batch, batch_idx):
+        self(batch[0])
+
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), lr=0.0)
+
+
 class TestLayerStatsCallback:
     def test_stats_averaged_and_logged_under_right_names(self):
         callback = LayerStatsCallback(prefix="mixer")
@@ -106,6 +145,21 @@ class TestLayerStatsCallback:
         expected = torch.arange(8 * 4, dtype=torch.float32).mean().item()
         assert metrics["mixer/layer0/m"] == pytest.approx(expected)
         assert metrics["mixer/layer1/m"] == pytest.approx(expected + 10.0)
+
+    def test_provider_that_skips_batches_is_not_resnapshotted(self):
+        """``latest_stats`` is cleared at each epoch start and after every
+        snapshot, so a provider that does not fill its stats in a batch is
+        never snapshotted with a stale value."""
+        callback = LayerStatsCallback(prefix="skip")
+        trainer = make_trainer([callback])
+        module = SkippingLM()
+        data = make_data()  # 4 validation batches
+        trainer.fit(module, train_dataloaders=data, val_dataloaders=data)
+        metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
+        # The provider fills stats at calls 1 and 2 only (values 1 and 2):
+        # the epoch's mean is (1 + 2) / 2 = 1.5. Without the resets,
+        # batches 3 and 4 would re-snapshot the stale value 2 -> 1.75.
+        assert metrics["skip/layer0/m"] == pytest.approx(1.5)
 
     def test_test_epoch_also_collects(self):
         callback = LayerStatsCallback(prefix="ts")

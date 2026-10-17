@@ -13,6 +13,7 @@ EVERY tier.
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -342,6 +343,42 @@ class TestRenderSummary:
             assert record["mean"] == pytest.approx(
                 CORE_ACC[record["layout"]][record["gate_mode"]]
             )
+
+
+class TestLoadRuns:
+    """The loader flattens the run JSON (one row per run file)."""
+
+    def test_early_stopped_loaded_from_stopping(self, tmp_path):
+        run = {
+            "run_id": "r0",
+            "config": {
+                "model": {
+                    "layout": "ws",
+                    "gate_mode": "full",
+                    "lambda_mode": "mlp",
+                    "d_model": 32,
+                    "num_heads": 2,
+                    "head_dim": None,
+                },
+                "task": {"name": "mqar"},
+                "experiment": {"tier": "tier1_core", "phase": 1},
+                "optimizer": {"decay_scheme": "grouped"},
+            },
+            "seed": 0,
+            "timing": {"steps_completed": 10},
+            "stopping": {
+                "early_stopped": True,
+                "best_value": 0.9,
+                "best_step": 10,
+            },
+            "status": "test_done",
+            "test": {"acc": 0.5},
+        }
+        (tmp_path / "r0.json").write_text(json.dumps(run))
+        table = analyze.load_runs(tmp_path)
+        assert len(table) == 1
+        assert bool(table.iloc[0]["early_stopped"]) is True
+        assert table.iloc[0]["best_value"] == 0.9
 
 
 class TestIncompleteRuns:

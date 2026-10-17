@@ -380,16 +380,17 @@ def make_run_id(cfg: DictConfig, lr: float) -> str:
     return run_id
 
 
+def first_gated_delta(model) -> MultistateGatedDelta | None:
+    """The first gated-delta mixer under ``model`` (``None`` if none)."""
+    return next(
+        (m for m in model.modules() if isinstance(m, MultistateGatedDelta)), None
+    )
+
+
 def state_bytes_collector(trainer, pl_module):
     """Recurrent-state bytes of one gated-delta layer, in fp32."""
-    layers = [
-        module
-        for module in pl_module.model.modules()
-        if isinstance(module, MultistateGatedDelta)
-    ]
-    if not layers:
-        return {}
-    return {"bytes_per_mixer": layers[0].state_bytes()}
+    layer = first_gated_delta(pl_module.model)
+    return {} if layer is None else {"bytes_per_mixer": layer.state_bytes()}
 
 
 def per_slot_summary(key, value):
@@ -529,10 +530,8 @@ def main(cfg: DictConfig) -> None:
         model = torch.compile(model)
     module = build_module(cfg, model, lr)
     num_params = sum(p.numel() for p in model.parameters())
-    gd_layers = [
-        module for module in model.modules() if isinstance(module, MultistateGatedDelta)
-    ]
-    state_bytes = gd_layers[0].state_bytes() if gd_layers else 0
+    gd_layer = first_gated_delta(model)
+    state_bytes = gd_layer.state_bytes() if gd_layer is not None else 0
     logger.info(
         "Model: %s parameters; recurrent state per mixer: %d bytes",
         f"{num_params:,}",
