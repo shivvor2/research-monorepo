@@ -6,7 +6,6 @@ Run with: pytest src/research_lib/training/callbacks/tests/test_run_summary.py -
 """
 
 import json
-from pathlib import Path
 from typing import Any, cast
 
 import lightning as L
@@ -18,7 +17,6 @@ from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
 from research_lib.layers.attention import MultistateGatedDelta
 from research_lib.training.callbacks.run_summary import (
     BUILTIN_SECTIONS,
-    DEFAULT_COLLECTORS,
     Collector,
     RunSummaryCallback,
     Stage,
@@ -475,17 +473,51 @@ class TestStatus:
         assert summary["stopping"]["best_value"] is not None
         assert summary["stopping"]["best_step"] is not None
 
+    def test_test_stage_keeps_fit_sections(self, tmp_path):
+        """Fit + test in one process: ``timing`` / ``stopping`` keep their
+        fit-end values (the test stage measures neither)."""
+        cb = RunSummaryCallback(
+            tmp_path,
+            "keep-fit",
+            tiny_config_dict(),
+            monitor="val/acc",
+            strict=True,
+        )
+        trainer = make_trainer([cb])
+        module = tiny_module()
+        loader = make_loader()
+        trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        fit_summary = read(tmp_path, "keep-fit")
+        trainer.test(module, dataloaders=loader)
+        after = read(tmp_path, "keep-fit")
+        assert after["status"] == "test_done"
+        assert after["timing"] == fit_summary["timing"]
+        assert after["stopping"] == fit_summary["stopping"]
+
     def test_test_only_launch_updates_existing_file(self, tmp_path):
-        cb = RunSummaryCallback(tmp_path, "resume", tiny_config_dict(), strict=True)
+        cb = RunSummaryCallback(
+            tmp_path,
+            "resume",
+            tiny_config_dict(),
+            monitor="val/acc",
+            strict=True,
+        )
         trainer = make_trainer([cb])
         module = tiny_module()
         loader = make_loader()
         trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
         fit_summary = read(tmp_path, "resume")
+        assert fit_summary["stopping"]["best_value"] is not None
 
         # A fresh callback + trainer, test only: the existing file is
         # loaded and updated, not replaced by a test-only file.
-        cb2 = RunSummaryCallback(tmp_path, "resume", tiny_config_dict(), strict=True)
+        cb2 = RunSummaryCallback(
+            tmp_path,
+            "resume",
+            tiny_config_dict(),
+            monitor="val/acc",
+            strict=True,
+        )
         trainer2 = L.Trainer(
             accelerator="cpu",
             logger=False,
@@ -500,6 +532,9 @@ class TestStatus:
         assert summary["params"] == fit_summary["params"]  # fit sections retained
         assert summary["timing"] == fit_summary["timing"]
         assert summary["val_final"] == fit_summary["val_final"]
+        # The fresh process tracked nothing: stopping must be the loaded
+        # fit-end section, not rewritten with best_value=None.
+        assert summary["stopping"] == fit_summary["stopping"]
 
 
 # ---------------------------------------------------------------------------

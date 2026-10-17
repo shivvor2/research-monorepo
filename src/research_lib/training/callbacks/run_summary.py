@@ -517,8 +517,11 @@ class RunSummaryCallback(L.Callback):
             self._load_existing()
         self._run_stage(Stage.TEST_END, trainer, pl_module)
         self.summary["status"] = "test_done"
-        self._update_timing(trainer)
-        self._update_stopping(trainer)
+        # Nothing else: timing and stopping are fit-time sections, computed
+        # at fit end only. Recomputing them here would either fold the test
+        # run into the timing of a fit in the same process, or (in a
+        # test-only launch, where this process tracked nothing) rewrite
+        # stopping with best_value=None, destroying the loaded values.
         self._merge_extra()
         self._write()
 
