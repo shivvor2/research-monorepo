@@ -14,8 +14,10 @@ the anchors -> their own entries keyed by d_model.
 import importlib.util
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
+import torch
 from omegaconf import OmegaConf
 
 _SRC = Path(__file__).resolve().parents[3] / "src"
@@ -357,3 +359,89 @@ class TestOverwriteTaskFollowsDModel:
     def test_non_overwrite_tasks_are_untouched(self, frozen_with_tasks):
         cfg = make_cfg(task="mqar", d_model=64, num_keys=(8, 16, 32))
         train.check_overwrite_k(cfg, frozen_with_tasks)  # no raise
+
+
+GATE_MODES = ("full", "b_only", "w_only", "kda", "gdn")
+
+
+def model_cfg(**overrides):
+    """A model section mirroring conf/config.yaml's (Hydra passes this)."""
+    model: dict[str, Any] = {
+        "vocab_size": 64,
+        "d_model": 16,
+        "n_layer": 2,
+        "layer_pattern": "zoology",
+        "state_mixer": "none",
+        "ff_mult": 4,
+        "num_heads": 1,
+        "head_dim": None,
+        "expand_v": 1.0,
+        "gate_mode": "full",
+        "layout": "single",
+        "lambda_mode": "mlp",
+        "window": 4,
+        "chunk_size": 16,
+        "t_max": 32,
+        "output_gate_activation": "silu",
+        "mixer_mode": "chunk",
+        "base_conv_kernel": 3,
+    }
+    model.update(overrides)
+    return OmegaConf.create({"model": model})
+
+
+class TestBuildModel:
+    """The experiment's builder: make_mixer + zoology_mixers + ZoologyLM.
+
+    The gated-delta-specific model tests moved here from the harness
+    tests when ZoologyLM became mixer-agnostic.
+    """
+
+    @pytest.mark.parametrize("gate_mode", GATE_MODES)
+    def test_param_counts_identical_across_gate_modes(self, gate_mode):
+        model = train.build_model(model_cfg(layout="ws", gate_mode=gate_mode))
+        counts = {name: tuple(p.shape) for name, p in model.named_parameters()}
+        reference = train.build_model(model_cfg(layout="ws", gate_mode="full"))
+        ref_counts = {name: tuple(p.shape) for name, p in reference.named_parameters()}
+        assert counts.keys() == ref_counts.keys()
+        for key in ref_counts:
+            assert counts[key] == ref_counts[key], key
+
+    @pytest.mark.parametrize("layout", ["ws", "fs", "ll"])
+    def test_layouts_differ_only_by_lambda_parameters(self, layout):
+        single = train.build_model(model_cfg(layout="single"))
+        multi = train.build_model(model_cfg(layout=layout))
+        single_names = {name for name, _ in single.named_parameters()}
+        multi_names = {name for name, _ in multi.named_parameters()}
+        lambda_names = {n for n in multi_names if "lambda_mixer" in n}
+        assert multi_names - single_names == lambda_names
+        assert single_names - multi_names == set()
+        for name, p in single.named_parameters():
+            assert multi.state_dict()[name].shape == p.shape, name
+
+    def test_state_bytes_accounting(self):
+        from research_lib.layers.attention import MultistateGatedDelta
+
+        for layout in ("single", "ws", "fs", "ll"):
+            model = train.build_model(model_cfg(layout=layout))
+            layers = [
+                module
+                for module in model.modules()
+                if isinstance(module, MultistateGatedDelta)
+            ]
+            assert len(layers) == 1  # one mixer block in the zoology pattern
+            layer = layers[0]
+            expected = (
+                layer.projections.num_heads
+                * layer.num_slots
+                * layer.projections.head_k_dim
+                * layer.projections.head_v_dim
+                * 4
+            )
+            assert layer.state_bytes() == expected
+
+    def test_builder_forward_shapes_both_patterns(self):
+        for pattern in ("zoology", "mixer_x2"):
+            model = train.build_model(model_cfg(layer_pattern=pattern))
+            logits = model(torch.zeros(2, 12, dtype=torch.long))
+            assert logits.shape == (2, 12, 64)

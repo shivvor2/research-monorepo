@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from research_lib.architectures.config import ZoologyLMConfig
-from research_lib.architectures.zoology_lm import ZoologyLM
+from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
 from research_lib.data.synthetic import (
     MQARConfig,
     OverwriteConfig,
@@ -17,6 +17,7 @@ from research_lib.data.synthetic import (
     generate_mqar,
     generate_overwrite,
 )
+from research_lib.layers.attention import MultistateGatedDelta
 from research_lib.training.configs import ScheduleConfig
 from research_lib.training.modules.mgdn2_synthetic_recall import (
     MGDN2SyntheticRecallModule,
@@ -52,17 +53,15 @@ def tiny_overwrite_config() -> OverwriteConfig:
 
 
 def tiny_model(layout: str = "single") -> ZoologyLM:
-    return ZoologyLM(
-        ZoologyLMConfig(
-            vocab_size=64,
-            d_model=16,
-            n_layer=2,
-            num_heads=1,
-            t_max=32,
-            layout=layout,
-            collect_stats=False,
-        )
+    """Zoology harness with a BaseConv block and one gated-delta mixer."""
+    mixers = zoology_mixers(
+        2,
+        16,
+        make_mixer=lambda: MultistateGatedDelta(
+            hidden_size=16, num_heads=1, head_dim=16, layout=layout, t_max=32
+        ),
     )
+    return ZoologyLM(ZoologyLMConfig(vocab_size=64, d_model=16), mixers)
 
 
 def lr_schedule(peak: float = 1e-3) -> ScheduleConfig:

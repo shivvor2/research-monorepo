@@ -1098,3 +1098,36 @@ class TestM19CanonicalCache:
                         rtol=RTOL,
                         msg=f"{layout}: canonical cache at p={p}",
                     )
+
+
+class TestM20StateBytes:
+    """A layer knows its own recurrent-state size."""
+
+    @pytest.mark.parametrize("layout", ["single", "ws", "fs", "ll"])
+    def test_M20_state_bytes_matches_the_formula(self, layout):
+        window = 4
+        layer = MultistateGatedDelta(
+            hidden_size=32,
+            num_heads=2,
+            head_dim=16,
+            layout=layout,
+            window=window,
+            t_max=32,
+        )
+        expected = (
+            layer.projections.num_heads
+            * layer.num_slots
+            * layer.projections.head_k_dim
+            * layer.projections.head_v_dim
+            * 4
+        )
+        assert layer.state_bytes() == expected
+        # The single-state layer is the L = 1 case; ws/fs have window + 2
+        # slots; ll has bitlen(t_max) + 1 slots.
+        if layout == "single":
+            assert layer.num_slots == 1
+            assert layer.state_bytes() == 2 * 1 * 16 * 16 * 4
+        elif layout == "ll":
+            assert layer.num_slots == (32).bit_length() + 1
+        else:
+            assert layer.num_slots == window + 2

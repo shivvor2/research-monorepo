@@ -14,7 +14,8 @@ import pytest
 import torch
 
 from research_lib.architectures.config import ZoologyLMConfig
-from research_lib.architectures.zoology_lm import ZoologyLM
+from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
+from research_lib.layers.attention import MultistateGatedDelta
 from research_lib.training.callbacks.run_summary import (
     BUILTIN_SECTIONS,
     DEFAULT_COLLECTORS,
@@ -39,11 +40,15 @@ from research_lib.training.scheduling import WarmupStableDecaySchedule
 
 
 def tiny_model() -> ZoologyLM:
-    return ZoologyLM(
-        ZoologyLMConfig(
-            vocab_size=64, d_model=16, num_heads=1, t_max=32, layout="single"
-        )
+    """Zoology harness with a BaseConv block and one gated-delta mixer."""
+    mixers = zoology_mixers(
+        2,
+        16,
+        make_mixer=lambda: MultistateGatedDelta(
+            hidden_size=16, num_heads=1, head_dim=16, layout="single", t_max=32
+        ),
     )
+    return ZoologyLM(ZoologyLMConfig(vocab_size=64, d_model=16), mixers)
 
 
 def tiny_config_dict(seed: int = 0) -> dict:

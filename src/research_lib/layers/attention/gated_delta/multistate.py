@@ -893,6 +893,19 @@ class MultistateGatedDelta(nn.Module):
                 dtype=dtype,
             )
 
+    def state_bytes(self) -> int:
+        """Recurrent-state bytes of this layer.
+
+        The canonical slot stack in fp32:
+        ``num_heads * num_slots * d_k * d_v * 4`` (the single-state
+        layer is the ``L = 1`` case).
+
+        Returns:
+            int: Bytes of one layer's recurrent state.
+        """
+        proj = self.projections
+        return proj.num_heads * self.num_slots * proj.head_k_dim * proj.head_v_dim * 4
+
     def extra_repr(self) -> str:
         return (
             f"layout={self.layout.value}, gate_mode={self.gate_mode.value}, "

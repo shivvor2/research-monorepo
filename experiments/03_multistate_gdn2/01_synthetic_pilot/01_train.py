@@ -37,12 +37,13 @@ from omegaconf import DictConfig, OmegaConf
 
 # Library imports
 from research_lib.architectures.config import ZoologyLMConfig
-from research_lib.architectures.zoology_lm import ZoologyLM
+from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
 from research_lib.data.synthetic import (
     MQARConfig,
     OverwriteConfig,
     SyntheticRecallDataModule,
 )
+from research_lib.layers.attention import MultistateGatedDelta
 from research_lib.training.callbacks import (
     Collector,
     LayerStatsCallback,
@@ -284,25 +285,45 @@ def slice_values(cfg: DictConfig) -> tuple[int, ...]:
 
 
 def build_model(cfg: DictConfig) -> ZoologyLM:
-    model_config = ZoologyLMConfig(
-        vocab_size=cfg.model.vocab_size,
-        d_model=cfg.model.d_model,
-        n_layer=cfg.model.n_layer,
-        layer_pattern=cfg.model.layer_pattern,
-        state_mixer=cfg.model.state_mixer,
-        num_heads=cfg.model.num_heads,
-        head_dim=cfg.model.get("head_dim", None),
-        expand_v=cfg.model.get("expand_v", 1.0),
-        gate_mode=cfg.model.gate_mode,
-        layout=cfg.model.layout,
-        lambda_mode=cfg.model.lambda_mode,
-        window=cfg.model.window,
-        chunk_size=cfg.model.chunk_size,
-        t_max=cfg.model.t_max,
-        output_gate_activation=cfg.model.output_gate_activation,
-        mixer_mode=cfg.model.mixer_mode,
+    """Build the model: make_mixer from cfg.model, layout by zoology_mixers.
+
+    The Hydra config's keys and structure are unchanged; only this
+    Python that reads them is mixer-specific.
+    """
+    c = cfg.model
+    head_dim = c.get("head_dim", None)
+    head_dim = int(head_dim) if head_dim is not None else c.d_model // c.num_heads
+
+    def make_mixer() -> MultistateGatedDelta:
+        return MultistateGatedDelta(
+            hidden_size=c.d_model,
+            num_heads=c.num_heads,
+            head_dim=head_dim,
+            expand_v=c.get("expand_v", 1.0),
+            gate_mode=c.gate_mode,
+            layout=c.layout,
+            lambda_mode=c.lambda_mode,
+            window=c.window,
+            chunk_size=c.chunk_size,
+            t_max=c.t_max,
+            mode=c.mixer_mode,
+            output_gate_activation=c.output_gate_activation,
+        )
+
+    mixers = zoology_mixers(
+        n_layer=c.n_layer,
+        d_model=c.d_model,
+        make_mixer=make_mixer,
+        pattern=c.layer_pattern,
+        conv_kernel=c.get("base_conv_kernel", 3),  # the old config default
     )
-    return ZoologyLM(model_config)
+    model_config = ZoologyLMConfig(
+        vocab_size=c.vocab_size,
+        d_model=c.d_model,
+        state_mixer=c.state_mixer,
+        ff_mult=c.get("ff_mult", 4),  # the old config default
+    )
+    return ZoologyLM(model_config, mixers)
 
 
 def build_module(
@@ -361,14 +382,14 @@ def make_run_id(cfg: DictConfig, lr: float) -> str:
 
 def state_bytes_collector(trainer, pl_module):
     """Recurrent-state bytes of one gated-delta layer, in fp32."""
-
-    def fn(trainer, pl_module):
-        layers = pl_module.model.gated_delta_layers()
-        if not layers:
-            return {}
-        return {"bytes_per_mixer": layers[0].state_bytes_per_mixer()}
-
-    return fn
+    layers = [
+        module
+        for module in pl_module.model.modules()
+        if isinstance(module, MultistateGatedDelta)
+    ]
+    if not layers:
+        return {}
+    return {"bytes_per_mixer": layers[0].state_bytes()}
 
 
 def per_slot_summary(key, value):
@@ -403,7 +424,7 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
                     param_counts({"lambda": ["lambda_mixer"]}),
                     Stage.FIT_START,
                 ),
-                Collector("state", state_bytes_collector(), Stage.FIT_START),
+                Collector("state", state_bytes_collector, Stage.FIT_START),
                 Collector("val_final", metrics_by_prefix("val"), Stage.FIT_END),
                 Collector(
                     "mixer_stats_final", metrics_by_prefix("mixer"), Stage.FIT_END
@@ -508,10 +529,14 @@ def main(cfg: DictConfig) -> None:
         model = torch.compile(model)
     module = build_module(cfg, model, lr)
     num_params = sum(p.numel() for p in model.parameters())
+    gd_layers = [
+        module for module in model.modules() if isinstance(module, MultistateGatedDelta)
+    ]
+    state_bytes = gd_layers[0].state_bytes() if gd_layers else 0
     logger.info(
         "Model: %s parameters; recurrent state per mixer: %d bytes",
         f"{num_params:,}",
-        model.state_bytes_per_mixer(),
+        state_bytes,
     )
 
     # 7. Callbacks and loggers.
