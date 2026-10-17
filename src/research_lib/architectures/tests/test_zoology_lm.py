@@ -5,6 +5,8 @@ Target: src/research_lib/architectures/zoology_lm.py
 Run with: pytest src/research_lib/architectures/tests/test_zoology_lm.py -v
 """
 
+from typing import Any
+
 import pytest
 import torch
 
@@ -18,14 +20,16 @@ GATE_MODES = ("full", "b_only", "w_only", "kda", "gdn")
 
 
 def tiny_config(**overrides) -> ZoologyLMConfig:
-    defaults = dict(
-        vocab_size=64,
-        d_model=16,
-        n_layer=2,
-        num_heads=1,
-        t_max=32,
-        window=4,
-    )
+    # dict(...) infers dict[str, int] from the literals, which would fail
+    # the str-typed fields below at **defaults; annotate as Any-valued.
+    defaults: dict[str, Any] = {
+        "vocab_size": 64,
+        "d_model": 16,
+        "n_layer": 2,
+        "num_heads": 1,
+        "t_max": 32,
+        "window": 4,
+    }
     defaults.update(overrides)
     return ZoologyLMConfig(**defaults)
 
@@ -169,6 +173,7 @@ class TestZoologyLM:
         model = ZoologyLM(tiny_config(layout="single", collect_stats=True))
         model(torch.zeros(1, 8, dtype=torch.long))
         stats = model.gated_delta_layers()[0].latest_stats
+        assert stats is not None  # collect_stats=True fills it on forward
         assert set(stats.keys()) == {"erase_strength"}
 
     def test_state_bytes_per_mixer(self):
