@@ -646,6 +646,58 @@ class TestStatus:
 
 
 # ---------------------------------------------------------------------------
+# Stale failure fields are cleared on success
+# ---------------------------------------------------------------------------
+
+
+class TestClearsStaleFailureFields:
+    """A successful relaunch that loaded a previously failed record must
+    not keep the old error next to the success status."""
+
+    def _failed_record(self, tmp_path, run_id, module, loader):
+        cb = RunSummaryCallback(tmp_path, run_id, tiny_config_dict(), strict=True)
+        trainer = make_trainer([cb])
+        trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        cb.on_exception(trainer, module, RuntimeError("old boom"))
+        failed = read(tmp_path, run_id)
+        assert failed["status"] == "failed"
+        assert "old boom" in failed["error"]
+        assert failed["failed_stage"] is not None
+
+    def test_test_only_launch_clears_stale_failure_fields(self, tmp_path):
+        module = tiny_module()
+        loader = make_loader()
+        self._failed_record(tmp_path, "retry", module, loader)
+
+        cb2 = RunSummaryCallback(tmp_path, "retry", tiny_config_dict(), strict=True)
+        trainer2 = L.Trainer(
+            accelerator="cpu",
+            logger=False,
+            enable_progress_bar=False,
+            callbacks=[cb2],
+            limit_val_batches=0,
+        )
+        trainer2.test(module, dataloaders=loader)
+        summary = read(tmp_path, "retry")
+        assert summary["status"] == "test_done"
+        assert "error" not in summary
+        assert "failed_stage" not in summary
+
+    def test_fit_relauunch_clears_stale_failure_fields(self, tmp_path):
+        module = tiny_module()
+        loader = make_loader()
+        self._failed_record(tmp_path, "retry", module, loader)
+
+        cb2 = RunSummaryCallback(tmp_path, "retry", tiny_config_dict(), strict=True)
+        trainer2 = make_trainer([cb2])
+        trainer2.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        summary = read(tmp_path, "retry")
+        assert summary["status"] == "fit_done"
+        assert "error" not in summary
+        assert "failed_stage" not in summary
+
+
+# ---------------------------------------------------------------------------
 # Writer-unique temporary files (no *.tmp left behind)
 # ---------------------------------------------------------------------------
 

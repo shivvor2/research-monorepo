@@ -64,7 +64,7 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
     specific instance and may be tied to one task or project. A general
     synthetic-task module is deferred until a second experiment needs
     one; when it exists, :class:`MGDN2SyntheticRecallModule` will become
-    that module with fixed init arguments (see issue #7).
+    that module with fixed init arguments (see issue #8).
 
     The parent's ``training_step`` calls ``self.forward(**batch)`` and the
     synthetic batches carry extra keys (``labels``, ``slice_id``,

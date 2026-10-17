@@ -616,6 +616,10 @@ class RunSummaryCallback(L.Callback):
         # interruption (restored via load_state_dict).
         self._fit_start = time.monotonic()
         self._run_stage(Stage.FIT_START, trainer, pl_module)
+        # A successful stage clears any stale failure fields (e.g. loaded
+        # from this run's previously failed record).
+        self.summary.pop("error", None)
+        self.summary.pop("failed_stage", None)
         self.summary["status"] = "running"
         self._merge_extra()
         self._write(trainer)
@@ -643,6 +647,10 @@ class RunSummaryCallback(L.Callback):
             # writing one with only the test section.
             self._load_existing()
         self._run_stage(Stage.TEST_END, trainer, pl_module)
+        # A successful stage clears any stale failure fields loaded from
+        # this run's previously failed record.
+        self.summary.pop("error", None)
+        self.summary.pop("failed_stage", None)
         self.summary["status"] = "test_done"
         # Nothing else: timing and stopping are fit-time sections, computed
         # at fit end only. Recomputing them here would either fold the test
