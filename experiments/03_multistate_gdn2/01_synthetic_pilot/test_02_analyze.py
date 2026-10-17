@@ -345,6 +345,37 @@ class TestRenderSummary:
             )
 
 
+class TestIncompleteRunsNeverEnterTheStatistics:
+    """Only complete runs (status == 'test_done') enter the statistics,
+    like the missing-run report: a failed record that still carries test
+    metrics (e.g. a test-only relaunch that then failed) must not."""
+
+    def test_failed_core_row_excluded_from_primary(self, table):
+        table = table.copy()
+        mask = (
+            (table["tier"] == "tier1_core")
+            & (table["seed"] == 0)
+            & (table["layout"] == "ll")
+            & (table["gate_mode"] == "full")
+        )
+        assert mask.sum() == 1  # one run to corrupt
+        table.loc[mask, "status"] = "failed"
+        table.loc[mask, PRIMARY] = 9.99  # would poison the ll/full cell
+
+        primary = analyze.analyze_primary(table, N_RESAMPLES, ALPHA)
+        ll = primary[primary["layout"] == "ll"].iloc[0]
+        # Seed 0's DiD is uncomputable (its ll/full cell is incomplete):
+        # the seed is dropped, and the sentinel never enters the mean.
+        assert ll["n_seeds"] == 9
+        ws = primary[primary["layout"] == "ws"].iloc[0]
+        assert ws["n_seeds"] == 10  # untouched cells keep every seed
+
+        # The same row is listed under incomplete runs.
+        incomplete = analyze.analyze_incomplete(table)
+        assert len(incomplete) == 1
+        assert incomplete.iloc[0]["status"] == "failed"
+
+
 class TestLoadRuns:
     """The loader flattens the run JSON (one row per run file)."""
 

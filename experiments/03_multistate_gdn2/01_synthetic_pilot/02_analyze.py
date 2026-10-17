@@ -145,10 +145,19 @@ def tier_rows(table: pd.DataFrame, tier: str) -> pd.DataFrame:
     λ controls, R1 and the long-sequence tier), so to the per-seed DiD
     pairing those rows read as duplicated cells and would drop seeds.
     Calibration tiers (and smoke runs) never enter any statistic.
+
+    Only **complete** rows are returned (``status == "test_done"``), the
+    same rule as the missing-run report: a record that is anything else
+    (a crashed run, or a test-only relaunch that failed but kept the
+    earlier test metrics) never enters the statistics;
+    :func:`analyze_incomplete` reads the unfiltered table to list them.
     """
     if "tier" not in table.columns:
         return table.iloc[0:0]
-    return table[table["tier"] == tier]
+    rows = table[table["tier"] == tier]
+    if "status" in table.columns:
+        rows = rows[rows["status"].fillna("unknown") == "test_done"]
+    return rows
 
 
 # --------------------------------------------------------------------------- #
@@ -508,7 +517,7 @@ def analyze_predictions(
 
 def analyze_anchors(table: pd.DataFrame) -> pd.DataFrame:
     """Tier 6 anchor table next to Log-Linear Table 2."""
-    anchors = table[table["tier"] == "tier6_anchors"]
+    anchors = tier_rows(table, "tier6_anchors")
     if anchors.empty:
         return pd.DataFrame()
     records = []
