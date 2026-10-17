@@ -6,6 +6,7 @@ Run with: pytest src/research_lib/training/callbacks/tests/test_run_summary.py -
 """
 
 import json
+from types import SimpleNamespace
 from typing import Any, cast
 
 import lightning as L
@@ -577,6 +578,23 @@ class TestStatus:
         # The fresh process tracked nothing: stopping must be the loaded
         # fit-end section, not rewritten with best_value=None.
         assert summary["stopping"] == fit_summary["stopping"]
+
+
+# ---------------------------------------------------------------------------
+# DDP safety: only the global rank zero writes
+# ---------------------------------------------------------------------------
+
+
+class TestRankZero:
+    def test_non_zero_rank_writes_nothing(self, tmp_path):
+        cb = RunSummaryCallback(tmp_path, "rank", tiny_config_dict(), strict=True)
+        cb.summary["note"] = "pending"
+        non_zero = SimpleNamespace(is_global_zero=False)
+        cb._write(non_zero)
+        assert not (tmp_path / "rank.json").exists()
+        zero = SimpleNamespace(is_global_zero=True)
+        cb._write(zero)
+        assert (tmp_path / "rank.json").exists()
 
 
 # ---------------------------------------------------------------------------

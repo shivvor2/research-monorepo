@@ -9,6 +9,11 @@ of one configuration share a hash), provenance (git, versions, device),
 timing, early-stopping / best-monitored-value information, a lifecycle
 ``status``, and the outputs of the run's **collectors**.
 
+**DDP.** Only the global rank-zero process writes the file; the other
+ranks return before touching the file system (every rank runs the
+callback, and the ranks would race on the same temp file). Collectors
+still run on every rank, since a collector may use collective operations.
+
 Writing a collector
 -------------------
 
@@ -387,8 +392,17 @@ class RunSummaryCallback(L.Callback):
         """The resolved JSON path (``runs_dir`` / resolved ``filename``)."""
         return self.runs_dir / self.filename
 
-    def _write(self) -> None:
-        """Write the summary JSON atomically (temp file + rename)."""
+    def _write(self, trainer: L.Trainer) -> None:
+        """Write the summary JSON atomically (temp file + rename).
+
+        Only the global rank-zero process writes. Under DDP every rank
+        runs the callback and would race on the same temp file, so the
+        other ranks return before touching the file system. Collectors
+        still run on every rank — a collector may use collective
+        operations.
+        """
+        if not trainer.is_global_zero:
+            return
         self.summary["run_id"] = self.run_id
         self.summary["config"] = self.config
         self.summary["config_hash"] = config_hash(self.config)
@@ -502,7 +516,7 @@ class RunSummaryCallback(L.Callback):
         self._run_stage(Stage.FIT_START, trainer, pl_module)
         self.summary["status"] = "running"
         self._merge_extra()
-        self._write()
+        self._write(trainer)
 
     def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         self._run_stage(Stage.FIT_END, trainer, pl_module)
@@ -510,7 +524,7 @@ class RunSummaryCallback(L.Callback):
         self._update_timing(trainer)
         self._update_stopping(trainer)
         self._merge_extra()
-        self._write()
+        self._write(trainer)
 
     def on_test_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
         if not self.summary:
@@ -525,7 +539,7 @@ class RunSummaryCallback(L.Callback):
         # test-only launch, where this process tracked nothing) rewrite
         # stopping with best_value=None, destroying the loaded values.
         self._merge_extra()
-        self._write()
+        self._write(trainer)
 
     def on_validation_end(
         self, trainer: L.Trainer, pl_module: L.LightningModule
@@ -563,7 +577,7 @@ class RunSummaryCallback(L.Callback):
         self.summary["failed_stage"] = _failed_stage(trainer)
         self.summary["error"] = repr(exception)
         self._merge_extra()
-        self._write()
+        self._write(trainer)
 
 
 def _failed_stage(trainer: L.Trainer) -> str | None:
