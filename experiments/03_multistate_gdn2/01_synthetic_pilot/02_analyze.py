@@ -206,7 +206,11 @@ def paired_diff(
 
 
 def did_table_for(
-    table: pd.DataFrame, metric: str, layouts=("ws", "ll", "fs")
+    table: pd.DataFrame,
+    metric: str,
+    layouts=("ws", "ll", "fs"),
+    n_resamples: int = 10_000,
+    alpha: float = 0.05,
 ) -> pd.DataFrame:
     """Delta_int per layout for one metric, with bootstrap CIs."""
     records = []
@@ -218,7 +222,9 @@ def did_table_for(
             continue
         if deltas.empty:
             continue
-        mean, low, high = bootstrap_ci(deltas.values)
+        mean, low, high = bootstrap_ci(
+            deltas.values, n_resamples=n_resamples, alpha=alpha
+        )
         records.append(
             {
                 "layout": layout,
@@ -339,7 +345,9 @@ def analyze_long_t(table: pd.DataFrame, n_resamples: int, alpha: float) -> pd.Da
     return pd.DataFrame(records)
 
 
-def analyze_all_cells(table: pd.DataFrame) -> pd.DataFrame:
+def analyze_all_cells(
+    table: pd.DataFrame, n_resamples: int = 10_000, alpha: float = 0.05
+) -> pd.DataFrame:
     """Delta_int for every measured cell, core tier rows only."""
     frames = []
     acc_columns = [c for c in table.columns if c.startswith("test/acc")]
@@ -350,7 +358,7 @@ def analyze_all_cells(table: pd.DataFrame) -> pd.DataFrame:
         for column in acc_columns:
             if sub[column].notna().sum() == 0:
                 continue
-            result = did_table_for(sub, column)
+            result = did_table_for(sub, column, n_resamples=n_resamples, alpha=alpha)
             if not result.empty:
                 result.insert(0, "task", task)
                 frames.append(result)
@@ -520,11 +528,17 @@ def analyze_anchors(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def analyze_mixer_stats(table: pd.DataFrame) -> pd.DataFrame:
-    """Lambda / erase statistics per slot, averaged per (layout, gate_mode)."""
+    """Lambda / erase statistics per slot, averaged per (layout, gate_mode).
+
+    Core tier rows only, like every other statistic: calibration, smoke,
+    R1, long-T and lambda-control runs repeat core configurations and
+    must not mix in.
+    """
     mixer_cols = [c for c in table.columns if c.startswith("mixer/")]
     if not mixer_cols:
         return pd.DataFrame()
-    rows = table[table["layout"] != "single"]
+    rows = tier_rows(table, TIER_CORE)
+    rows = rows[rows["layout"] != "single"]
     records = []
     for (layout, gate_mode), group in rows.groupby(["layout", "gate_mode"]):
         record = {"layout": layout, "gate_mode": gate_mode, "n_runs": len(group)}
@@ -737,7 +751,7 @@ def main() -> None:
     primary = analyze_primary(table, args.n_resamples, args.alpha)
     r1 = analyze_r1(table, args.n_resamples, args.alpha)
     long_t = analyze_long_t(table, args.n_resamples, args.alpha)
-    cells = analyze_all_cells(table)
+    cells = analyze_all_cells(table, args.n_resamples, args.alpha)
     predictions = analyze_predictions(table, args.n_resamples, args.alpha)
     distance = analyze_distance(table)
     anchors = analyze_anchors(table)

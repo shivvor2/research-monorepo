@@ -381,6 +381,70 @@ class TestLoadRuns:
         assert table.iloc[0]["best_value"] == 0.9
 
 
+class TestMixerStatsCoreTier:
+    """analyze_mixer_stats selects the core tier's rows like every other
+    statistic: calibration, smoke, R1, long-T and lambda-control runs
+    must never mix in."""
+
+    def test_non_core_rows_never_mix_in(self):
+        rows = []
+        for layout in ("ws", "ll"):
+            for seed in range(2):
+                rows.append(
+                    {
+                        "tier": "tier1_core",
+                        "layout": layout,
+                        "gate_mode": "full",
+                        "run_id": f"c-{layout}-{seed}",
+                        "mixer/lambda_mean": 1.0,
+                    }
+                )
+        # A non-core row with sentinel mixer values: never mixed in.
+        rows.append(
+            {
+                "tier": "R1",
+                "layout": "ws",
+                "gate_mode": "full",
+                "run_id": "r1-sentinel",
+                "mixer/lambda_mean": 9.0,
+            }
+        )
+        out = analyze.analyze_mixer_stats(pd.DataFrame(rows))
+        ws = out[(out["layout"] == "ws") & (out["gate_mode"] == "full")].iloc[0]
+        assert ws["mixer/lambda_mean"] == 1.0  # not (1 + 1 + 9) / 3
+        assert ws["n_runs"] == 2
+
+
+class TestAllCellsSettings:
+    """--alpha / --n-resamples must reach did_all_cells.csv too."""
+
+    def test_alpha_narrows_the_all_cells_intervals(self):
+        # 4 seeds x (ws | single) x (full | kda): the ws DiD has 4 deltas.
+        acc = {"ws": {"full": 0.60, "kda": 0.45}, "single": {"full": 0.50, "kda": 0.40}}
+        rows = []
+        for seed in range(4):
+            for layout in ("ws", "single"):
+                for gate in ("full", "kda"):
+                    rows.append(
+                        {
+                            "tier": "tier1_core",
+                            "task": "mqar",
+                            "layout": layout,
+                            "gate_mode": gate,
+                            "seed": seed,
+                            "run_id": f"r-{layout}-{gate}-{seed}",
+                            "test/acc": acc[layout][gate] + 0.01 * seed,
+                        }
+                    )
+        table = pd.DataFrame(rows)
+        # bootstrap_ci seeds its RNG, so the two calls are deterministic.
+        wide = analyze.analyze_all_cells(table, 500, 0.5)
+        narrow = analyze.analyze_all_cells(table, 500, 0.05)
+        w = wide[wide["layout"] == "ws"].iloc[0]
+        n = narrow[narrow["layout"] == "ws"].iloc[0]
+        assert (w["ci_high"] - w["ci_low"]) < (n["ci_high"] - n["ci_low"])
+
+
 class TestIncompleteRuns:
     """The missing-run report separates incomplete runs by status."""
 
