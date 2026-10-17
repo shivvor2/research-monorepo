@@ -11,6 +11,8 @@ writes CSVs plus ``summary.md`` under ``analysis/``:
   core cells;
 - predictions 1-4 (tiers 2-4) with the same bootstrap;
 - the anchor table next to Log-Linear Table 2 (tier 6);
+- accuracy and old-value leakage by the write-distance bin, per layout
+  and gate mode (core tier);
 - lambda and erase-strength statistics per slot;
 - the list of missing runs per tier.
 
@@ -531,6 +533,42 @@ def analyze_missing_runs(table: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def analyze_distance(table: pd.DataFrame) -> pd.DataFrame:
+    """Accuracy and leakage by write-distance bin, per layout and gate.
+
+    Core tier rows only. The run JSONs carry the per-bin metrics from
+    ``RecallMetrics`` (``test/acc/dist={lo}-{hi}`` and
+    ``test/leak/dist={lo}-{hi}``); this table averages them over seeds per
+    (layout, gate mode), so the distance response of each row of the grid
+    is readable next to the class-binned numbers.
+    """
+    core = tier_rows(table, TIER_CORE)
+    core = core[core["task"] == "overwrite"]
+    if core.empty:
+        return pd.DataFrame()
+    dist_columns = sorted(
+        c
+        for c in core.columns
+        if c.startswith("test/acc/dist=") or c.startswith("test/leak/dist=")
+    )
+    records = []
+    for (layout, gate_mode), group in core.groupby(["layout", "gate_mode"]):
+        for column in dist_columns:
+            values = group[column].dropna()
+            if values.empty:
+                continue
+            records.append(
+                {
+                    "layout": layout,
+                    "gate_mode": gate_mode,
+                    "metric": column,
+                    "n_seeds": int(values.size),
+                    "mean": float(values.mean()),
+                }
+            )
+    return pd.DataFrame(records)
+
+
 # --------------------------------------------------------------------------- #
 # Summary rendering
 # --------------------------------------------------------------------------- #
@@ -564,6 +602,7 @@ def render_summary(
     long_t: pd.DataFrame,
     cells: pd.DataFrame,
     predictions: pd.DataFrame,
+    distance: pd.DataFrame,
     anchors: pd.DataFrame,
     missing: pd.DataFrame,
 ) -> str:
@@ -590,6 +629,10 @@ def render_summary(
     lines.append("")
     lines.append(_markdown_table(predictions))
     lines.append("")
+    lines.append("## Write distance (core tier)")
+    lines.append("")
+    lines.append(_markdown_table(distance))
+    lines.append("")
     lines.append("## Long-sequence tier (Delta_int)")
     lines.append("")
     lines.append(_markdown_table(long_t))
@@ -604,14 +647,6 @@ def render_summary(
     lines.append("")
     lines.append("## Notes and limitations")
     lines.append("")
-    lines.append(
-        "- The run JSONs record class-binned metrics only: accuracy and "
-        "leakage binned by raw `write_distance` are NOT available in this "
-        "analysis (RecallMetrics bins by placement class). For models "
-        "without block structure (single-state, ll), bin by distance "
-        "should be computed from saved checkpoints in a follow-up "
-        "(protocol §4.4 note)."
-    )
     lines.append(
         "- Missing keys in a metrics dict mean 'not measured' (empty cells "
         "are omitted by RecallMetrics), not zero."
@@ -654,6 +689,7 @@ def main() -> None:
     long_t = analyze_long_t(table, args.n_resamples, args.alpha)
     cells = analyze_all_cells(table)
     predictions = analyze_predictions(table, args.n_resamples, args.alpha)
+    distance = analyze_distance(table)
     anchors = analyze_anchors(table)
     mixer = analyze_mixer_stats(table)
     missing = analyze_missing_runs(table)
@@ -663,10 +699,13 @@ def main() -> None:
     long_t.to_csv(out_dir / "long_t_did.csv", index=False)
     cells.to_csv(out_dir / "did_all_cells.csv", index=False)
     predictions.to_csv(out_dir / "predictions.csv", index=False)
+    distance.to_csv(out_dir / "write_distance.csv", index=False)
     anchors.to_csv(out_dir / "anchors.csv", index=False)
     mixer.to_csv(out_dir / "mixer_stats.csv", index=False)
     missing.to_csv(out_dir / "missing_runs.csv", index=False)
-    summary = render_summary(primary, r1, long_t, cells, predictions, anchors, missing)
+    summary = render_summary(
+        primary, r1, long_t, cells, predictions, distance, anchors, missing
+    )
     (out_dir / "summary.md").write_text(summary, encoding="utf-8")
     logger.info("Wrote analysis to %s", out_dir)
 

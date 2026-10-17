@@ -427,12 +427,19 @@ class TestValidationLogging:
         # and turned off afterwards
         assert not module.model.gated_delta_layers()[0].collect_stats
 
-    def test_overwrite_logs_class_keys(self, fitted_overwrite):
+    def test_overwrite_logs_class_and_distance_keys(self, fitted_overwrite):
         trainer, module = fitted_overwrite
         metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
         assert "val/acc" in metrics
         assert any("/class=" in k for k in metrics)
         assert any(k.startswith("val/leak/class=") for k in metrics)
+        # The write-distance bins are logged too (overwrite batches carry
+        # write_distance; RecallMetrics bins them by default).
+        assert any(k.startswith("val/acc/dist=") for k in metrics), sorted(metrics)
+        assert any(k.startswith("val/leak/dist=") for k in metrics), sorted(metrics)
+        assert any(
+            k.startswith("val/acc/slice=") and "/dist=" in k for k in metrics
+        ), sorted(metrics)
 
     def test_test_step_logs_test_metrics(self, fitted_mqar):
         trainer, module = fitted_mqar

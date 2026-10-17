@@ -83,6 +83,8 @@ def _row(tier, task, layout, gate, seed, acc, **extra):
         PRIMARY: acc,
         SINGLE_CLASS: acc,
         DISTANT_LEAK: 0.0,
+        "test/acc/dist=32-64": acc,
+        "test/leak/dist=32-64": 0.0,
     }
     return row
 
@@ -300,14 +302,32 @@ class TestRenderSummary:
         long_t = analyze.analyze_long_t(table, N_RESAMPLES, ALPHA)
         cells = analyze.analyze_all_cells(table)
         predictions = analyze.analyze_predictions(table, N_RESAMPLES, ALPHA)
+        distance = analyze.analyze_distance(table)
         anchors = analyze.analyze_anchors(table)
         missing = analyze.analyze_missing_runs(table)
         summary = analyze.render_summary(
-            primary, r1, long_t, cells, predictions, anchors, missing
+            primary, r1, long_t, cells, predictions, distance, anchors, missing
         )
         assert "## Primary endpoint" in summary
         assert "### Under uniform weight decay (tier R1)" in summary
         assert "## Long-sequence tier" in summary
+        assert "## Write distance" in summary
         # The R1 table carries n_seeds, mean and CI columns.
         assert "n_seeds" in summary
         assert "ci_low" in summary
+
+    def test_distance_table_uses_core_tier_rows_only(self, table):
+        distance = analyze.analyze_distance(table)
+        # Per (layout, gate) x distance-metric column, averaged over the
+        # core tier's ten seeds. Tiers 4/5 and R1 repeat the core
+        # configurations with sentinel values; a leak would change the
+        # means or the seed counts.
+        assert not distance.empty
+        acc_rows = distance[distance["metric"] == "test/acc/dist=32-64"]
+        assert set(acc_rows["layout"]) == {"single", "ws", "ll"}
+        assert set(acc_rows["gate_mode"]) == {"full", "kda"}
+        for _, record in acc_rows.iterrows():
+            assert record["n_seeds"] == 10, record.to_dict()
+            assert record["mean"] == pytest.approx(
+                CORE_ACC[record["layout"]][record["gate_mode"]]
+            )
