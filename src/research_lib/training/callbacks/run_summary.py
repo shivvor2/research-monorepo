@@ -78,6 +78,7 @@ from typing import Any, Literal
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.trainer.states import TrainerFn
 
 from research_lib.training.param_utils import select_parameters
 
@@ -114,6 +115,7 @@ class Collector:
 BUILTIN_SECTIONS: tuple[str, ...] = (
     "run_id",
     "status",
+    "failed_stage",
     "error",
     "config",
     "config_hash",
@@ -551,11 +553,25 @@ class RunSummaryCallback(L.Callback):
     def on_exception(
         self, trainer: L.Trainer, pl_module: L.LightningModule, exception: BaseException
     ) -> None:
+        if not self.summary:
+            # A test-only launch (or any fresh callback) that raised:
+            # keep the existing file's sections instead of replacing the
+            # complete fit summary with built-ins and the error only.
+            self._load_existing()
         status = "interrupted" if isinstance(exception, KeyboardInterrupt) else "failed"
         self.summary["status"] = status
+        self.summary["failed_stage"] = _failed_stage(trainer)
         self.summary["error"] = repr(exception)
         self._merge_extra()
         self._write()
+
+
+def _failed_stage(trainer: L.Trainer) -> str | None:
+    """The stage that raised: ``"fit"`` / ``"test"`` (from ``trainer.state.fn``)."""
+    fn = trainer.state.fn
+    return {TrainerFn.FITTING: "fit", TrainerFn.TESTING: "test"}.get(
+        fn, str(fn) if fn is not None else None
+    )
 
 
 def _resolve_filename(template: str, fields: Mapping[str, str]) -> str:

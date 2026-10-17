@@ -433,6 +433,48 @@ class TestStatus:
         summary = read(tmp_path, "fail")
         assert summary["status"] == "failed"
         assert "boom in training" in summary["error"]
+        assert summary["failed_stage"] == "fit"
+
+    def test_test_only_failure_keeps_fit_sections(self, tmp_path):
+        """A failing test-only launch keeps the fit sections, and records
+        that the run failed during testing (not during fitting)."""
+
+        class _FailingTest(L.LightningModule):
+            def __init__(self):
+                super().__init__()
+                self.layer = torch.nn.Linear(2, 2)
+
+            def test_step(self, batch, batch_idx):
+                raise RuntimeError("boom in test")
+
+            def configure_optimizers(self):
+                return torch.optim.SGD(self.parameters(), lr=0.0)
+
+        cb = RunSummaryCallback(tmp_path, "fail-test", tiny_config_dict(), strict=True)
+        trainer = make_trainer([cb])
+        module = tiny_module()
+        loader = make_loader()
+        trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        fit_summary = read(tmp_path, "fail-test")
+
+        cb2 = RunSummaryCallback(tmp_path, "fail-test", tiny_config_dict(), strict=True)
+        trainer2 = L.Trainer(
+            accelerator="cpu",
+            logger=False,
+            enable_progress_bar=False,
+            callbacks=[cb2],
+            limit_val_batches=0,
+        )
+        with pytest.raises(RuntimeError, match="boom in test"):
+            trainer2.test(_FailingTest(), dataloaders=loader)
+        summary = read(tmp_path, "fail-test")
+        assert summary["status"] == "failed"
+        assert summary["failed_stage"] == "test"
+        assert "boom in test" in summary["error"]
+        # The fit sections are retained, not replaced.
+        assert summary["params"] == fit_summary["params"]
+        assert summary["timing"] == fit_summary["timing"]
+        assert summary["stopping"] == fit_summary["stopping"]
 
     def test_interrupted_status_from_on_exception(self, tmp_path):
         cb = RunSummaryCallback(tmp_path, "int", tiny_config_dict(), strict=True)
