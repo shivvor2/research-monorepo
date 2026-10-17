@@ -207,6 +207,47 @@ def resolve_lr(cfg: DictConfig, frozen: DictConfig) -> float:
     return float(value)
 
 
+def check_overwrite_k(cfg: DictConfig, frozen: DictConfig) -> None:
+    """Assert the overwrite task's largest K equals 2 * d_k.
+
+    The primary endpoint is defined at K = 2 * d_k, so the task file must
+    match the model width: conf/task/overwrite.yaml at d_k = 16
+    (d_model = 32), conf/task/overwrite_dk32.yaml at d_k = 32
+    (d_model = 64). On a mismatch the error names the right task file
+    (from the frozen protocol's ``overwrite_task_by_d_model`` record).
+
+    Raises:
+        RuntimeError: If the largest key count does not equal 2 * d_k.
+    """
+    if str(cfg.task.name) != "overwrite":
+        return
+    d_model = int(cfg.model.d_model)
+    num_heads = int(cfg.model.num_heads)
+    head_dim = cfg.model.get("head_dim", None)
+    dk = int(head_dim) if head_dim is not None else d_model // num_heads
+    largest_k = max(slice_values(cfg))
+    if largest_k == 2 * dk:
+        return
+    by_d_model = frozen.get("overwrite_task_by_d_model", None)
+    suggested = None
+    if by_d_model is not None:
+        suggested = by_d_model.get(d_model, None)
+    if suggested is not None:
+        hint = f"use task={suggested} (conf/task/{suggested}.yaml)"
+    else:
+        hint = (
+            "pick the task file whose largest K equals 2 * d_k "
+            "(conf/task/overwrite.yaml at d_k = 16, "
+            "conf/task/overwrite_dk32.yaml at d_k = 32)"
+        )
+    raise RuntimeError(
+        f"the overwrite task's largest K is {largest_k}, but the primary "
+        f"endpoint is defined at K = 2 * d_k = {2 * dk} (d_model={d_model}, "
+        f"num_heads={num_heads}, d_k={dk}); {hint}, or change "
+        f"model.d_model / model.num_heads to match the task"
+    )
+
+
 def build_task_config(cfg: DictConfig):
     """The generator config for the selected task."""
     name = str(cfg.task.name)
@@ -394,6 +435,10 @@ def main(cfg: DictConfig) -> None:
             f"model.t_max ({cfg.model.t_max}) must be >= task.max_seq_len "
             f"({cfg.task.max_seq_len}); the ll slot count depends on it"
         )
+
+    # 3b. The overwrite task's largest K must equal 2 * d_k (the primary
+    # endpoint is defined there); the error names the right task file.
+    check_overwrite_k(cfg, frozen)
 
     # 4. Seeds: the run seed fixes init AND the training stream.
     L.seed_everything(cfg.seed)

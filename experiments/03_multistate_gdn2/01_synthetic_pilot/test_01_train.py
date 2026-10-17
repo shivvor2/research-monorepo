@@ -37,15 +37,20 @@ def make_cfg(
     lr=None,
     tier=None,
     d_model=32,
+    num_heads=2,
+    head_dim=None,
+    num_keys=(8, 16, 32),
 ):
     return OmegaConf.create(
         {
             "optimizer": {"lr": lr},
-            "task": {"name": task},
+            "task": {"name": task, "num_keys": list(num_keys)},
             "model": {
                 "layout": layout,
                 "gate_mode": gate_mode,
                 "d_model": d_model,
+                "num_heads": num_heads,
+                "head_dim": head_dim,
             },
             "experiment": {"tier": tier},
         }
@@ -298,3 +303,57 @@ class TestResolveLr:
                 )
                 lr = train.resolve_lr(cfg, frozen)
                 assert 0 < lr < 1, (tier, variant, lr)
+
+
+class TestOverwriteTaskFollowsDModel:
+    """The overwrite task's largest K must equal 2 * d_k."""
+
+    @pytest.fixture
+    def frozen_with_tasks(self, frozen):
+        return OmegaConf.merge(
+            frozen,
+            {
+                "overwrite_task_by_d_model": {
+                    32: "overwrite",
+                    64: "overwrite_dk32",
+                }
+            },
+        )
+
+    def test_matching_config_passes(self, frozen_with_tasks):
+        # d_model=32, num_heads=2 -> d_k=16 -> largest K = 32.
+        cfg = make_cfg(d_model=32, num_heads=2, num_keys=(8, 16, 32))
+        train.check_overwrite_k(cfg, frozen_with_tasks)
+        # d_model=64, num_heads=2 -> d_k=32 -> largest K = 64.
+        cfg = make_cfg(d_model=64, num_heads=2, num_keys=(16, 32, 64))
+        train.check_overwrite_k(cfg, frozen_with_tasks)
+        # head_dim overrides d_model / num_heads.
+        cfg = make_cfg(d_model=64, num_heads=2, head_dim=16, num_keys=(8, 16, 32))
+        train.check_overwrite_k(cfg, frozen_with_tasks)
+
+    def test_mismatch_names_the_right_task_file(self, frozen_with_tasks):
+        # d_model=64 (d_k=32, largest K must be 64) but the d_k=16 task file.
+        cfg = make_cfg(d_model=64, num_heads=2, num_keys=(8, 16, 32))
+        with pytest.raises(RuntimeError) as exc:
+            train.check_overwrite_k(cfg, frozen_with_tasks)
+        assert "K = 2 * d_k = 64" in str(exc.value)
+        assert "use task=overwrite_dk32 (conf/task/overwrite_dk32.yaml)" in str(
+            exc.value
+        )
+        # The reverse: d_model=32 with the d_k=32 task file.
+        cfg = make_cfg(d_model=32, num_heads=2, num_keys=(16, 32, 64))
+        with pytest.raises(RuntimeError) as exc:
+            train.check_overwrite_k(cfg, frozen_with_tasks)
+        assert "use task=overwrite (conf/task/overwrite.yaml)" in str(exc.value)
+
+    def test_mismatch_without_the_record_still_fails_loudly(self, frozen):
+        # No overwrite_task_by_d_model record: generic hint, still loud.
+        cfg = make_cfg(d_model=64, num_heads=2, num_keys=(8, 16, 32))
+        with pytest.raises(RuntimeError) as exc:
+            train.check_overwrite_k(cfg, frozen)
+        assert "largest K is 32" in str(exc.value)
+        assert "conf/task/overwrite_dk32.yaml" in str(exc.value)
+
+    def test_non_overwrite_tasks_are_untouched(self, frozen_with_tasks):
+        cfg = make_cfg(task="mqar", d_model=64, num_keys=(8, 16, 32))
+        train.check_overwrite_k(cfg, frozen_with_tasks)  # no raise

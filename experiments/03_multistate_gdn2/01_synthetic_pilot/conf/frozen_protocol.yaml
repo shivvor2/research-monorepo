@@ -38,3 +38,12 @@ anchor_lr:
   16: {single: null, ll: null}
   32: {single: null, ll: null}
   64: {single: null, ll: null}
+
+# The overwrite task file that goes with the chosen d_model: the largest K
+# must equal 2 * d_k (d_k = d_model / num_heads when head_dim is unset),
+# because the primary endpoint is defined there. 01_train.py enforces this
+# and names the right file on a mismatch. The mapping is complete, so it
+# needs no edit at the end of calibration.
+overwrite_task_by_d_model:
+  32: overwrite       # d_k = 16, K in {8, 16, 32}, T = 256
+  64: overwrite_dk32  # d_k = 32, K in {16, 32, 64}, T = 512
