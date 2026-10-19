@@ -93,7 +93,11 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
         answer_head: Evaluate the LM head only at answer positions under
             ``loss_on="answers"`` (the default; exact, see the module
             docstring). Requires the model to provide ``hidden_states``
-            and ``head`` methods.
+            and ``head`` methods. With ``compile: true`` the answer-head
+            path runs the model uncompiled (``torch.compile`` compiles
+            only the model's ``forward``, and the path calls
+            ``hidden_states`` and ``head`` directly); use
+            ``answer_head: false`` for compiled runs.
         **kwargs: Forwarded to
             :class:`~research_lib.training.modules.DualOptimizerModule`
             (model, optimizer and schedule configs, target modules, …).
