@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .. import rotatory_mha
 from ..rotatory_mha import RotaryMultiheadAttention
 
 
@@ -231,6 +232,198 @@ class TestRotaryMultiheadAttention:
 
         assert output.shape == x.shape
         assert weights[:, :, :8].max() < 1e-5
+
+    def test_causal_with_key_padding_mask_runs(self, default_config, sample_input):
+        """is_causal=True plus a padding mask must not raise (torch >= 2.14)."""
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+        x = sample_input
+        key_padding_mask = torch.zeros(x.shape[:2], dtype=torch.bool)
+        key_padding_mask[:, -4:] = True
+
+        with torch.no_grad():
+            output, weights = attn(
+                x,
+                x,
+                x,
+                key_padding_mask=key_padding_mask,
+                is_causal=True,
+                need_weights=False,
+            )
+
+        assert output.shape == x.shape
+        assert weights is None
+        assert torch.isfinite(output).all()
+
+    def test_causal_with_attn_mask_runs(self, default_config, sample_input):
+        """is_causal=True plus an explicit attn mask must not raise."""
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+        x = sample_input
+        seq_len = x.shape[1]
+        attn_mask = torch.zeros(seq_len, seq_len, dtype=torch.bool)
+        attn_mask[:, 2] = True
+
+        with torch.no_grad():
+            output, weights = attn(
+                x,
+                x,
+                x,
+                attn_mask=attn_mask,
+                is_causal=True,
+                need_weights=False,
+            )
+
+        assert output.shape == x.shape
+        assert weights is None
+        assert torch.isfinite(output).all()
+
+    @pytest.mark.parametrize("mask_kind", ["key_padding", "attn", "both"])
+    def test_causal_masked_sdpa_matches_manual(
+        self, default_config, sample_input, mask_kind
+    ):
+        """SDPA and manual paths agree when causal and explicit masks are folded."""
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+        x = sample_input
+        seq_len = x.shape[1]
+
+        key_padding_mask = None
+        attn_mask = None
+        if mask_kind in ("key_padding", "both"):
+            key_padding_mask = torch.zeros(x.shape[:2], dtype=torch.bool)
+            key_padding_mask[:, -3:] = True
+        if mask_kind in ("attn", "both"):
+            attn_mask = torch.zeros(seq_len, seq_len, dtype=torch.bool)
+            attn_mask[:, 2] = True
+
+        with torch.no_grad():
+            output_sdpa, _ = attn(
+                x,
+                x,
+                x,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                is_causal=True,
+                need_weights=False,
+            )
+            output_manual, _ = attn(
+                x,
+                x,
+                x,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                is_causal=True,
+                need_weights=True,
+            )
+
+        assert torch.allclose(output_sdpa, output_manual, atol=1e-5, rtol=1e-5)
+
+    def test_causal_masked_matches_explicit_full_mask(
+        self, default_config, sample_input
+    ):
+        """A causal+padding path equals an explicit padding-or-causal mask."""
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+        x = sample_input
+        batch_size, seq_len, _ = x.shape
+
+        padding = torch.zeros(seq_len, dtype=torch.bool)
+        padding[-3:] = True
+        key_padding_mask = padding.unsqueeze(0).expand(batch_size, -1).clone()
+        full_mask = padding.unsqueeze(0) | torch.triu(
+            torch.ones(seq_len, seq_len, dtype=torch.bool), diagonal=1
+        )
+
+        with torch.no_grad():
+            output_causal, _ = attn(
+                x,
+                x,
+                x,
+                key_padding_mask=key_padding_mask,
+                is_causal=True,
+                need_weights=False,
+            )
+            output_explicit, _ = attn(
+                x,
+                x,
+                x,
+                attn_mask=full_mask,
+                is_causal=False,
+                need_weights=False,
+            )
+
+        assert torch.allclose(output_causal, output_explicit, atol=1e-5, rtol=1e-5)
+
+    def test_no_mask_keeps_sdpa_is_causal(
+        self, default_config, sample_input, monkeypatch
+    ):
+        """SDPA keeps its native causal path only when no explicit mask exists."""
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+        x = sample_input
+        calls = []
+        real_sdpa = F.scaled_dot_product_attention
+
+        def recording_sdpa(*args, **kwargs):
+            calls.append(dict(kwargs))
+            return real_sdpa(*args, **kwargs)
+
+        monkeypatch.setattr(
+            rotatory_mha.F, "scaled_dot_product_attention", recording_sdpa
+        )
+
+        with torch.no_grad():
+            attn(x, x, x, is_causal=True, need_weights=False)
+            assert calls[-1]["attn_mask"] is None
+            assert calls[-1]["is_causal"] is True
+
+            key_padding_mask = torch.zeros(x.shape[:2], dtype=torch.bool)
+            key_padding_mask[:, -3:] = True
+            attn(
+                x,
+                x,
+                x,
+                key_padding_mask=key_padding_mask,
+                is_causal=True,
+                need_weights=False,
+            )
+
+        assert calls[-1]["attn_mask"] is not None
+        assert calls[-1]["is_causal"] is False
+
+    def test_causal_padded_keys_do_not_leak(self, default_config, sample_input):
+        """Padded keys must not affect outputs at non-padded query positions."""
+        attn = RotaryMultiheadAttention(**default_config)
+        attn.eval()
+        x1 = sample_input
+        x2 = x1.clone()
+        x2[:, 4:6, :] = torch.randn_like(x2[:, 4:6, :])
+
+        key_padding_mask = torch.zeros(x1.shape[:2], dtype=torch.bool)
+        key_padding_mask[:, 4:6] = True
+        real = torch.ones(x1.shape[1], dtype=torch.bool)
+        real[4:6] = False
+
+        with torch.no_grad():
+            output1, _ = attn(
+                x1,
+                x1,
+                x1,
+                key_padding_mask=key_padding_mask,
+                is_causal=True,
+                need_weights=False,
+            )
+            output2, _ = attn(
+                x2,
+                x2,
+                x2,
+                key_padding_mask=key_padding_mask,
+                is_causal=True,
+                need_weights=False,
+            )
+
+        assert torch.allclose(output1[:, real], output2[:, real], atol=1e-5, rtol=1e-5)
 
     # =========================================================================
     # API Compatibility Tests

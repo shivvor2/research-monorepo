@@ -300,7 +300,9 @@ class RotaryMultiheadAttention(nn.Module):
                        True = ignore, False = attend (for bool masks).
             average_attn_weights: If True, returns attention weights averaged across
                                   heads. Default: True.
-            is_causal: If True, applies a causal mask. Default: False.
+            is_causal: If True, applies a causal mask. If an explicit mask is
+                       also supplied, the causal mask is merged into it.
+                       Default: False.
             seqlen_offset: Position offset for rotary embeddings (for KV-cache).
                            Only used when use_xpos=False. Default: 0.
 
@@ -373,9 +375,17 @@ class RotaryMultiheadAttention(nn.Module):
         # Apply rotary embeddings to Q and K
         q, k = self._apply_rotary(q, k, seq_dim=-2, offset=seqlen_offset)
 
-        # Prepare attention mask
-        combined_mask = self._prepare_attention_mask(
-            attn_mask, key_padding_mask, q.dtype, batch_size, tgt_len, src_len, q.device
+        # Prepare attention mask. The causal mask is folded into an explicit
+        # mask so SDPA never receives both attn_mask and is_causal=True.
+        combined_mask, sdpa_is_causal = self._prepare_attention_mask(
+            attn_mask,
+            key_padding_mask,
+            q.dtype,
+            batch_size,
+            tgt_len,
+            src_len,
+            q.device,
+            is_causal,
         )
 
         # Compute attention
@@ -383,7 +393,7 @@ class RotaryMultiheadAttention(nn.Module):
 
         if need_weights:
             attn_output, attn_weights = self._attention_with_weights(
-                q, k, v, combined_mask, is_causal, dropout_p, average_attn_weights
+                q, k, v, combined_mask, sdpa_is_causal, dropout_p, average_attn_weights
             )
         else:
             # Use efficient SDPA (no attention weights returned)
@@ -393,7 +403,7 @@ class RotaryMultiheadAttention(nn.Module):
                 v,
                 attn_mask=combined_mask,
                 dropout_p=dropout_p,
-                is_causal=is_causal,
+                is_causal=sdpa_is_causal,
             )
             attn_weights = None
 
@@ -436,8 +446,17 @@ class RotaryMultiheadAttention(nn.Module):
         tgt_len: int,
         src_len: int,
         device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        """Prepare and combine attention masks for SDPA."""
+        is_causal: bool,
+    ) -> Tuple[Optional[torch.Tensor], bool]:
+        """Prepare and combine attention masks for SDPA.
+
+        Returns:
+            combined_mask: The additive mask, or None when no explicit mask was
+                supplied.
+            sdpa_is_causal: True only when SDPA can use its native causal fast
+                path. When an explicit mask is present, the causal mask is
+                folded into ``combined_mask`` and this is False.
+        """
         combined_mask = None
 
         if attn_mask is not None:
@@ -469,7 +488,16 @@ class RotaryMultiheadAttention(nn.Module):
             else:
                 combined_mask = padding_mask_float
 
-        return combined_mask
+        if combined_mask is not None and is_causal:
+            # Fold causality into the explicit mask. Addition broadcasts a
+            # (L, S) causal mask over padding-only (N, 1, 1, S) masks.
+            causal = torch.ones(tgt_len, src_len, dtype=torch.bool, device=device)
+            causal = causal.triu(1)
+            causal_additive = torch.zeros(tgt_len, src_len, dtype=dtype, device=device)
+            causal_additive.masked_fill_(causal, float("-inf"))
+            combined_mask = combined_mask + causal_additive
+
+        return combined_mask, bool(is_causal and combined_mask is None)
 
     def _attention_with_weights(
         self,
@@ -477,7 +505,7 @@ class RotaryMultiheadAttention(nn.Module):
         k: torch.Tensor,
         v: torch.Tensor,
         combined_mask: Optional[torch.Tensor],
-        is_causal: bool,
+        apply_causal: bool,
         dropout_p: float,
         average_attn_weights: bool,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -491,7 +519,7 @@ class RotaryMultiheadAttention(nn.Module):
         if combined_mask is not None:
             attn_weights = attn_weights + combined_mask
 
-        if is_causal:
+        if apply_causal:
             causal_mask = torch.triu(
                 torch.ones(tgt_len, src_len, device=q.device, dtype=torch.bool),
                 diagonal=1,
