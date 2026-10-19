@@ -20,10 +20,10 @@ The readings:
   Gated DeltaNet numbers at the chosen width. The choice itself is a
   judgment (keep the default unless it lands far outside the published
   range), so the report prints the numbers and marks no verdict.
-- learning rates: per core configuration, the LR with the best mean
-  accuracy; ties go to the fewer mean steps to the best value, then to
-  the smaller LR. The anchors get their own per-(d_model, layout)
-  table.
+- learning rates: per width and core configuration, the LR with the
+  best mean accuracy; ties go to the fewer mean steps to the best
+  value, then to the smaller LR. The anchors get their own
+  per-(d_model, layout) table.
 - a ``frozen_protocol.yaml`` snippet filled from the readings, with
   ``null`` for the fields whose step has not run.
 - missing runs per calibration tier.
@@ -213,6 +213,7 @@ def _fmt_lr(value) -> str:
 
 def frozen_snippet(
     d_model: int | None,
+    lr_width: int | None,
     lr_cells: pd.DataFrame,
     anchor_cells: pd.DataFrame,
 ) -> str:
@@ -221,12 +222,18 @@ def frozen_snippet(
     Fields whose calibration step has not run stay ``null``. The harness
     block is left ``null`` on purpose: its reading is a judgment (keep
     the default unless far outside the published range), made when the
-    snippet is pasted.
+    snippet is pasted. The ``lr_table`` takes only the rows at ``lr_width``
+    (the width the snippet uses), so learning rates measured at another
+    width never fill it.
 
     Args:
         d_model: The width reading (``None`` = the step has not run).
+        lr_width: The width whose ``lr_cells`` rows fill the table —
+            the width reading, else the single width measured (``None``
+            = no width to use: the entries stay ``null``).
         lr_cells: The ``calib_lr`` reading table (one row per
-            (task, layout, gate, lr), with a ``selected`` column).
+            (d_model, task, layout, gate, lr), with a ``selected``
+            column).
         anchor_cells: The ``calib_lr_anchors`` reading table (one row
             per (d_model, layout, lr), with a ``selected`` column).
 
@@ -234,8 +241,9 @@ def frozen_snippet(
         str: The YAML text, ready to paste.
     """
     selected_lr: dict[tuple, float] = {}
-    if not lr_cells.empty:
-        picked = lr_cells[lr_cells["selected"]]
+    if not lr_cells.empty and lr_width is not None:
+        at_width = lr_cells[lr_cells["d_model"] == lr_width]
+        picked = at_width[at_width["selected"]]
         for _, row in picked.iterrows():
             selected_lr[(row["task"], row["layout"], row["gate_mode"])] = float(
                 row["lr"]
@@ -293,7 +301,9 @@ def run(table: pd.DataFrame) -> dict:
     Returns:
         dict: ``dmodel`` (table), ``dmodel_choice`` (d, reading),
         ``harness`` (table), ``lr`` (table), ``lr_anchors`` (table),
-        ``missing`` (table), ``snippet`` (YAML text).
+        ``missing`` (table), ``snippet`` (YAML text),
+        ``lr_width_note`` (a one-line warning when the learning rates
+        span several widths and no width reading exists to pick one).
     """
     dmodel_rows = _selection_rows(table, TIER_CALIB_DMODEL)
     dmodel = _per_seed_mean(dmodel_rows, "d_model").sort_values("d_model")
@@ -326,11 +336,26 @@ def run(table: pd.DataFrame) -> dict:
         )
 
     lr_rows = _selection_rows(table, TIER_CALIB_LR)
-    lr = _lr_reading(lr_rows, ["task", "layout", "gate_mode"])
+    lr = _lr_reading(lr_rows, ["d_model", "task", "layout", "gate_mode"])
     anchor_rows = _selection_rows(table, TIER_CALIB_LR_ANCHORS)
     lr_anchors = _lr_reading(anchor_rows, ["d_model", "layout"])
     missing = calibration_missing(table)
-    snippet = frozen_snippet(d_choice, lr, lr_anchors)
+    # The snippet's lr_table uses one width: the width reading when it
+    # exists; otherwise the single width the records ran at. Several
+    # widths with no reading leave the table null — the widths cannot
+    # be averaged, and the report says which step is missing.
+    lr_widths = sorted(int(w) for w in lr["d_model"].dropna().unique())
+    snippet_width = d_choice
+    lr_width_note = None
+    if snippet_width is None and len(lr_widths) == 1:
+        snippet_width = lr_widths[0]
+    elif snippet_width is None and len(lr_widths) > 1:
+        lr_width_note = (
+            f"calib_lr records found at widths {lr_widths}; the width "
+            "step (calib_dmodel) must be recorded before the "
+            "learning-rate table can be filled"
+        )
+    snippet = frozen_snippet(d_choice, snippet_width, lr, lr_anchors)
     return {
         "dmodel": dmodel,
         "dmodel_choice": (d_choice, d_reading),
@@ -339,6 +364,7 @@ def run(table: pd.DataFrame) -> dict:
         "lr_anchors": lr_anchors,
         "missing": missing,
         "snippet": snippet,
+        "lr_width_note": lr_width_note,
     }
 
 
@@ -382,12 +408,16 @@ def render(readings: dict) -> str:
     )
     lines.append("")
     lines.append(
-        "### Learning rates (best mean accuracy; ties: fewer steps to the "
-        "best value, then the smaller LR)"
+        "### Learning rates (per width and core configuration; best mean "
+        "accuracy; ties: fewer steps to the best value, then the smaller "
+        "LR)"
     )
     lines.append("")
     lines.append(markdown_table(readings["lr"]))
     lines.append("")
+    if readings.get("lr_width_note"):
+        lines.append(f"{readings['lr_width_note']}.")
+        lines.append("")
     lines.append("### Anchor learning rates (per d_model and layout)")
     lines.append("")
     lines.append(markdown_table(readings["lr_anchors"]))

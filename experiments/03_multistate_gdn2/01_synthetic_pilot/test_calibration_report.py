@@ -353,6 +353,25 @@ class TestLRSelection:
         }
 
 
+def _lr_grid_rows(
+    d_model, lr, accs, *, task="overwrite", layout="ws", gate_mode="full"
+):
+    """A calib_lr grid point: one selection-seed row per given accuracy."""
+    return [
+        _calib_row(
+            "calib_lr",
+            seed,
+            value,
+            lr=lr,
+            d_model=d_model,
+            task=task,
+            layout=layout,
+            gate_mode=gate_mode,
+        )
+        for seed, value in zip(SELECTION_SEEDS, accs, strict=True)
+    ]
+
+
 class TestSnippet:
     """The snippet parses as YAML and mirrors the readings."""
 
@@ -417,6 +436,52 @@ class TestSnippet:
         assert snippet.anchor_lr[16].ll is None
         assert snippet.anchor_lr[32].ll == 0.001
         assert snippet.anchor_lr[64].single is None
+
+    def test_snippet_uses_only_the_width_reading_s_lr_rows(self):
+        # calib_lr records at two widths (runs launched before the width
+        # was frozen can straddle widths); at width 32 the 0.001 grid
+        # point wins, at 64 the 0.003 one does. The reading keeps the
+        # widths apart, and the snippet uses only the width the reading
+        # chose (64), never an average across widths.
+        rows = _dmodel_table({32: (0.99, 0.99), 64: (0.7, 0.9)}).to_dict("records")
+        rows += _lr_grid_rows(32, 0.001, (0.8, 0.82))
+        rows += _lr_grid_rows(32, 0.003, (0.5, 0.52))
+        rows += _lr_grid_rows(64, 0.001, (0.5, 0.52))
+        rows += _lr_grid_rows(64, 0.003, (0.8, 0.82))
+        readings = calibration.run(pd.DataFrame(rows))
+        lr_table = readings["lr"]
+        # One row per (width, lr): the widths are never averaged.
+        assert len(lr_table) == 4
+        assert set(lr_table["d_model"]) == {32, 64}
+        selected = lr_table[lr_table["selected"]]
+        assert {(int(r["d_model"]), r["lr"]) for _, r in selected.iterrows()} == {
+            (32, 0.001),
+            (64, 0.003),
+        }
+        snippet = OmegaConf.create(readings["snippet"])
+        assert snippet.d_model == 64
+        assert snippet.lr_table.overwrite.ws.full == 0.003
+
+    def test_snippet_lr_table_null_across_several_widths_without_a_reading(self):
+        # The same two widths, but no width step has run: the snippet
+        # cannot know which width's learning rates to fill, so its
+        # lr_table stays null and the report says so in one line.
+        rows = (
+            _lr_grid_rows(32, 0.001, (0.8, 0.82))
+            + _lr_grid_rows(32, 0.003, (0.5, 0.52))
+            + _lr_grid_rows(64, 0.001, (0.5, 0.52))
+            + _lr_grid_rows(64, 0.003, (0.8, 0.82))
+        )
+        readings = calibration.run(pd.DataFrame(rows))
+        assert readings["dmodel_choice"] == (None, None)
+        snippet = OmegaConf.create(readings["snippet"])
+        assert snippet.lr_table.overwrite.ws.full is None
+        # One line naming the widths found and the missing step.
+        note = readings["lr_width_note"]
+        assert "32" in note
+        assert "64" in note
+        assert "calib_dmodel" in note
+        assert note in calibration.render(readings)
 
     def test_snippet_nulls_when_nothing_has_run(self):
         readings = calibration.run(
