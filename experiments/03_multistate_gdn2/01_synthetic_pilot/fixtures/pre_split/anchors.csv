@@ -1,0 +1,7 @@
+d_model,layout,n_seeds,acc_mean,acc_std,log_linear_acc,log_linear_std
+16,ll,5,0.99,0.0,40.0,1.4
+16,single,5,0.99,0.0,38.4,1.0
+32,ll,5,0.99,0.0,84.4,1.2
+32,single,5,0.99,0.0,79.0,2.1
+64,ll,5,0.99,0.0,99.0,
+64,single,5,0.99,0.0,99.0,

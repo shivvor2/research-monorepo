@@ -1,0 +1,5 @@
+layout,metric,n_seeds,mean,ci_low,ci_high,reading
+ws,test/acc,10,0.04999999999999999,0.04999999999999999,0.04999999999999999,CI entirely above 0: supports the hypothesis at pilot scale
+ll,test/acc,10,0.09999999999999991,0.09999999999999991,0.09999999999999991,CI entirely above 0: supports the hypothesis at pilot scale
+ws,test/acc/slice=32,10,0.04999999999999999,0.04999999999999999,0.04999999999999999,CI entirely above 0: supports the hypothesis at pilot scale
+ll,test/acc/slice=32,10,0.09999999999999991,0.09999999999999991,0.09999999999999991,CI entirely above 0: supports the hypothesis at pilot scale

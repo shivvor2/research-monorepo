@@ -1,0 +1,11 @@
+task,layout,metric,n_seeds,mean,ci_low,ci_high,reading
+overwrite,ws,test/acc,10,0.04999999999999999,0.04999999999999999,0.04999999999999999,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ll,test/acc,10,0.09999999999999998,0.09999999999999998,0.09999999999999998,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ws,test/acc/slice=32,10,0.04999999999999999,0.04999999999999999,0.04999999999999999,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ll,test/acc/slice=32,10,0.09999999999999998,0.09999999999999998,0.09999999999999998,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ws,test/acc/slice=32/class=distant,10,0.04999999999999999,0.04999999999999999,0.04999999999999999,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ll,test/acc/slice=32/class=distant,10,0.09999999999999998,0.09999999999999998,0.09999999999999998,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ws,test/acc/slice=32/class=single,10,0.04999999999999999,0.04999999999999999,0.04999999999999999,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ll,test/acc/slice=32/class=single,10,0.09999999999999998,0.09999999999999998,0.09999999999999998,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ws,test/acc/dist=32-64,10,0.04999999999999999,0.04999999999999999,0.04999999999999999,CI entirely above 0: supports the hypothesis at pilot scale
+overwrite,ll,test/acc/dist=32-64,10,0.09999999999999998,0.09999999999999998,0.09999999999999998,CI entirely above 0: supports the hypothesis at pilot scale

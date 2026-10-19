@@ -44,6 +44,18 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from lightning.pytorch.trainer.states import TrainerStatus
 from omegaconf import DictConfig, OmegaConf
 
+# The protocol's tier names, one source of truth shared with the analysis
+# reports (pilot_analysis/protocol.py): a tier added there cannot
+# silently skip the frozen-choice gate, and a tier added here cannot
+# silently vanish from the analysis's expected-run counts.
+from pilot_analysis.protocol import (
+    PROTOCOL_TIERS,
+    TIER_ANCHORS,
+    TIER_CALIB_DMODEL,
+    TIER_CALIB_HARNESS,
+    TIER_CALIB_LR_ANCHORS,
+)
+
 # Library imports
 from research_lib.architectures.config import ZoologyLMConfig
 from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
@@ -293,7 +305,7 @@ def lr_source(cfg: DictConfig) -> tuple[str, str, str, str | None]:
     layout = str(cfg.model.layout)
     gate_mode = str(cfg.model.gate_mode)
     tier = str(cfg.experiment.get("tier", None) or "")
-    if tier == "tier6_anchors":
+    if tier == TIER_ANCHORS:
         return task, layout, gate_mode, int(cfg.model.d_model)
     if gate_mode == "gdn":
         raise RuntimeError(
@@ -424,28 +436,12 @@ def check_overwrite_k(cfg: DictConfig, frozen: DictConfig) -> None:
     )
 
 
-# The protocol's tiers: every calibration tier plus every tier the
-# analysis's expected-runs table counts (02_analyze.py EXPECTED_RUNS).
-# check_frozen_choices applies to these ONLY: tooling configs (the smoke
-# and debug configs, or no tier at all) are not protocol runs and must
-# not trip the gate - an allow-list is safer than exempting them one by
-# one, because the next tooling config would hit the same problem.
-PROTOCOL_TIERS: frozenset[str] = frozenset(
-    {
-        "calib_dmodel",
-        "calib_harness",
-        "calib_lr",
-        "calib_lr_anchors",
-        "tier1_core",
-        "tier2_gates",
-        "tier3_frozen",
-        "tier4_lambda",
-        "tier5_matched_bytes",
-        "tier6_anchors",
-        "tier_longT",
-        "R1",
-    }
-)
+# check_frozen_choices applies to PROTOCOL_TIERS ONLY (imported from
+# pilot_analysis.protocol, one source of truth with the analysis
+# reports): tooling configs (the smoke and debug configs, or no tier at
+# all) are not protocol runs and must not trip the gate - an allow-list
+# is safer than exempting them one by one, because the next tooling
+# config would hit the same problem.
 
 
 def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
@@ -476,9 +472,9 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
 
     frozen_d_model = frozen.get("d_model", None)
     if frozen_d_model is not None and tier not in (
-        "calib_dmodel",
-        "calib_lr_anchors",
-        "tier6_anchors",
+        TIER_CALIB_DMODEL,
+        TIER_CALIB_LR_ANCHORS,
+        TIER_ANCHORS,
     ):
         if int(cfg.model.d_model) != int(frozen_d_model):
             raise RuntimeError(
@@ -492,7 +488,7 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
     if harness is not None:
         for key in ("layer_pattern", "state_mixer"):
             frozen_value = harness.get(key, None)
-            if frozen_value is None or tier == "calib_harness":
+            if frozen_value is None or tier == TIER_CALIB_HARNESS:
                 continue
             if str(cfg.model[key]) != str(frozen_value):
                 raise RuntimeError(
@@ -657,7 +653,7 @@ def per_slot_summary(key, value):
 
     if key.startswith("lambda_"):
         per_slot = value.float().mean(dim=0)  # average over heads -> (L,)
-        return {f"{key}/slot{l}": float(v) for l, v in enumerate(per_slot)}
+        return {f"{key}/slot{slot}": float(v) for slot, v in enumerate(per_slot)}
     return {key: float(value.float().mean())}
 
 

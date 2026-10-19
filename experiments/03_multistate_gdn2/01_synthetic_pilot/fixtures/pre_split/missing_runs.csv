@@ -1,0 +1,13 @@
+tier,expected,observed,missing
+calib_dmodel,4,24,-20
+calib_harness,4,24,-20
+calib_lr,72,24,48
+calib_lr_anchors,36,24,12
+tier1_core,120,60,60
+tier2_gates,60,30,30
+tier3_frozen,20,10,10
+tier4_lambda,40,20,20
+tier5_matched_bytes,10,5,5
+tier6_anchors,30,30,0
+tier_longT,60,60,0
+R1,30,30,0

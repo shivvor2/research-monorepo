@@ -1,0 +1,13 @@
+prediction,layout,gate_mode,n_seeds,mean,ci_low,ci_high
+P1 recovered fraction (test/acc/slice=32/class=distant),ws,b_only,5,0.0,0.0,0.0
+P1 recovered fraction (test/acc/slice=32/class=distant),ws,w_only,5,0.0,0.0,0.0
+P1 recovered fraction (test/acc/slice=32/class=distant),ll,b_only,5,0.0,0.0,0.0
+P1 recovered fraction (test/acc/slice=32/class=distant),ll,w_only,5,0.0,0.0,0.0
+P2 ws - fs (test/acc/slice=32/class=distant),ws-fs,full,5,-0.39,-0.39,-0.39
+P2 ws - fs (test/leak/slice=32/class=distant),ws-fs,full,5,0.0,0.0,0.0
+P2 ws - fs (test/acc/slice=32/class=distant),ws-fs,kda,5,-0.54,-0.54,-0.54
+P2 ws - fs (test/leak/slice=32/class=distant),ws-fs,kda,5,0.0,0.0,0.0
+P3 ws - fs (test/acc/slice=32/class=single),ws-fs,full,5,-0.39,-0.39,-0.39
+P3 ws - fs (test/acc/slice=32/class=single),ws-fs,kda,5,-0.54,-0.54,-0.54
+P4 static - single-full (test/acc/slice=32/class=distant),ws,full,5,0.49000000000000005,0.49000000000000005,0.49000000000000005
+P4 static - single-full (test/acc/slice=32/class=distant),ll,full,5,0.49000000000000005,0.49000000000000005,0.49000000000000005
