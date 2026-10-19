@@ -15,6 +15,7 @@ from pilot_analysis.base import Report, ReportFn, ReportOptions
 from pilot_analysis.reports import (
     all_cells,
     anchors,
+    calibration,
     completeness,
     distance,
     frozen,
@@ -36,7 +37,8 @@ __all__ = [
     "ReportOptions",
 ]
 
-# One entry per report, in summary order.
+# One entry per report, in summary order. `calibration` is registered but
+# excluded from `all`: it is a Phase-1 reading, not a tier summary.
 REPORTS: dict[str, ReportFn] = {
     "primary": primary.report,
     "robustness": robustness.report,
@@ -50,6 +52,7 @@ REPORTS: dict[str, ReportFn] = {
     "matched_bytes": matched_bytes.report,
     "mixer": mixer.report,
     "completeness": completeness.report,
+    "calibration": calibration.report,
 }
 
 REPORT_TITLES: dict[str, str] = {
@@ -65,7 +68,8 @@ REPORT_TITLES: dict[str, str] = {
     "matched_bytes": matched_bytes.TITLE,
     "mixer": mixer.TITLE,
     "completeness": completeness.TITLE,
+    "calibration": calibration.TITLE,
 }
 
-SUMMARY_EXCLUDES: tuple[str, ...] = ()
+SUMMARY_EXCLUDES: tuple[str, ...] = ("calibration",)
 """Reports registered but never run by ``all``."""

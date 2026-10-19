@@ -521,6 +521,13 @@ class TestReportRegistry:
         all_stems = [stem for _, stem in stems]
         assert len(all_stems) == len(set(all_stems)), stems
 
+    def test_all_excludes_calibration(self):
+        names, is_all = cli.expand_names(["all"])
+        assert is_all
+        assert names == [n for n in REPORTS if n not in SUMMARY_EXCLUDES]
+        assert "calibration" not in names
+        assert "calibration" in REPORTS
+
     def test_explicit_names_keep_order_and_deduplicate(self):
         names, is_all = cli.expand_names(["primary", "gates", "primary"])
         assert names == ["primary", "gates"]
@@ -793,6 +800,21 @@ class TestCommandLine:
             assert (out_dir / f"{name}.md").exists(), name
         summary = (out_dir / "summary.md").read_text()
         assert "## Notes and limitations" in summary
+
+    def test_calibration_report_runs_on_its_own(self, runs_dir, tmp_path):
+        out_dir = tmp_path / "analysis"
+        result = self._run_cli(
+            "calibration",
+            "--runs-dir",
+            str(runs_dir),
+            "--out-dir",
+            str(out_dir),
+            cwd=Path(__file__).resolve().parent,
+        )
+        assert result.returncode == 0, result.stderr
+        assert (out_dir / "calibration.md").exists()
+        assert (out_dir / "calibration_lr.csv").exists()
+        assert not (out_dir / "summary.md").exists()
 
     def test_list_prints_every_report_name(self):
         result = self._run_cli("--list", cwd=Path(__file__).resolve().parent)
