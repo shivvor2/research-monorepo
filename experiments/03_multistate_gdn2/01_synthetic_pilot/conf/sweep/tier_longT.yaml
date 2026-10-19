@@ -5,6 +5,7 @@
 # not DDP). Re-check the LR on seeds 100-101 before the tier if
 # training is unstable.
 # Run: python 01_train.py +sweep=tier_longT --multirun
+# Sweep order: seed first (MQAR only), then the rest.
 
 experiment:
   phase: 2
@@ -14,7 +15,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
+      seed: range(0,10)
       task: mqar_longT
       model.gate_mode: kda,full
       model.layout: single,ws,ll
-      seed: range(0,10)

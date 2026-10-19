@@ -237,7 +237,7 @@ class TestWeightDecayGroups:
 
 
 class TestCosineSchedule:
-    """Test (spec §5): peak at step 0, half at the midpoint, 0 at max_steps."""
+    """The cosine LR peaks at step 0, halves at the midpoint, decays to 0 at max_steps."""
 
     def test_cosine_lr_values(self):
         import lightning as L  # noqa: F401  (import check only)

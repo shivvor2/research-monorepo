@@ -1,4 +1,4 @@
-# Long, sparse MQAR variant for the long-T tier (protocol §7):
+# Long, sparse MQAR variant for the long-T tier:
 # T = 2048, D in {8, 16, 32, 64}, uniform query gaps (power_a = 1) so
 # most queries are hundreds of tokens after their key-value pair.
 # t_max (ll slot count = 12) follows max_seq_len via config.yaml.

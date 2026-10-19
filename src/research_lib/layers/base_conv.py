@@ -5,7 +5,7 @@ width ``k`` (kernel 3 in the Zoology MQAR harness) whose output gates a
 linear projection of the input, on a residual connection
 (``zoology/mixers/base_conv.py``).  This is the layer-0 mixer of the
 two-layer Zoology-style language model used by the multi-state GDN-2
-pilot (``06_experiment_protocol.md`` §2): the layer under test is the
+pilot: the layer under test is the
 gated-delta mixer in layer 1, exactly as Zoology's ``Hybrid`` alternates
 mixers by layer index.
 

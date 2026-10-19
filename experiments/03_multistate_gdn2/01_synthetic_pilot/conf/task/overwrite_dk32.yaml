@@ -13,7 +13,7 @@ vocab_size: 8192
 seq_len: 512
 num_keys: [16, 32, 64]             # K drawn per example (slices)
 class_probs: [0.25, 0.25, 0.25, 0.25]
-block_size: 16                      # B = C (D13)
+block_size: 16                      # B = C
 distant_min_blocks: 4
 max_placement_attempts: 100
 

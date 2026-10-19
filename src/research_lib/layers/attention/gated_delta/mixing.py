@@ -16,7 +16,7 @@ the reason there are three modes (D5).
 ``nonlinearity`` is a constructor field because V2 (the original release's
 choice) is still open: the init bias is computed as the *inverse* of the
 nonlinearity at 1, so a later nonlinearity keeps λ≡1 at init.  Only
-``softplus`` is implemented (D21).
+``softplus`` is implemented.
 
 Run tests with::
 
@@ -51,7 +51,7 @@ class LambdaMode(str, Enum):
 
 
 # softplus and its inverse at y: softplus^{-1}(y) = log(e^y - 1); at y=1 this
-# is log(e - 1) = 0.5413... (D21).  A later nonlinearity registers its
+# is log(e - 1) = 0.5413...  A later nonlinearity registers its
 # inverse here and keeps the λ≡1 init.
 _NONLINEARITIES = {
     "softplus": (F.softplus, lambda y: math.log(math.expm1(y))),

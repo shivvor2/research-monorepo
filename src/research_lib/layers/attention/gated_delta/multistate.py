@@ -734,10 +734,10 @@ class MultistateGatedDelta(nn.Module):
             ``hidden_size``).
         window (int): WS/FS window ``W``. Defaults to 8.
         block_size (int | None): WS/FS block size ``B``; ``None`` means
-            ``chunk_size`` (so ``B = C``, D13).
+            ``chunk_size`` (so ``B = C``).
         t_max (int): Longest total sequence the cache will hold (the
             longest **eval** length), used only for ``ll``'s slot count
-            ``bitlen(t_max) + 1`` (D23). Defaults to 4096.
+            ``bitlen(t_max) + 1``. Defaults to 4096.
         mode (str): Forward path: ``"chunk"`` (default) or ``"recurrent"``;
             overridable per call.  No automatic switching.
         chunk_size (int): Chunk length ``C``. Defaults to 16.

@@ -7,7 +7,7 @@
 
 frozen: false
 
-# d_model chosen in calibration from {32, 64} (protocol §10 rule 2).
+# d_model chosen in calibration from {32, 64}.
 d_model: null
 
 # Harness switches chosen in calibration (rule 3): layer_pattern in
@@ -17,7 +17,7 @@ harness:
   state_mixer: null
 
 # Peak LR per (task, layout, gate_mode), selected on seeds 100-101
-# (rule 4; D24) from {1e-3, 3e-3, 1e-2}.
+# from {1e-3, 3e-3, 1e-2}.
 lr_table:
   mqar:
     single: {full: null, b_only: null, w_only: null, kda: null, gdn: null}

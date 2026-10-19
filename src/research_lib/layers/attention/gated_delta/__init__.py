@@ -1,7 +1,7 @@
 """Gated delta-rule token mixers (KDA / GDN-2 / GDN), reference implementation.
 
-The single-state reference layer (PR 1) plus its functional core, shared
-projections and cache, and the multi-state layouts (PR 2): windowed
+The single-state reference layer plus its functional core, shared
+projections and cache, and the multi-state layouts: windowed
 uniform (WS), frozen control (FS) and Fenwick/log-linear (LL), with the
 λ mixer.
 """

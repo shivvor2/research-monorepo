@@ -1,5 +1,5 @@
 # @package _global_
-# Phase 1 calibration: LR selection (protocol §10 rule 4, D24).
+# Phase 1 calibration: LR selection.
 # 6 core configs x 3 LRs x 2 selection seeds (100, 101) x 2 tasks = 72
 # short runs. Per core config, pick the LR with the best validation
 # accuracy on seeds 100-101; use it for seeds 0-9.

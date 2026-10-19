@@ -10,6 +10,7 @@
 # 30 runs: gate {kda, full} x layout {single, ws, ll} x seeds 0-4.
 #
 # Run: python 01_train.py +sweep=tier_R1_uniform_decay --multirun
+# Sweep order: task, then seed, then the rest.
 
 experiment:
   phase: 2
@@ -20,7 +21,7 @@ hydra:
   sweeper:
     params:
       task: overwrite
+      seed: range(0,5)
       optimizer.decay_scheme: uniform
       model.gate_mode: kda,full
       model.layout: single,ws,ll
-      seed: range(0,5)

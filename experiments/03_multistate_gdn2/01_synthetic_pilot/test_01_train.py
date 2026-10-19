@@ -12,13 +12,22 @@ the anchors -> their own entries keyed by d_model.
 """
 
 import importlib.util
+import itertools
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
+import lightning as L
 import pytest
 import torch
+from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.trainer.states import TrainerFn, TrainerStatus
 from omegaconf import OmegaConf
+
+from research_lib.training.callbacks import RunSummaryCallback
+from research_lib.utils.run_lock import exclusive_lock
 
 _SRC = Path(__file__).resolve().parents[3] / "src"
 if str(_SRC) not in sys.path:
@@ -698,3 +707,441 @@ class TestBuildModel:
             model = train.build_model(model_cfg(layer_pattern=pattern))
             logits = model(torch.zeros(2, 12, dtype=torch.long))
             assert logits.shape == (2, 12, 64)
+
+
+class TestPrecisionFlags:
+    """fp32 without TF32 - both PyTorch TF32 switches off."""
+
+    def test_both_tf32_flags_off(self):
+        flags = train.set_precision_flags()
+        assert flags == {
+            "cuda_matmul_allow_tf32": False,
+            "cudnn_allow_tf32": False,
+        }
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+
+
+class TestAssertFitFinished:
+    """The post-fit guard passes only for a normally finished fit."""
+
+    def test_finished_passes(self):
+        trainer = SimpleNamespace(state=SimpleNamespace(status=TrainerStatus.FINISHED))
+        train.assert_fit_finished(trainer)  # no raise
+
+    @pytest.mark.parametrize(
+        "status", [TrainerStatus.INTERRUPTED, TrainerStatus.RUNNING]
+    )
+    def test_not_finished_raises(self, status):
+        trainer = SimpleNamespace(state=SimpleNamespace(status=status))
+        with pytest.raises(RuntimeError, match="not FINISHED"):
+            train.assert_fit_finished(trainer)
+
+
+class TestShouldSkip:
+    """The skip logic - done + same identity skips; everything else
+    falls through to the run."""
+
+    def _record(self, tmp_path, status="test_done", config_hash="h", seed=0):
+        path = tmp_path / "run.json"
+        path.write_text(
+            json.dumps({"status": status, "config_hash": config_hash, "seed": seed})
+        )
+        return path
+
+    def test_missing_record_runs(self, tmp_path):
+        assert train.should_skip(tmp_path / "nope.json", ("h", 0)) is None
+
+    def test_done_same_identity_skips(self, tmp_path):
+        path = self._record(tmp_path)
+        assert train.should_skip(path, ("h", 0)) == "already test_done"
+
+    def test_done_other_identity_runs(self, tmp_path):
+        path = self._record(tmp_path)
+        assert train.should_skip(path, ("h", 1)) is None  # other seed
+        assert train.should_skip(path, ("g", 0)) is None  # other config
+
+    @pytest.mark.parametrize("status", ["running", "interrupted", "failed", "fit_done"])
+    def test_non_done_statuses_run(self, tmp_path, status):
+        path = self._record(tmp_path, status=status)
+        assert train.should_skip(path, ("h", 0)) is None
+
+    def test_unreadable_record_runs(self, tmp_path):
+        path = tmp_path / "run.json"
+        path.write_text("{not json")
+        assert train.should_skip(path, ("h", 0)) is None
+
+
+class TestClaimRun:
+    """The skip decision is made while holding the run lock: a run that
+    another process completed between its pre-lock check and the lock
+    acquisition is skipped, not re-run."""
+
+    def test_skips_a_run_completed_while_waiting(self, tmp_path):
+        lock_path = tmp_path / "run.lock"
+        record_path = tmp_path / "run.json"
+        identity = ("h", 0)
+        # Another process is running the run: the lock is held and the
+        # record says `running`.
+        with exclusive_lock(lock_path):
+            record_path.write_text(
+                json.dumps({"status": "running", "config_hash": "h", "seed": 0})
+            )
+            # The other process finishes while this process is waiting:
+            # test_done is written before the lock is released.
+            record_path.write_text(
+                json.dumps({"status": "test_done", "config_hash": "h", "seed": 0})
+            )
+        # The lock is free now. Claiming the run must skip it: the
+        # record is read only after the lock is acquired, so the
+        # completed run is not re-run.
+        with train.claim_run(lock_path, record_path, identity) as reason:
+            assert reason == "already test_done"
+
+    def test_held_lock_skips_without_reading_the_record(self, tmp_path):
+        lock_path = tmp_path / "run.lock"
+        record_path = tmp_path / "run.json"
+        with exclusive_lock(lock_path):
+            with train.claim_run(lock_path, record_path, ("h", 0)) as reason:
+                assert reason == "running in another process"
+
+    def test_no_record_check_proceeds(self, tmp_path):
+        # record_path=None: the skip check does not apply (e.g. the smoke
+        # and debug configs); the run proceeds once the lock is acquired.
+        lock_path = tmp_path / "run.lock"
+        with train.claim_run(lock_path, None, ("h", 0)) as reason:
+            assert reason is None
+
+
+class _TinyFitModule(L.LightningModule):
+    """A minimal module for the post-fit tests: ``.model`` is a Linear."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Linear(2, 2)
+
+    def training_step(self, batch, batch_idx):
+        return self.model.weight.sum()
+
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), lr=0.1)
+
+
+def _fitted_post_fit(tmp_path, run_id="post"):
+    """A 1-step CPU fit with a run-summary callback attached."""
+    runs_dir = tmp_path / "runs"
+    cb = RunSummaryCallback(runs_dir, run_id, {"seed": 0}, strict=True)
+    trainer = L.Trainer(
+        max_steps=1,
+        accelerator="cpu",
+        logger=False,
+        enable_progress_bar=False,
+        callbacks=[cb],
+        num_sanity_val_steps=0,
+        limit_val_batches=0,
+    )
+    module = _TinyFitModule()
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(torch.zeros(8, 2), torch.zeros(8, 2)),
+        batch_size=4,
+    )
+    trainer.fit(module, train_dataloaders=loader)
+    return cb, trainer, module, runs_dir
+
+
+class TestPostFit:
+    """Failures after fit() must reach the run record: the guard and the
+    checkpoint save run outside trainer.fit()/trainer.test(), so
+    Lightning's on_exception never fires for them; post_fit records the
+    failure itself (status "failed", failed_stage "fit")."""
+
+    def test_checkpoint_failure_reaches_the_record(self, tmp_path, monkeypatch):
+        cb, trainer, module, runs_dir = _fitted_post_fit(tmp_path, "ckpt")
+        cfg = OmegaConf.create(
+            {"output": {"save_final_checkpoint": True, "runs_dir": str(runs_dir)}}
+        )
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(train, "atomic_torch_save", boom)
+        with pytest.raises(OSError, match="disk full"):
+            train.post_fit(cfg, trainer, module, [cb], "ckpt")
+        record = json.loads((runs_dir / "ckpt.json").read_text())
+        assert record["status"] == "failed"
+        assert "OSError" in record["error"] and "disk full" in record["error"]
+        assert record["failed_stage"] == "fit"
+
+    def test_guard_failure_reaches_the_record(self, tmp_path):
+        runs_dir = tmp_path / "runs"
+        cb = RunSummaryCallback(runs_dir, "guard", {"seed": 0}, strict=True)
+        trainer = SimpleNamespace(
+            state=SimpleNamespace(
+                status=TrainerStatus.INTERRUPTED, fn=TrainerFn.FITTING
+            ),
+            is_global_zero=True,
+        )
+        cfg = OmegaConf.create(
+            {"output": {"save_final_checkpoint": False, "runs_dir": str(runs_dir)}}
+        )
+        with pytest.raises(RuntimeError, match="not FINISHED"):
+            train.post_fit(cfg, trainer, _TinyFitModule(), [cb], "guard")
+        record = json.loads((runs_dir / "guard.json").read_text())
+        assert record["status"] == "failed"
+        assert "not FINISHED" in record["error"]
+        assert record["failed_stage"] == "fit"
+
+
+class TestStopRequested:
+    """The STOP file lives in the launch directory (the original
+    working directory, not the job dir)."""
+
+    def _cfg(self):
+        return OmegaConf.create({"launch": {"stop_file": "STOP"}})
+
+    def test_no_stop_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        assert train.stop_requested(self._cfg()) is None
+
+    def test_stop_file_found(self, tmp_path, monkeypatch):
+        stop = tmp_path / "STOP"
+        stop.touch()
+        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        assert train.stop_requested(self._cfg()) == stop
+
+    def test_stop_file_elsewhere_is_not_seen(self, tmp_path, monkeypatch):
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "STOP").touch()
+        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        assert train.stop_requested(self._cfg()) is None
+
+
+class TestInShard:
+    """Round-robin shard membership, with validation."""
+
+    def test_round_robin(self):
+        assert train.in_shard(0, 0, 2) is True
+        assert train.in_shard(1, 0, 2) is False
+        assert train.in_shard(1, 1, 2) is True
+        assert train.in_shard(2, 0, 2) is True
+        assert train.in_shard(2, 1, 2) is False
+        assert train.in_shard(0, 0, 1) is True
+        assert train.in_shard(7, 0, 1) is True
+
+    def test_validation_errors(self):
+        with pytest.raises(ValueError, match="num_shards"):
+            train.in_shard(0, 0, 0)
+        with pytest.raises(ValueError, match="num_shards"):
+            train.in_shard(0, 0, -1)
+        with pytest.raises(ValueError, match="shard_index"):
+            train.in_shard(0, 2, 2)
+        with pytest.raises(ValueError, match="shard_index"):
+            train.in_shard(0, -1, 2)
+
+
+class TestSkipOnlyProtocolTiers:
+    """The smoke and debug configs are tooling, not protocol tiers:
+    they always run, whatever launch.skip_completed says."""
+
+    def test_smoke_and_debug_tiers_are_not_protocol_tiers(self):
+        from hydra import compose, initialize_config_dir
+
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+            for name in ("test", "debug"):
+                cfg = compose(config_name=name)
+                assert str(cfg.experiment.tier) not in train.PROTOCOL_TIERS
+
+    def test_protocol_tiers_are_all_present(self):
+        for tier in (
+            "calib_dmodel",
+            "calib_harness",
+            "calib_lr",
+            "calib_lr_anchors",
+            "tier1_core",
+            "tier2_gates",
+            "tier3_frozen",
+            "tier4_lambda",
+            "tier5_matched_bytes",
+            "tier6_anchors",
+            "tier_longT",
+            "R1",
+        ):
+            assert tier in train.PROTOCOL_TIERS
+
+
+class TestSeedMajorSweepOrder:
+    """Tier sweeps run overwrite before mqar, seed-major: a partial
+    tier still yields complete paired Delta_i at the primary endpoint
+    (overwrite, class distant) before any MQAR run starts."""
+
+    def test_tier_sweeps_are_seed_major(self):
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        tier_files = sorted((conf_dir / "sweep").glob("tier*.yaml"))
+        assert tier_files  # sanity: we found the tier files
+        for path in tier_files:
+            params = OmegaConf.select(
+                OmegaConf.load(path), "hydra.sweeper.params", default={}
+            )
+            names = list(params.keys())
+            grids = [sweeper_values(params[name]) for name in names]
+            jobs = [dict(zip(names, combo)) for combo in itertools.product(*grids)]
+            # Overwrite jobs come before MQAR jobs (Hydra's BasicSweeper
+            # iterates the Cartesian product in key order).
+            seen_mqar = False
+            for job in jobs:
+                task = str(job.get("task", ""))
+                if task.startswith("mqar"):
+                    seen_mqar = True
+                else:
+                    assert not seen_mqar, (path.name, job)
+            # Within one task, the seed is non-decreasing along the job
+            # order (seed-major: a partial tier covers every seed of the
+            # first task before moving on).
+            for task in {str(job.get("task", "")) for job in jobs}:
+                seeds = [
+                    int(job["seed"]) for job in jobs if str(job.get("task")) == task
+                ]
+                assert seeds == sorted(seeds), (path.name, task)
+
+    def test_calibration_sweeps_are_untouched(self):
+        """The calib_* files keep their own order (they are not tiers)."""
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        calib_files = sorted((conf_dir / "sweep").glob("calib*.yaml"))
+        assert calib_files
+        for path in calib_files:
+            params = OmegaConf.select(
+                OmegaConf.load(path), "hydra.sweeper.params", default={}
+            )
+            names = list(params.keys())
+            # The seed is NOT the first or second key in the calibration
+            # sweeps (they vary the choice dimension fastest).
+            assert "seed" not in names[:2], path.name
+
+
+class TestCreateLoggers:
+    """The CSV logger writes next to the run records:
+    runs/<task>/curves/<run_id>/version_0."""
+
+    def test_csv_logger_under_runs_curves(self, tmp_path):
+        runs_dir = tmp_path / "runs" / "mqar"
+        cfg = OmegaConf.create(
+            {
+                "logging": {
+                    "csv": {"enabled": True, "save_dir": str(runs_dir / "curves")},
+                    "wandb": {"enabled": False},
+                }
+            }
+        )
+        loggers = train.create_loggers(cfg, "run-1")
+        csv_logger = next(logger for logger in loggers if isinstance(logger, CSVLogger))
+        log_dir = Path(csv_logger.log_dir)
+        assert log_dir == runs_dir / "curves" / "run-1" / "version_0"
+
+    def test_csv_disabled_returns_only_wandb(self, tmp_path):
+        cfg = OmegaConf.create(
+            {
+                "logging": {
+                    "csv": {"enabled": False, "save_dir": "logs/csv"},
+                    "wandb": {"enabled": False},
+                }
+            }
+        )
+        assert train.create_loggers(cfg, "run-1") is None
+
+    def test_wandb_logger_keeps_the_project(self, tmp_path):
+        from lightning.pytorch.loggers import WandbLogger
+
+        cfg = OmegaConf.create(
+            {
+                "logging": {
+                    "csv": {"enabled": False, "save_dir": "logs/csv"},
+                    "wandb": {
+                        "enabled": True,
+                        "project": "MultistateGDN2",
+                        "entity": None,
+                    },
+                },
+                "experiment": {"name": "multistate_gdn2_synthetic_pilot"},
+            }
+        )
+        loggers = train.create_loggers(cfg, "run-1")
+        wandb_logger = next(
+            logger for logger in loggers if isinstance(logger, WandbLogger)
+        )
+        # WandbLogger.name is the project name (the run name lives on
+        # wandb's Run, which needs a live session).
+        assert wandb_logger.name == "MultistateGDN2"
+
+
+def _callbacks_cfg(runs_dir, curves_dir):
+    """A config with everything create_callbacks and the curves reset read."""
+    return OmegaConf.create(
+        {
+            "seed": 0,
+            "output": {"runs_dir": str(runs_dir)},
+            "training": {
+                "early_stop_threshold": 0.99,
+                "collect_mixer_stats": False,
+            },
+            "logging": {
+                "csv": {"enabled": True, "save_dir": str(curves_dir)},
+                "wandb": {"enabled": False},
+            },
+            "optimizer": {"decay_scheme": "grouped"},
+            "experiment": {"name": "test", "tier": "tier1_core"},
+        }
+    )
+
+
+class TestCallbacksBeforeCurvesReset:
+    """The run identity is checked before the stale curves are deleted:
+    a relaunch refused for another run's record must leave that run's
+    curves directory in place; an accepted relaunch still resets it."""
+
+    def _curves(self, curves_dir, run_id):
+        curves = curves_dir / run_id
+        curves.mkdir(parents=True)
+        (curves / "metrics.csv").write_text("step,acc\n0,0.0\n")
+        return curves
+
+    def test_refused_relaunch_keeps_the_curves(self, tmp_path):
+        runs_dir = tmp_path / "runs"
+        curves_dir = tmp_path / "curves"
+        run_id = "run-1"
+        # A record of a *different* run under this run ID: what a relaunch
+        # after editing a non-identity key (e.g. training.max_steps) sees.
+        runs_dir.mkdir(parents=True)
+        (runs_dir / f"{run_id}.json").write_text(
+            json.dumps({"config_hash": "another-run", "seed": 0})
+        )
+        curves = self._curves(curves_dir, run_id)
+
+        cfg = _callbacks_cfg(runs_dir, curves_dir)
+        with pytest.raises(FileExistsError, match="different run"):
+            train.create_callbacks_reset_curves(cfg, run_id, {})
+        # The other run's curves were not deleted.
+        assert (curves / "metrics.csv").read_text() == "step,acc\n0,0.0\n"
+
+    def test_accepted_relaunch_resets_the_curves(self, tmp_path):
+        runs_dir = tmp_path / "runs"
+        curves_dir = tmp_path / "curves"
+        run_id = "run-1"
+        cfg = _callbacks_cfg(runs_dir, curves_dir)
+        runs_dir.mkdir(parents=True)
+        identity = (
+            train.config_hash(
+                OmegaConf.to_container(cfg, resolve=True), train.HASH_EXCLUDE
+            ),
+            cfg.seed,
+        )
+        (runs_dir / f"{run_id}.json").write_text(
+            json.dumps({"config_hash": identity[0], "seed": identity[1]})
+        )
+        curves = self._curves(curves_dir, run_id)
+
+        callbacks = train.create_callbacks_reset_curves(cfg, run_id, {})
+        # The relaunch is a fresh run: the stale curves directory is gone.
+        assert not curves.exists()
+        assert any(isinstance(cb, RunSummaryCallback) for cb in callbacks)

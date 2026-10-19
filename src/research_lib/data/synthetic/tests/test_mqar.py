@@ -1,12 +1,12 @@
 """
-Test suite for the Zoology-format MQAR generator (spec PR 3).
+Test suite for the Zoology-format MQAR generator.
 
 Covers:
   * MQARConfig construction validation
-  * D01: determinism per seed
-  * D02: example structure (context layout, key/value ranges, query placement)
-  * D03: query-gap power-law distribution
-  * D04: loss convention (loss lands exactly on the logits at query positions)
+  * determinism per seed
+  * example structure (context layout, key/value ranges, query placement)
+  * query-gap power-law distribution
+  * loss convention (loss lands exactly on the logits at query positions)
 
 Run with: pytest src/research_lib/data/synthetic/tests/test_mqar.py -v
 """
@@ -91,11 +91,11 @@ def test_mqar_config_validation():
 
 
 # =============================================================================
-# Tests: D01 determinism
+# Tests: determinism
 # =============================================================================
 
 
-def test_D01_same_seed_reproduces_batch():
+def test_same_seed_reproduces_batch():
     first = generate_mqar(SMALL, num_examples=16, seed=0)
     second = generate_mqar(SMALL, num_examples=16, seed=0)
     assert set(first) == set(second)
@@ -103,32 +103,32 @@ def test_D01_same_seed_reproduces_batch():
         assert torch.equal(first[key], second[key]), f"{key} differs"
 
 
-def test_D01_different_seed_differs():
+def test_different_seed_differs():
     first = generate_mqar(SMALL, num_examples=16, seed=0)
     second = generate_mqar(SMALL, num_examples=16, seed=1)
     assert not torch.equal(first["input_ids"], second["input_ids"])
     assert not torch.equal(first["labels"], second["labels"])
 
 
-def test_D01_fixed_num_kv_pairs_uses_slice():
+def test_fixed_num_kv_pairs_uses_slice():
     batch = generate_mqar(SMALL, num_examples=16, seed=0, num_kv_pairs=8)
     assert batch["slice_id"].tolist() == [8] * 16
 
 
 # =============================================================================
-# Tests: D02 structure
+# Tests: structure
 # =============================================================================
 
 
 @pytest.mark.parametrize("d", [2, 4, 8])
-def test_D02_fixed_num_kv_pairs_structure(d):
+def test_fixed_num_kv_pairs_structure(d):
     batch = generate_mqar(SMALL, num_examples=32, seed=42, num_kv_pairs=d)
     assert batch["slice_id"].tolist() == [d] * 32
     for e in range(32):
         check_mqar_example(SMALL, batch["input_ids"][e], batch["labels"][e], d)
 
 
-def test_D02_drawn_num_kv_pairs_structure():
+def test_drawn_num_kv_pairs_structure():
     batch = generate_mqar(SMALL, num_examples=64, seed=7)
     for e in range(64):
         d = int(batch["slice_id"][e])
@@ -136,7 +136,7 @@ def test_D02_drawn_num_kv_pairs_structure():
         check_mqar_example(SMALL, batch["input_ids"][e], batch["labels"][e], d)
 
 
-def test_D02_dtypes_shapes_and_filler():
+def test_dtypes_shapes_and_filler():
     batch = generate_mqar(SMALL, num_examples=4, seed=0)
     assert set(batch) == {"input_ids", "labels", "slice_id"}
     assert all(t.dtype == torch.int64 for t in batch.values())
@@ -150,7 +150,7 @@ def test_D02_dtypes_shapes_and_filler():
     assert answers == sum(int(d) for d in batch["slice_id"])
 
 
-def test_D02_non_random_filler_is_zero():
+def test_non_random_filler_is_zero():
     config = MQARConfig(
         vocab_size=256, seq_len=64, num_kv_pairs=(4,), random_non_queries=False
     )
@@ -165,7 +165,7 @@ def test_D02_non_random_filler_is_zero():
 
 
 # =============================================================================
-# Tests: D03 query-gap distribution
+# Tests: query-gap distribution
 # =============================================================================
 
 
@@ -189,7 +189,7 @@ def _gap_pooled_tv(config, d, num_examples, seed):
 
 
 @pytest.mark.slow
-def test_D03_gap_distribution_matches_power_law():
+def test_gap_distribution_matches_power_law():
     """With D=1 every gap is an unconditioned draw from the power law, so
     the pooled empirical distribution converges to the weights (20k draws,
     TV < 0.02; the noise floor at space=15, 20k draws is ~0.008)."""
@@ -200,7 +200,7 @@ def test_D03_gap_distribution_matches_power_law():
 
 
 @pytest.mark.slow
-def test_D03_multi_gap_distribution_close_to_power_law():
+def test_multi_gap_distribution_close_to_power_law():
     """With D > 1 the gaps are drawn without replacement, so the *pooled*
     marginal is biased away from the raw weights (a heavy slot can be used
     at most once per example): the TV of Zoology's own procedure at D=4,
@@ -213,7 +213,7 @@ def test_D03_multi_gap_distribution_close_to_power_law():
 
 
 # =============================================================================
-# Tests: D04 loss convention
+# Tests: loss convention
 # =============================================================================
 
 
@@ -234,7 +234,7 @@ def _dummy_module():
     )
 
 
-def test_D04_loss_lands_on_query_logits_only():
+def test_loss_lands_on_query_logits_only():
     """DualOptimizerModule.compute_loss-style shifting puts the loss exactly
     on the logits at the query positions (hand-built example).
 
@@ -285,7 +285,7 @@ def test_D04_loss_lands_on_query_logits_only():
     )
 
 
-def test_D04_generated_batch_loss_equals_answer_mean():
+def test_generated_batch_loss_equals_answer_mean():
     """The repo shift + ignore_index loss equals a manual mean over the
     answer positions of a generated MQAR batch."""
     import torch.nn.functional as F

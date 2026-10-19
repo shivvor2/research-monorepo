@@ -1,8 +1,8 @@
 """Pure functional core for the gated delta-rule family (GDN-2 / KDA / Gated DeltaNet).
 
-This module is the **single source of truth** for the recurrence math (see
-``impl/01_spec_gated_delta.md`` §4).  Both :class:`~research_lib.layers.attention.gated_delta.reference.GatedDeltaReference`
-(single state, PR 1) and the multi-state layer (PR 2) call these functions;
+This module is the **single source of truth** for the recurrence math.
+Both :class:`~research_lib.layers.attention.gated_delta.reference.GatedDeltaReference`
+(single state) and the multi-state layer call these functions;
 neither re-implements the math.
 
 The recurrence (per batch element and head), with ``q_t, k_t`` L2-normalized:

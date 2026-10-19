@@ -5,7 +5,10 @@ Target: src/research_lib/training/callbacks/run_summary.py
 Run with: pytest src/research_lib/training/callbacks/tests/test_run_summary.py -v
 """
 
+import hashlib
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -508,6 +511,23 @@ class TestStatus:
         assert summary["status"] == "interrupted"
         assert "KeyboardInterrupt" in summary["error"]
 
+    def test_sigterm_is_interrupted_not_failed(self, tmp_path):
+        """Lightning raises SIGTERMException at the next batch after
+        SIGTERM (kill, Slurm cancel/preemption, cloud stop): the run is
+        interrupted, not failed, so a relaunch treats it as incomplete."""
+        from lightning.pytorch.utilities.exceptions import SIGTERMException
+
+        cb = RunSummaryCallback(tmp_path, "sig", tiny_config_dict(), strict=True)
+        trainer = make_trainer([cb])
+        module = tiny_module()
+        loader = make_loader()
+        trainer.fit(module, train_dataloaders=loader, val_dataloaders=loader)
+        cb.on_exception(trainer, module, SIGTERMException())
+        summary = read(tmp_path, "sig")
+        assert summary["status"] == "interrupted"
+        assert "SIGTERMException" in summary["error"]
+        assert summary["failed_stage"] == "fit"
+
     def test_no_monitor_no_tracking(self, fitted):
         cb, runs_dir, trainer, module = fitted
         summary = read(runs_dir)
@@ -845,6 +865,30 @@ class TestRankZero:
         assert (tmp_path / "rank.json").exists()
 
 
+class TestFsync:
+    """One write fsyncs the record file and the parent directory, so a
+    power cut cannot truncate the JSON the next relaunch reads."""
+
+    def test_write_fsyncs_the_file_and_the_directory(self, tmp_path, monkeypatch):
+        cb = RunSummaryCallback(tmp_path, "fsync", tiny_config_dict(), strict=True)
+        zero = SimpleNamespace(is_global_zero=True)
+        fsynced = []
+        monkeypatch.setattr(os, "fsync", lambda fd: fsynced.append(fd))
+        real_open = os.open
+        opened = {}
+
+        def recording_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            opened[fd] = Path(path)
+            return fd
+
+        monkeypatch.setattr(os, "open", recording_open)
+        cb._write(zero)
+        assert len(fsynced) == 2
+        # The directory fsynced after the rename is the record's parent.
+        assert opened[fsynced[1]] == (tmp_path / "fsync.json").parent
+
+
 # ---------------------------------------------------------------------------
 # Config hash (unchanged behaviour)
 # ---------------------------------------------------------------------------
@@ -872,3 +916,161 @@ class TestConfigHash:
         assert read(tmp_path, "extra")["my_key"] == 42
         trainer.test(module, dataloaders=loader)
         assert read(tmp_path, "extra")["my_key"] == 42
+
+
+class TestConfigHashExclude:
+    """Configs differing only in an excluded key share the hash;
+    differing in any other key do not; the seed is still excluded."""
+
+    def test_excluded_keys_share_the_hash(self):
+        a = {
+            "seed": 0,
+            "output": {"runs_dir": "/a"},
+            "data": {"num_workers": 2},
+            "model": {"d_model": 16},
+        }
+        b = {
+            "seed": 1,
+            "output": {"runs_dir": "/b"},
+            "data": {"num_workers": 4},
+            "model": {"d_model": 16},
+        }
+        assert config_hash(a, ("output", "data.num_workers")) == config_hash(
+            b, ("output", "data.num_workers")
+        )
+
+    def test_any_other_key_still_differs(self):
+        a = {"seed": 0, "output": {"runs_dir": "/a"}, "model": {"d_model": 16}}
+        b = {"seed": 0, "output": {"runs_dir": "/b"}, "model": {"d_model": 32}}
+        assert config_hash(a, ("output",)) != config_hash(b, ("output",))
+
+    def test_seed_is_still_excluded(self):
+        a = {"seed": 0, "output": {"runs_dir": "/a"}}
+        b = {"seed": 9, "output": {"runs_dir": "/a"}}
+        assert config_hash(a, ("output",)) == config_hash(b, ("output",))
+
+    def test_missing_excluded_keys_are_ignored(self):
+        a = {"seed": 0, "a": 1}
+        assert config_hash(a, ("nope", "a.b.c")) == config_hash(a)
+
+    def test_excluding_a_subtree_covers_its_leaves(self):
+        a = {"seed": 0, "output": {"runs_dir": "/a", "other": 1}}
+        assert config_hash(a, ("output",)) == config_hash({"seed": 0}, ("output",))
+
+    def test_default_exclude_keeps_today_behaviour(self):
+        a = {"seed": 0, "output": {"runs_dir": "/a"}}
+        b = {"seed": 0, "output": {"runs_dir": "/b"}}
+        assert config_hash(a) != config_hash(b)
+
+
+class TestHashExcludeIdentity:
+    """The callback's identity uses the excluded hash, and the
+    record stores the sorted excluded keys."""
+
+    def _fit(self, tmp_path, run_id, cb):
+        trainer = make_trainer([cb])
+        trainer.fit(
+            tiny_module(),
+            train_dataloaders=make_loader(),
+            val_dataloaders=make_loader(),
+        )
+        return read(tmp_path, run_id)
+
+    def test_record_contains_hash_excluded_keys(self, tmp_path):
+        """The record stores the sorted excluded keys."""
+        cb = RunSummaryCallback(
+            tmp_path,
+            "hx",
+            tiny_config_dict(),
+            hash_exclude=("output", "data.num_workers"),
+            strict=True,
+        )
+        summary = self._fit(tmp_path, "hx", cb)
+        assert summary["hash_excluded_keys"] == ["data.num_workers", "output"]
+
+    def test_different_runs_dir_is_the_same_identity(self, tmp_path):
+        """A record written with runs_dir=A is accepted as the same
+        identity by a callback for the same run whose config has
+        output.runs_dir=B."""
+        config_a = {"seed": 0, "output": {"runs_dir": "/a"}, "model": {"d": 16}}
+        config_b = {"seed": 0, "output": {"runs_dir": "/b"}, "model": {"d": 16}}
+        self._fit(
+            tmp_path,
+            "id",
+            RunSummaryCallback(
+                tmp_path, "id", config_a, hash_exclude=("output",), strict=True
+            ),
+        )
+        # A fresh callback for the same run with a different runs_dir is
+        # accepted (same identity), and overwrites its own record.
+        cb2 = RunSummaryCallback(
+            tmp_path, "id", config_b, hash_exclude=("output",), strict=True
+        )
+        summary = self._fit(tmp_path, "id", cb2)
+        assert summary["status"] == "fit_done"
+        assert summary["config_hash"] == config_hash(config_a, ("output",))
+
+    def test_without_exclude_the_difference_is_refused(self, tmp_path):
+        """The default (no exclude) keeps today's behaviour: a different
+        runs_dir is a different identity and is refused."""
+        config_a = {"seed": 0, "output": {"runs_dir": "/a"}}
+        config_b = {"seed": 0, "output": {"runs_dir": "/b"}}
+        self._fit(
+            tmp_path, "id", RunSummaryCallback(tmp_path, "id", config_a, strict=True)
+        )
+        with pytest.raises(FileExistsError, match="config_hash"):
+            RunSummaryCallback(tmp_path, "id", config_b, strict=True)
+
+
+class TestProvenance:
+    """Provenance hashes files relative to the repository root; a
+    missing file gives null."""
+
+    def test_provenance_hashes_files_and_records_them(self, tmp_path, monkeypatch):
+        from research_lib.training.callbacks import run_summary as rs
+
+        monkeypatch.setattr(rs, "_repo_root", lambda: tmp_path)
+        lock = tmp_path / "uv.lock"
+        lock.write_bytes(b"lock content")
+        cb = RunSummaryCallback(
+            tmp_path,
+            "prov",
+            tiny_config_dict(),
+            provenance_files=("uv.lock",),
+            strict=True,
+        )
+        expected = hashlib.sha256(b"lock content").hexdigest()
+        assert cb._provenance == {"uv.lock": expected}
+        trainer = make_trainer([cb])
+        trainer.fit(
+            tiny_module(),
+            train_dataloaders=make_loader(),
+            val_dataloaders=make_loader(),
+        )
+        assert read(tmp_path, "prov")["provenance"] == {"uv.lock": expected}
+
+    def test_missing_file_gives_null(self, tmp_path, monkeypatch):
+        from research_lib.training.callbacks import run_summary as rs
+
+        monkeypatch.setattr(rs, "_repo_root", lambda: tmp_path)
+        cb = RunSummaryCallback(
+            tmp_path,
+            "prov2",
+            tiny_config_dict(),
+            provenance_files=("missing.lock",),
+        )
+        assert cb._provenance == {"missing.lock": None}
+
+    def test_no_repo_root_gives_null(self, tmp_path, monkeypatch):
+        from research_lib.training.callbacks import run_summary as rs
+
+        monkeypatch.setattr(rs, "_repo_root", lambda: None)
+        cb = RunSummaryCallback(
+            tmp_path, "prov3", tiny_config_dict(), provenance_files=("uv.lock",)
+        )
+        assert cb._provenance == {"uv.lock": None}
+
+    def test_default_records_no_provenance(self, tmp_path):
+        cb = RunSummaryCallback(tmp_path, "prov4", tiny_config_dict())
+        assert cb._provenance == {}
+        assert "provenance" in BUILTIN_SECTIONS

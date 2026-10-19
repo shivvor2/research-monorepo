@@ -1,7 +1,7 @@
 """Input/output projections for the gated delta-rule layers.
 
 One module shared by :class:`~research_lib.layers.attention.gated_delta.reference.GatedDeltaReference`
-(single state, PR 1) and the multi-state layer (PR 2), so both have
+(single state) and the multi-state layer, so both have
 identical parameter names and the gate-mode ablations keep parameter counts
 fixed.
 

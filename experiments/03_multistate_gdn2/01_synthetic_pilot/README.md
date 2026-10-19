@@ -8,9 +8,8 @@ measuring the pre-registered primary statistic
 Δ_int = (X-GDN2 − X-KDA) − (GDN2 − KDA), X ∈ {LL, WS}
 
 on overwrite, class `distant`, K = 2·d_k, with per-seed bootstrap CIs.
-The protocol (`06_experiment_protocol.md` in the project notes) is the
-source of truth for every setting: grid, seeds, decision rules, and the
-calibration below.
+The experiment protocol is the source of truth for every setting:
+grid, seeds, decision rules, and the calibration below.
 
 ## Quick start
 
@@ -27,7 +26,7 @@ python 01_train.py --config-name=debug --multirun
 The pilot runs in the committed `uv.lock` (Linux x86_64, Python 3.13,
 Lightning ≥ 2.4); `uv sync --frozen` installs exactly that environment.
 **Do not run `uv lock --upgrade` or `uv add` between the first calibration
-run and the end of the pilot** (protocol §10.1). Every run record will
+run and the end of the pilot**. Every run record will
 store the SHA-256 of `uv.lock`, so a tier that mixed lock versions would
 be visible.
 
@@ -87,6 +86,50 @@ outside the anchor tier).
 
 4. **Phase 4 — long-T tier**: `+sweep=tier_longT` (T = 2048 sparse MQAR).
 
+## Running, stopping and continuing
+
+**What `test_done` guarantees.** A run record with `status == "test_done"`
+means the fit ended normally (max steps or early stop) **and** the test
+pass completed on the final weights **and**, when checkpoint saving is
+on, the checkpoint was fully written before the test pass. Anything else
+(`running`, `fit_done`, `interrupted`, `failed`) is an incomplete run:
+relaunch it.
+
+**Stopping.**
+
+- Ctrl-C interrupts the current run; the record is marked `interrupted`
+  (Lightning ≥ 2.4 raises `SIGTERMException` on SIGTERM, which is also
+  an interruption, not a failure).
+- Killing the machine loses the runs in progress; the tracker never
+  records a wrong `test_done`.
+- `touch STOP` in the launch directory stops the sweep at the next run
+  boundary: no new run starts while the file exists, and the script
+  never deletes it. In a multirun this ends the whole sweep; in a
+  single run it just exits.
+
+**Continuing.** Relaunch the same command. With
+`launch.skip_completed: true` (protocol tiers only — the smoke and
+`debug` configs always run), a run whose record is `test_done` with the
+same identity is skipped; a non-done record is overwritten by the
+re-run. A record of a *different* run at the same path is refused by
+`RunSummaryCallback` (the identity is the `(config_hash, seed)` pair,
+with the operational keys `output`, `logging`, `launch` and
+`data.num_workers` excluded from the hash).
+
+**Several runs on one GPU (shards).** Launch the identical sweep command
+in several processes, each with `launch.shard_index=k` and
+`launch.num_shards=N` (e.g. `launch.shard_index=0 launch.num_shards=2`
+and `launch.shard_index=1 launch.num_shards=2`). Job `k` of the sweep
+runs only in the process with `shard_index == k % num_shards`, so every
+shard moves along the sweep's priority order (overwrite before mqar,
+seed-major). A per-run lock file (`runs/<task>/<run_id>.lock`, empty,
+not a record) prevents two processes from running the same run at once:
+the second one skips it.
+
+**Curves.** The CSV logger writes next to the run records:
+`runs/<task>/curves/<run_id>/version_0/metrics.csv`. A relaunch removes
+a stale curves directory first (a relaunch is a fresh run).
+
 ## Analysis
 
 ```bash
@@ -111,13 +154,18 @@ perfectly while DDP mostly adds communication overhead.
   and end of fitting, at the end of testing and on failure. Top-level
   sections: `run_id`, `status` (`running` → `fit_done` → `test_done`;
   `failed` / `interrupted` on an exception, with `error`), `config` +
-  `config_hash` (seed excluded), `seed`, `git`, `versions`, `device`,
-  `timing`, `stopping` (`early_stopped`, `monitor`, `mode`, `best_value`,
-  `best_step`), and the run's collector sections: `params` (total /
-  trainable / the λ group), `state` (`bytes_per_mixer`),
-  `val_final`, `mixer_stats_final`, `test` — plus `lr_resolved` and
-  `decay_scheme`. Runs whose status is not `test_done` are incomplete;
-  the analysis lists them. `run_id` is
+  `config_hash` (seed excluded; the operational keys `output`,
+  `logging`, `launch` and `data.num_workers` are excluded too, recorded
+  as `hash_excluded_keys`), `seed`, `git`, `versions`, `device`,
+  `provenance` (SHA-256 of `uv.lock`), `timing`, `stopping`
+  (`early_stopped`, `monitor`, `mode`, `best_value`, `best_step`), and
+  the run's collector sections: `params` (total / trainable / the λ
+  group), `state` (`bytes_per_mixer`), `val_final`,
+  `mixer_stats_final`, `test` — plus `lr_resolved`, `decay_scheme`,
+  `precision_flags` (the two TF32 flags, both off) and
+  `final_checkpoint` (the saved file name, or `null`). Runs whose
+  status is not `test_done` are incomplete; the analysis lists them.
+  `run_id` is
   `{tier_}{task}-{layout}-{gate_mode}-{lambda_mode}-d{d}-lr{lr}-s{seed}`,
   plus a suffix for every non-default value the base ID leaves out:
   `-wd-{scheme}` (weight-decay scheme other than `grouped`),
@@ -125,13 +173,18 @@ perfectly while DDP mostly adds communication overhead.
   `-sm-{value}` (`state_mixer` other than `none`) and
   `-ev{value}` (`expand_v` other than `1`); the suffixes go before
   `-s{seed}`, in that order.
-- `logs/` — CSV (and optional wandb) logs; `outputs/`, `multirun/` —
-  hydra job dirs; `analysis/` — the analysis output. All git-ignored.
-- Final checkpoints are **on** by default (`output.save_final_checkpoint`,
-  about 2 MB per run at the pilot size): every run saves its final weights
-  next to its run JSON (`runs/<task>/<run_id>.pt`), so the mechanism
-  probes and finer λ breakdowns can be computed afterwards without
-  retraining.
+- `runs/<task>/curves/<run_id>/version_0/metrics.csv` — the training
+  curves of each run, next to its record.
+- `runs/<task>/<run_id>.lock` — empty per-run lock file (not a record;
+  the analysis reads only `*.json`).
+- `logs/` — optional wandb logs; `outputs/`, `multirun/` — hydra job
+  dirs; `analysis/` — the analysis output. All git-ignored.
+- Final checkpoints are **off** by default (`output.save_final_checkpoint`):
+  final weights are saved only for runs whose weights are needed, e.g.
+  the mechanism probes (a re-run in the same environment is close but
+  not bit-identical). When on, the checkpoint is saved atomically after
+  fit and before the test pass, next to the run JSON
+  (`runs/<task>/<run_id>.pt`, git-ignored).
 
 ## Disposable-instance rules (rented machines)
 

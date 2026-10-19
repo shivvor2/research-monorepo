@@ -1,5 +1,5 @@
 """
-Test suite for SyntheticRecallDataModule (spec PR 3, test D08).
+Test suite for SyntheticRecallDataModule.
 
 Covers:
   * Construction validation (task/config-type/seed checks)
@@ -90,11 +90,11 @@ def test_datamodule_construction_validation():
 
 
 # =============================================================================
-# Tests: D08 train stream
+# Tests: train stream
 # =============================================================================
 
 
-def test_D08_train_stream_deterministic_per_seed_and_batch_index():
+def test_train_stream_deterministic_per_seed_and_batch_index():
     dm = _dm()
     batches = _take(dm.train_dataloader(), 3)
 
@@ -123,7 +123,7 @@ def test_D08_train_stream_deterministic_per_seed_and_batch_index():
         assert _batch_content(first) != _batch_content(second)
 
 
-def test_D08_train_stream_worker_sharding():
+def test_train_stream_worker_sharding():
     """Worker w of num_workers produces the batches w, w + num_workers, ...;
     the union over workers covers every stream index exactly once, for any
     worker count."""
@@ -155,7 +155,7 @@ def test_D08_train_stream_worker_sharding():
             assert _batch_content(batch) == _batch_content(expected)
 
 
-def test_D08_train_stream_worker_count_independent_via_dataloader():
+def test_train_stream_worker_count_independent_via_dataloader():
     """Through a real DataLoader with num_workers=2: the collected stream has
     no duplicate batches and its contents are exactly the per-index batches
     of the num_workers=0 stream (arrival order across workers is not
@@ -175,7 +175,7 @@ def test_D08_train_stream_worker_count_independent_via_dataloader():
     assert {_batch_content(b) for b in collected} == reference
 
 
-def test_D08_resume_via_state_dict():
+def test_resume_via_state_dict():
     dm = _dm()
     consumed = _take(dm.train_dataloader(), 3)
     assert [int(b["batch_index"]) for b in consumed] == [0, 1, 2]
@@ -198,7 +198,7 @@ def test_D08_resume_via_state_dict():
 
 
 @pytest.mark.parametrize("num_workers", [2, 3])
-def test_D08_stream_position_exact_for_any_worker_count(num_workers):
+def test_stream_position_exact_for_any_worker_count(num_workers):
     """The stream position advanced by on_before_batch_transfer makes
     state_dict resumption exact for any worker count: batches fed through
     the hook in DataLoader (round-robin) order, checkpointed mid-stream,
@@ -259,7 +259,7 @@ def test_D08_stream_position_exact_for_any_worker_count(num_workers):
     assert quiet.state_dict() == {"next_batch_idx": 0}
 
 
-def test_D08_batch_index_ignored_by_loss():
+def test_batch_index_ignored_by_loss():
     """The extra "batch_index" key does not affect the training loss:
     DualOptimizerModule.compute_loss reads only `labels` (and falls back to
     `input_ids`), so extra batch keys are ignored."""
@@ -297,7 +297,7 @@ def test_D08_batch_index_ignored_by_loss():
     assert torch.allclose(module.compute_loss(logits, without_index), loss)
 
 
-def test_D08_resume_sharded_with_workers():
+def test_resume_sharded_with_workers():
     """Resuming mid-stream with workers: worker w yields the stream positions
     saved + w + k*W, so the DataLoader's round-robin fetch order (worker 0
     first) continues the stream exactly — saved, saved+1, ... — and the
@@ -362,7 +362,7 @@ def _expected_batch(index):
     return expected
 
 
-def test_D08_ddp_two_rank_stream_partition_and_resume():
+def test_ddp_two_rank_stream_partition_and_resume():
     """W = 2 (simulated): the two ranks' global indices are disjoint and
     together cover 0..N-1 in lockstep order, with contents equal to the
     per-index generations (so the global stream is identical to W = 1);
@@ -410,7 +410,7 @@ def test_D08_ddp_two_rank_stream_partition_and_resume():
         assert _batch_content(batch) == _batch_content(_expected_batch(index))
 
 
-def test_D08_ddp_val_test_divisibility():
+def test_ddp_val_test_divisibility():
     """Under a process group with world size > 1, val/test set sizes must be
     divisible by the world size: Lightning's DistributedSampler pads by
     duplicating rows, which would double-count examples in the metrics."""
@@ -434,11 +434,11 @@ def test_D08_ddp_val_test_divisibility():
 
 
 # =============================================================================
-# Tests: D08 validation / test sets
+# Tests: validation / test sets
 # =============================================================================
 
 
-def test_D08_val_test_fixed_and_disjoint():
+def test_val_test_fixed_and_disjoint():
     dm = _dm(num_val_per_slice=7, num_test_per_slice=5)
     assert len({dm.train_seed, dm.val_seed, dm.test_seed}) == 3
     dm.setup()
@@ -468,7 +468,7 @@ def test_D08_val_test_fixed_and_disjoint():
     assert not torch.equal(dm.val_set["input_ids"][:4], train_batch["input_ids"])
 
 
-def test_D08_val_test_loader_shapes():
+def test_val_test_loader_shapes():
     dm = _dm(num_val_per_slice=3, num_test_per_slice=5)
     dm.setup()
     val_batches = list(dm.val_dataloader())
@@ -480,7 +480,7 @@ def test_D08_val_test_loader_shapes():
     assert sum(b["input_ids"].shape[0] for b in test_batches) == 2 * 5
 
 
-def test_D08_overwrite_task_batches():
+def test_overwrite_task_batches():
     dm = _dm(task="overwrite", task_config=OW_CFG, num_val_per_slice=3)
     dm.setup()
     train_batch = _take(dm.train_dataloader(), 1)[0]
@@ -501,7 +501,7 @@ def test_D08_overwrite_task_batches():
     assert "batch_index" not in val_batch
 
 
-def test_D08_fixed_set_generator_matches_dm():
+def test_fixed_set_generator_matches_dm():
     dm = _dm(num_val_per_slice=6)
     dm.setup()
     direct = _generate_fixed_set("mqar", MQAR_CFG, 6, dm.val_seed)
@@ -509,7 +509,7 @@ def test_D08_fixed_set_generator_matches_dm():
         assert torch.equal(dm.val_set[key], direct[key])
 
 
-def test_D08_val_test_slices_seeded_by_slice_value():
+def test_val_test_slices_seeded_by_slice_value():
     """Slices are seeded by slice VALUE, not position: configs that share a
     slice value (and base seed) share that slice's rows bit-exactly, so
     e.g. re-evaluations under a different slice grid stay comparable."""

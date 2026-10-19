@@ -41,20 +41,20 @@ model:                     # -> ZoologyLMConfig
   mixer_mode: chunk
 
 optimizer:
-  lr: null                 # null -> frozen_protocol.yaml (task, layout, gate_mode)
+  lr: null   # null -> frozen_protocol.yaml (task, layout, gate_mode)
   weight_decay: 0.1
   betas: [0.9, 0.95]
-  decay_scheme: grouped    # grouped | uniform (uniform = weight decay everywhere)
+  decay_scheme: grouped   # grouped | uniform (uniform = decay everywhere)
 
 training:
   batch_size: 256
-  collect_mixer_stats: true  # per-layer lambda/erase statistics during validation
+  collect_mixer_stats: true  # per-layer lambda/erase stats in validation
   max_steps: 20000
   val_check_interval: 500
   early_stop_threshold: 0.99
   precision: 32-true
   grad_clip_val: null
-  loss_on: answers         # answers | all (full-sequence CE, the D18 switch)
+  loss_on: answers         # answers | all (full-sequence CE)
   compile: false
   log_every_n_steps: 50
 
@@ -63,18 +63,30 @@ data:
   num_val_per_slice: 1000
   num_test_per_slice: 1000
 
+launch:
+  # Protocol tiers only: skip a run whose record is test_done with the
+  # same identity (the smoke and debug configs always run).
+  skip_completed: true
+  # In the launch directory; while it exists, no new run starts.
+  stop_file: STOP
+  # Several processes on one machine split one sweep: job k runs only in
+  # the process with shard_index == k % num_shards.
+  shard_index: 0
+  num_shards: 1
+
 output:
   runs_dir: ${hydra:runtime.cwd}/runs/${task.name}
-  # Every run's final checkpoint, saved next to its run JSON
-  # (runs/<task>/<run_id>.pt, git-ignored) so the mechanism probes and
-  # finer breakdowns can be computed afterwards without retraining.
-  # About 2 MB per run at the pilot size.
-  save_final_checkpoint: true
+  # Final checkpoints are OFF by default: final weights are saved
+  # only for runs whose weights are needed, e.g. the mechanism probes; a
+  # re-run in the same environment is close but not bit-identical. When
+  # on, the checkpoint is saved atomically after fit and before the test
+  # pass (runs/<task>/<run_id>.pt, git-ignored).
+  save_final_checkpoint: false
 
 logging:
   csv:
     enabled: true
-    save_dir: logs/csv
+    save_dir: ${output.runs_dir}/curves   # curves next to the run records
   wandb:
     enabled: false
     project: MultistateGDN2

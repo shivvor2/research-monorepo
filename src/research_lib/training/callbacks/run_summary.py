@@ -79,14 +79,15 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
-from uuid import uuid4
 
 import lightning as L
 import torch
 from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.trainer.states import TrainerFn
+from lightning.pytorch.utilities.exceptions import SIGTERMException
 
 from research_lib.training.param_utils import select_parameters
+from research_lib.utils.io import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -125,11 +126,13 @@ BUILTIN_SECTIONS: tuple[str, ...] = (
     "error",
     "config",
     "config_hash",
+    "hash_excluded_keys",
     "seed",
     "filename",
     "git",
     "versions",
     "device",
+    "provenance",
     "timing",
     "stopping",
 )
@@ -212,17 +215,41 @@ DEFAULT_COLLECTORS: tuple[Collector, ...] = (
 """Default sections: parameters at fit start, val metrics at fit end, test at test end."""
 
 
-def config_hash(config: Mapping[str, Any]) -> str:
-    """SHA-256 of the canonical JSON of the config without the seed.
+def _remove_dotted_keys(mapping: dict[str, Any], keys: Sequence[str]) -> dict[str, Any]:
+    """A copy of ``mapping`` without the dotted keys (``"output"`` removes
+    the subtree, ``"data.num_workers"`` one leaf; missing keys are ignored)."""
+    out = dict(mapping)
+    for dotted in keys:
+        parts = dotted.split(".")
+        node: Any = out
+        for part in parts[:-1]:
+            if not isinstance(node, dict) or part not in node:
+                node = None
+                break
+            node = node[part]
+        if node is not None and isinstance(node, dict) and parts[-1] in node:
+            del node[parts[-1]]
+    return out
+
+
+def config_hash(config: Mapping[str, Any], exclude: Sequence[str] = ()) -> str:
+    """SHA-256 of the canonical JSON of the config, without the seed and
+    without the dotted keys in ``exclude``.
 
     Args:
         config: Fully resolved config mapping.
+        exclude: Dotted keys removed before hashing (``"output"`` removes
+            the subtree, ``"data.num_workers"`` one leaf). Keys that do
+            not exist are ignored. The ``seed`` is always excluded, so all
+            seeds of one configuration share a hash.
 
     Returns:
-        str: The hex digest. All seeds of one configuration share a hash.
+        str: The hex digest.
     """
     plain = json.loads(json.dumps(config, default=str, sort_keys=True))
     plain.pop("seed", None)
+    if exclude:
+        plain = _remove_dotted_keys(plain, exclude)
     payload = json.dumps(plain, sort_keys=True)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
@@ -253,14 +280,24 @@ def _check_stage_hooks(cls: type) -> None:
         )
 
 
-def _git_info() -> dict[str, Any]:
-    """Commit hash and dirty flag of the repository containing this package."""
+def _repo_root() -> Path | None:
+    """The repository root (the directory holding ``.git``), or ``None``
+    outside a git checkout (e.g. installed from a wheel).
+
+    ``.git`` is a directory in a checkout and a file in a worktree, so
+    ``exists()`` covers both.
+    """
     root = Path(__file__).resolve()
     for parent in root.parents:
-        if (parent / ".git").exists():  # dir (checkout) or file (worktree)
-            root = parent
-            break
-    else:  # not a git checkout (e.g. installed from a wheel)
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def _git_info() -> dict[str, Any]:
+    """Commit hash and dirty flag of the repository containing this package."""
+    root = _repo_root()
+    if root is None:  # not a git checkout (e.g. installed from a wheel)
         return {"commit": None, "dirty": None}
     try:
         commit = subprocess.run(
@@ -329,6 +366,14 @@ class RunSummaryCallback(L.Callback):
             versions are recorded; a missing distribution gives ``None``.
             The Python version and ``torch.version.cuda`` are always
             recorded.
+        hash_exclude: Dotted config keys excluded from the stored
+            ``config_hash`` and from every identity check (see
+            :func:`config_hash`). The record stores the sorted list as
+            ``hash_excluded_keys``. The default is empty, so other
+            callers keep today's behaviour.
+        provenance_files: File names relative to the repository root
+            (found the same way ``_git_info`` finds it) whose SHA-256 is
+            recorded under ``provenance``; a missing file gives ``null``.
         monitor: Metric name to track the best value of (e.g.
             ``"val/acc"``); ``None`` disables tracking.
         mode: ``"max"`` or ``"min"``: which direction improves ``monitor``.
@@ -355,6 +400,8 @@ class RunSummaryCallback(L.Callback):
         *,
         filename: str = "{run_id}.json",
         packages: Sequence[str] = ("torch", "lightning", "numpy"),
+        hash_exclude: Sequence[str] = (),
+        provenance_files: Sequence[str] = (),
         monitor: str | None = None,
         mode: Literal["min", "max"] = "max",
         collectors: Sequence[Collector] = DEFAULT_COLLECTORS,
@@ -369,6 +416,9 @@ class RunSummaryCallback(L.Callback):
         self.run_id = str(run_id)
         self.config = json.loads(json.dumps(dict(config), default=str))
         self.packages = tuple(packages)
+        self.hash_exclude = tuple(hash_exclude)
+        self.provenance_files = tuple(provenance_files)
+        self._provenance = self._compute_provenance()
         self.monitor = monitor
         self.mode = mode
         self.collectors = tuple(collectors)
@@ -376,7 +426,7 @@ class RunSummaryCallback(L.Callback):
         self.strict = bool(strict)
         self.summary: dict[str, Any] = {}
 
-        hash_full = config_hash(self.config)
+        hash_full = config_hash(self.config, self.hash_exclude)
         seed = self.config.get("seed")
         fields = {
             "run_id": self.run_id,
@@ -420,7 +470,8 @@ class RunSummaryCallback(L.Callback):
         return self.runs_dir / self.filename
 
     def _write(self, trainer: L.Trainer) -> None:
-        """Write the summary JSON atomically (temp file + rename).
+        """Write the summary JSON atomically and durably (temp file +
+        fsync + rename, through :func:`research_lib.utils.io.atomic_write`).
 
         Only the global rank-zero process writes. Under DDP every rank
         runs the callback and would race on the same temp file, so the
@@ -432,29 +483,49 @@ class RunSummaryCallback(L.Callback):
             return
         self.summary["run_id"] = self.run_id
         self.summary["config"] = self.config
-        self.summary["config_hash"] = config_hash(self.config)
+        self.summary["config_hash"] = config_hash(self.config, self.hash_exclude)
+        self.summary["hash_excluded_keys"] = sorted(self.hash_exclude)
         self.summary["seed"] = self.config.get("seed")
         self.summary["filename"] = self.filename
         self.summary["git"] = self._git
         self.summary["versions"] = self._versions()
         self.summary["device"] = self._device()
+        self.summary["provenance"] = self._provenance
         path = self.path
-        # The filename may contain subdirectories; create the file's
-        # parent (covers runs_dir itself).
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # A writer-unique temp name: two processes writing the same path
-        # (a relaunch racing the old process, or two machines sharing the
-        # runs directory) must not race on one temp file. The temp file is
+
+        def write(f: Any) -> None:
+            json.dump(self.summary, f, indent=2, sort_keys=True, default=str)
+
+        # The shared atomic writer: a writer-unique temp name (two
+        # processes writing the same path — a relaunch racing the old
+        # process, or two machines sharing the runs directory — must not
+        # race on one temp file), fsync of the file before the rename and
+        # of the parent directory after it, so a power loss cannot
+        # truncate the record the next relaunch reads. The temp file is
         # removed if the write raises, so a crashed write leaves nothing.
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.summary, f, indent=2, sort_keys=True, default=str)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-        os.replace(tmp, path)
+        atomic_write(path, write, "w", encoding="utf-8")
         logger.info("RunSummaryCallback: wrote %s", path)
+
+    def _compute_provenance(self) -> dict[str, str | None]:
+        """SHA-256 of each provenance file, relative to the repository root.
+
+        A missing file (or no repository root) gives ``null``. Computed
+        once at construction: the files (e.g. ``uv.lock``) must not change
+        during a run.
+        """
+        root = _repo_root()
+        provenance: dict[str, str | None] = {}
+        for name in self.provenance_files:
+            if root is None:
+                provenance[name] = None
+                continue
+            try:
+                provenance[name] = hashlib.sha256(
+                    (root / name).read_bytes()
+                ).hexdigest()
+            except OSError:
+                provenance[name] = None
+        return provenance
 
     def _versions(self) -> dict[str, Any]:
         """Python version, ``torch.version.cuda`` and the package versions."""
@@ -570,7 +641,7 @@ class RunSummaryCallback(L.Callback):
 
     def _identity(self) -> tuple[str, Any]:
         """The record's identity: ``(config_hash, seed)``."""
-        return (config_hash(self.config), self.config.get("seed"))
+        return (config_hash(self.config, self.hash_exclude), self.config.get("seed"))
 
     def _read_record(self) -> dict[str, Any]:
         """The existing record at ``self.path``; raises if unreadable."""
@@ -691,7 +762,14 @@ class RunSummaryCallback(L.Callback):
             # keep the existing file's sections instead of replacing the
             # complete fit summary with built-ins and the error only.
             self._load_existing()
-        status = "interrupted" if isinstance(exception, KeyboardInterrupt) else "failed"
+        # SIGTERM is an interruption, not a failure: Lightning raises
+        # SIGTERMException at the next batch after SIGTERM (kill, Slurm
+        # cancel/preemption, cloud stop), and the run may be relaunched.
+        status = (
+            "interrupted"
+            if isinstance(exception, (KeyboardInterrupt, SIGTERMException))
+            else "failed"
+        )
         self.summary["status"] = status
         self.summary["failed_stage"] = _failed_stage(trainer)
         self.summary["error"] = repr(exception)

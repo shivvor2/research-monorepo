@@ -2,6 +2,7 @@
 # Tier 4 lambda controls (prediction 4): lambda {static, lin} x gate
 # full x layout {ws, ll} x seeds 0-4, both tasks. 40 runs.
 # Run: python 01_train.py +sweep=tier4_lambda --multirun
+# Sweep order: task (overwrite before mqar), then seed, then the rest.
 
 experiment:
   phase: 2
@@ -11,8 +12,8 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      task: mqar,overwrite
+      task: overwrite,mqar
+      seed: range(0,5)
       model.gate_mode: full
       model.layout: ws,ll
       model.lambda_mode: static,lin
-      seed: range(0,5)

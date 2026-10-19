@@ -3,6 +3,7 @@
 # Delta_int, w_only little. gate {b_only, w_only} x layout {single, ws,
 # ll} x seeds 0-4, both tasks. 60 runs.
 # Run: python 01_train.py +sweep=tier2_gates --multirun
+# Sweep order: task (overwrite before mqar), then seed, then the rest.
 
 experiment:
   phase: 2
@@ -12,7 +13,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      task: mqar,overwrite
+      task: overwrite,mqar
+      seed: range(0,5)
       model.gate_mode: b_only,w_only
       model.layout: single,ws,ll
-      seed: range(0,5)
