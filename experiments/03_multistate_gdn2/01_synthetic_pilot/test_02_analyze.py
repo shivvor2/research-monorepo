@@ -24,6 +24,7 @@ adds the matched-bytes and mixer sections.
 
 import importlib.util
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -375,6 +376,63 @@ class TestTierSelection:
         ws = frame[frame["layout"] == "ws"].iloc[0]
         # (0.60 - 0.99) hand-computed from the sentinels.
         assert ws["mean"] == pytest.approx(0.60 - SENTINEL, abs=1e-12)
+
+    def test_matched_bytes_means_use_the_paired_seeds_only(self, options):
+        # Core seeds 0-9 with seed-dependent values, matched seeds 0-4
+        # only: both means of one row must describe the same seed set -
+        # the paired seeds (0-4), never the whole core column.
+        rows = [
+            _row("tier1_core", "overwrite", "ws", "full", seed, 0.5 + 0.01 * seed)
+            for seed in range(10)
+        ]
+        rows += [
+            _row(
+                "tier5_matched_bytes",
+                "overwrite",
+                "single",
+                "full",
+                seed,
+                0.3 + 0.01 * seed,
+            )
+            for seed in range(5)
+        ]
+        frame = matched_bytes.run(
+            pd.DataFrame(rows), options.n_resamples, options.alpha
+        )
+        assert len(frame) == 1
+        record = frame.iloc[0]
+        assert record["n_seeds"] == 5
+        # Hand-computed over seeds 0-4: 0.52, 0.32, and their difference.
+        assert record["mean_multistate"] == pytest.approx(0.52)
+        assert record["mean_matched_single"] == pytest.approx(0.32)
+        assert record["mean"] == pytest.approx(0.20, abs=1e-12)
+
+    def test_matched_bytes_duplicated_cell_drops_that_seed(self, options, caplog):
+        # A duplicated matched-bytes record for one seed: that seed
+        # cannot pair, drops from the table, and the shared pairing
+        # helper logs it (a silent drop would hide the record).
+        rows = []
+        for seed in (0, 1):
+            rows.append(_row("tier1_core", "overwrite", "ws", "full", seed, 0.6))
+            rows.append(
+                _row("tier5_matched_bytes", "overwrite", "single", "full", seed, 0.3)
+            )
+        duplicate = dict(rows[-1])
+        duplicate["run_id"] = "tier5-duplicate"
+        rows.append(duplicate)
+        with caplog.at_level(logging.WARNING, logger="research_lib.utils.stats"):
+            frame = matched_bytes.run(
+                pd.DataFrame(rows), options.n_resamples, options.alpha
+            )
+        assert len(frame) == 1
+        record = frame.iloc[0]
+        # Seed 0 dropped (its matched cell is duplicated); seed 1 pairs.
+        assert record["n_seeds"] == 1
+        assert record["mean"] == pytest.approx(0.3, abs=1e-12)
+        assert any(
+            "dropped units" in record_.getMessage() and "0" in record_.getMessage()
+            for record_ in caplog.records
+        )
 
     def test_anchors_table_lists_published_numbers(self, table, options):
         frame = anchors.run(table)
