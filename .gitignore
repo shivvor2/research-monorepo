@@ -11,6 +11,9 @@ results
 # Hydra outputs
 **/outputs/
 
+# Timing benchmark outputs (00_benchmark.py)
+**/bench/
+
 # Keep Logging/ checkpointing local
 logs/*
 checkpoints/*
