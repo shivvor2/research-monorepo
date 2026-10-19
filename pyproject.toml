@@ -9,8 +9,8 @@ authors = [{ name = "Loo Jun Zing", email = "jzloo11111@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
     # Core DL
-    # 2.11 is the first PyPI Linux wheel built against CUDA 13 (no custom index).
-    "torch>=2.11",
+    # The code is tested on 2.14; its PyPI Linux wheel uses CUDA 13.
+    "torch>=2.14",
 
     # Pytorch native external dependencies
     "rotary-embedding-torch",
