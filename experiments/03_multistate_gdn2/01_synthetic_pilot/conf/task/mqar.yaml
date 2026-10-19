@@ -1,4 +1,4 @@
-# MQAR task (Zoology format; protocol §3.1).
+# MQAR task (Zoology format).
 #
 # Keys are drawn from [1, V/2) and values from [V/2, V) without repetition;
 # the D pairs occupy the first 2D positions; queries sit at even offsets

@@ -1,5 +1,5 @@
 # @package _global_
-# Phase 1 calibration: harness switches (protocol §10 rule 3).
+# Phase 1 calibration: harness switches.
 # single-state `gdn` with the default harness (zoology pattern) vs
 # mixer_x2, selection seeds 100-101. Keep the default unless it lands
 # far outside the Log-Linear Table 2 range.

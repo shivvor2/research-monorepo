@@ -1,5 +1,5 @@
 # @package _global_
-# Tier 6 anchors: Log-Linear Table 2 sanity (protocol §3.4).
+# Tier 6 anchors: Log-Linear Table 2 sanity.
 # gate gdn x layout {single, ll} x d in {16, 32, 64} x seeds 0-4, MQAR
 # only. 30 runs. Head counts follow the paper: 1 head at d = 16, 2
 # otherwise (one small anchor override file per dimension).

@@ -101,7 +101,7 @@ class TestM18LambdaMixer:
 
 
 class TestLambdaInit:
-    """λ≡1 exactly at initialization, every mode (D9 / D21)."""
+    """λ≡1 exactly at initialization, every mode."""
 
     @pytest.mark.parametrize("mode", LAMBDA_MODES)
     def test_lambda_is_one_at_init_fp64(self, mode):
@@ -120,7 +120,7 @@ class TestLambdaInit:
 
     @pytest.mark.parametrize("mode", LAMBDA_MODES)
     def test_lambda_is_one_at_init_fp32(self, mode):
-        # fp32: softplus(log(e-1)) is 1 up to rounding; D21's init is the
+        # fp32: softplus(log(e-1)) is 1 up to rounding; the init is the
         # inverse softplus at 1, so this holds to fp32 precision.
         d, H, L = 16, 2, 6
         mixer = LambdaMixer(hidden_size=d, num_heads=H, num_levels=L, mode=mode)

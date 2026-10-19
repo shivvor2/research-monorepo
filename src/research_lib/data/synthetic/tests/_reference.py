@@ -1,13 +1,12 @@
-"""Spec-literal sequential reference generator for the overwrite task.
+"""Literal sequential reference generator for the overwrite task.
 
 Test-only oracle: the original per-example (sequential) implementation of
 ``generate_overwrite``, kept verbatim as the reference for the
 distributional comparison test
-(``test_overwrite.py::test_D05_vectorized_matches_reference_distribution``)
+(``test_overwrite.py::test_vectorized_matches_reference_distribution``)
 of the batch-vectorized production implementation.
 
-The reference follows the spec (``impl/03_spec_synthetic_tasks.md`` §4)
-literally: keys processed in random order; ``s_1`` uniform over the free
+The reference implements the generation rules literally: keys processed in random order; ``s_1`` uniform over the free
 pair slots; ``s_2`` uniform over the free slots satisfying the class block
 rule given ``s_1``; ``s_1`` redrawn up to ``max_placement_attempts`` times;
 the example restarted (classes, keys, values redrawn; the example's
@@ -54,7 +53,7 @@ def _generate_reference_example(
     rng: np.random.Generator,
     k: int,
 ) -> dict[str, np.ndarray] | None:
-    """Generate one overwrite example with ``k`` keys (spec-literal loop).
+    """Generate one overwrite example with ``k`` keys (literal loop).
 
     Returns:
         Dict of int64 arrays of shape ``(T,)``, or ``None`` to signal that
@@ -179,7 +178,7 @@ def generate_overwrite_reference(
     seed: int,
     fixed_num_keys: int | None = None,
 ) -> dict[str, torch.Tensor]:
-    """Sequential spec-literal reference for ``generate_overwrite``.
+    """Sequential literal reference for ``generate_overwrite``.
 
     Same batch format as the production generator; same validation-free
     calling convention as the test configs (which are validated by

@@ -54,7 +54,7 @@ training:
   early_stop_threshold: 0.99
   precision: 32-true
   grad_clip_val: null
-  loss_on: answers         # answers | all (full-sequence CE, the D18 switch)
+  loss_on: answers         # answers | all (full-sequence CE)
   compile: false
   log_every_n_steps: 50
 

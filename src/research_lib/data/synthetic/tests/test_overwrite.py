@@ -1,14 +1,14 @@
 """
-Test suite for the repeated-key overwrite generator (spec PR 3).
+Test suite for the repeated-key overwrite generator.
 
 Covers:
   * OverwriteConfig construction / feasibility validation
   * Determinism per seed
-  * D05: example structure (placement classes, latest-value labels, filler)
-  * D05: batch-vectorized implementation vs the spec-literal sequential
+  * example structure (placement classes, latest-value labels, filler)
+  * batch-vectorized implementation vs the literal sequential
     reference (_reference.py), compared distributionally
-  * D06: class proportions match class_probs
-  * D07: infeasible configs raise ValueError
+  * class proportions match class_probs
+  * infeasible configs raise ValueError
 
 Run with: pytest src/research_lib/data/synthetic/tests/test_overwrite.py -v
 """
@@ -169,12 +169,12 @@ def test_overwrite_config_validation():
 
 
 # =============================================================================
-# Tests: D05 structure
+# Tests: structure
 # =============================================================================
 
 
 @pytest.mark.parametrize("k", [4, 8, 16])
-def test_D05_fixed_num_keys_structure(k):
+def test_fixed_num_keys_structure(k):
     batch = generate_overwrite(SMALL, num_examples=24, seed=3, num_keys=k)
     assert batch["slice_id"].tolist() == [k] * 24
     for e in range(24):
@@ -189,7 +189,7 @@ def test_D05_fixed_num_keys_structure(k):
         )
 
 
-def test_D05_drawn_num_keys_structure():
+def test_drawn_num_keys_structure():
     batch = generate_overwrite(SMALL, num_examples=48, seed=17)
     for e in range(48):
         k = int(batch["slice_id"][e])
@@ -205,7 +205,7 @@ def test_D05_drawn_num_keys_structure():
         )
 
 
-def test_D05_dtypes_shapes_and_distant_extreme():
+def test_dtypes_shapes_and_distant_extreme():
     batch = generate_overwrite(SMALL, num_examples=4, seed=0, num_keys=8)
     assert set(batch) == {
         "input_ids",
@@ -224,7 +224,7 @@ def test_D05_dtypes_shapes_and_distant_extreme():
     assert torch.all(batch["write_distance"][~mask] == NO_DISTANCE)
 
 
-def test_D05_all_distant_class_extreme():
+def test_all_distant_class_extreme():
     distant_only = OverwriteConfig(
         vocab_size=512,
         seq_len=128,
@@ -250,7 +250,7 @@ def test_D05_all_distant_class_extreme():
         )
 
 
-def test_D05_all_single_class_extreme():
+def test_all_single_class_extreme():
     single_only = OverwriteConfig(
         vocab_size=512,
         seq_len=128,
@@ -271,7 +271,7 @@ def test_D05_all_single_class_extreme():
 # =============================================================================
 
 
-def test_D01_overwrite_determinism():
+def test_overwrite_determinism():
     """Same seed reproduces the batch bit-exactly; a different seed differs."""
     batch = generate_overwrite(SMALL, num_examples=16, seed=42)
     again = generate_overwrite(SMALL, num_examples=16, seed=42)
@@ -282,7 +282,7 @@ def test_D01_overwrite_determinism():
 
 
 # =============================================================================
-# Tests: D05 vectorized vs spec-literal reference (distributional)
+# Tests: vectorized vs literal reference (distributional)
 # =============================================================================
 
 
@@ -314,8 +314,8 @@ def _first_write_slots(config, batch):
 
 
 @pytest.mark.slow
-def test_D05_vectorized_matches_reference_distribution():
-    """The batch-vectorized generator reproduces the spec-literal sequential
+def test_vectorized_matches_reference_distribution():
+    """The batch-vectorized generator reproduces the literal sequential
     reference (kept verbatim in ``_reference.py``) distributionally.
 
     Two-sample Kolmogorov-Smirnov tests (alpha = 1e-3) on the per-class
@@ -372,7 +372,7 @@ def test_D05_vectorized_matches_reference_distribution():
 
 
 @pytest.mark.slow
-def test_D05_restarts_keep_k_per_example():
+def test_restarts_keep_k_per_example():
     """K is drawn once per example and kept across restarts: with a tight
     config whose restart rate depends on K (all-distant K=42 at T=256
     restarts ~79% of examples), the slice mix stays at the configured 50/50
@@ -398,12 +398,12 @@ def test_D05_restarts_keep_k_per_example():
 
 
 # =============================================================================
-# Tests: D06 class proportions
+# Tests: class proportions
 # =============================================================================
 
 
 @pytest.mark.slow
-def test_D06_class_frequencies_match_probs():
+def test_class_frequencies_match_probs():
     probs = (0.2, 0.3, 0.4, 0.1)
     config = OverwriteConfig(
         vocab_size=512, seq_len=128, num_keys=(8,), class_probs=probs
@@ -417,17 +417,17 @@ def test_D06_class_frequencies_match_probs():
 
 
 # =============================================================================
-# Tests: D07 feasibility
+# Tests: feasibility
 # =============================================================================
 
 
-def test_D07_too_many_keys_raises():
+def test_too_many_keys_raises():
     # All-distant worst case: 4K write tokens + 2K query tokens = 6K > T.
     with pytest.raises(ValueError):
         OverwriteConfig(vocab_size=1024, seq_len=128, num_keys=(32,))
 
 
-def test_D07_write_region_too_short_raises():
+def test_write_region_too_short_raises():
     # 6K <= T but the write region spans < distant_min_blocks + 1 blocks.
     with pytest.raises(ValueError):
         OverwriteConfig(
@@ -439,6 +439,6 @@ def test_D07_write_region_too_short_raises():
         )
 
 
-def test_D07_generate_override_validates():
+def test_generate_override_validates():
     with pytest.raises(ValueError):
         generate_overwrite(SMALL, num_examples=2, seed=0, num_keys=32)

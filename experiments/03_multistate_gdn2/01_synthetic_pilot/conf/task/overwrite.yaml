@@ -1,4 +1,4 @@
-# Repeated-key overwrite task (protocol §4).
+# Repeated-key overwrite task.
 #
 # K distinct keys; each key gets a placement class (same / adjacent /
 # distant / single, 1/4 each); two-token writes live in the region before
@@ -10,7 +10,7 @@ vocab_size: 8192
 seq_len: 256
 num_keys: [8, 16, 32]              # K drawn per example (slices)
 class_probs: [0.25, 0.25, 0.25, 0.25]
-block_size: 16                      # B = C (D13)
+block_size: 16                      # B = C
 distant_min_blocks: 4
 max_placement_attempts: 100
 

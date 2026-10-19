@@ -4,7 +4,7 @@ Pilot analysis: Delta_int, bootstrap CIs and the pre-registered readings.
 Reads the run JSONs written by 01_train.py (``runs/**/*.json``) and
 writes CSVs plus ``summary.md`` under ``analysis/``:
 
-- the primary endpoint (protocol §6): Delta_int^LL and Delta_int^WS on
+- the primary endpoint: Delta_int^LL and Delta_int^WS on
   overwrite, class ``distant``, K = 2 d_k, with bootstrap CIs and the
   pre-registered decision-rule reading (§9);
 - the same for every other (task, slice, class) cell that has the four
@@ -50,7 +50,7 @@ LOG_LINEAR_STD_2 = {
     64: {"single": None, "ll": None},
 }
 
-# Expected run counts per tier (protocol §7), for the missing-run report.
+# Expected run counts per tier, for the missing-run report.
 EXPECTED_RUNS = {
     "calib_dmodel": 4,
     "calib_harness": 4,
@@ -166,7 +166,7 @@ def tier_rows(table: pd.DataFrame, tier: str) -> pd.DataFrame:
 
 
 def decision_rule(low: float, high: float, primary: bool) -> str:
-    """The pre-registered reading of a Delta_int CI (protocol §9)."""
+    """The pre-registered reading of a Delta_int CI."""
     if low > 0:
         return "CI entirely above 0: supports the hypothesis at pilot scale"
     if high < 0:

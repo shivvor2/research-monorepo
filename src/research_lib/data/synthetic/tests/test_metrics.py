@@ -1,11 +1,11 @@
 """
-Test suite for answer-position metrics (spec PR 3, tests D09-D10).
+Test suite for answer-position metrics.
 
 Covers:
   * answer_predictions: shift convention, masking
-  * D09: hand-made logits give exact accuracy / per-slice / per-class /
+  * hand-made logits give exact accuracy / per-slice / per-class /
     leakage / other values
-  * D10: cross-entropy with the repo convention equals a manual mean over
+  * cross-entropy with the repo convention equals a manual mean over
     answer positions only
 
 Run with: pytest src/research_lib/data/synthetic/tests/test_metrics.py -v
@@ -84,11 +84,11 @@ def test_answer_predictions_shift_and_mask():
 
 
 # =============================================================================
-# Tests: D09 metrics
+# Tests: metrics
 # =============================================================================
 
 
-def test_D09_exact_accuracy_slices_classes_leak_other():
+def test_exact_accuracy_slices_classes_leak_other():
     batch = _hand_batch()
     logits = _hand_logits()
     metrics = RecallMetrics(slice_values=[8])
@@ -119,7 +119,7 @@ def test_D09_exact_accuracy_slices_classes_leak_other():
     assert "leak/slice=8/class=distant" not in out
 
 
-def test_D09_leakage_counts_old_value_predictions():
+def test_leakage_counts_old_value_predictions():
     batch = _hand_batch()
     logits = torch.zeros(1, 6, 12, dtype=torch.float64)
     # Answer at position 3 (target 11, old 10): predict the OLD value -> leak.
@@ -140,7 +140,7 @@ def test_D09_leakage_counts_old_value_predictions():
     assert "leak/class=distant" not in out
 
 
-def test_D09_accumulation_across_updates_and_slices():
+def test_accumulation_across_updates_and_slices():
     metrics = RecallMetrics(slice_values=[4, 8])
     # Slice 4: 1 correct answer; slice 8: 2 answers, 1 correct.
     labels = torch.full((2, 4), IGNORE, dtype=torch.int64)
@@ -185,7 +185,7 @@ def test_D09_accumulation_across_updates_and_slices():
         assert f"acc/slice=8/class={name}" not in out
 
 
-def test_D09_mqar_mode_without_class_keys():
+def test_mqar_mode_without_class_keys():
     config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2,))
     batch = generate_mqar(config, num_examples=4, seed=0)
     logits = torch.zeros(4, config.seq_len, config.vocab_size, dtype=torch.float64)
@@ -205,7 +205,7 @@ def test_D09_mqar_mode_without_class_keys():
     assert metrics.compute()["acc"] == pytest.approx(1.0)
 
 
-def test_D09_perfect_and_random_overwrite_batches():
+def test_perfect_and_random_overwrite_batches():
     config = OverwriteConfig(
         vocab_size=512,
         seq_len=128,
@@ -273,7 +273,7 @@ def test_D09_perfect_and_random_overwrite_batches():
         assert f"leak/class={name}" not in out
 
 
-def test_D09_constructor_validation():
+def test_constructor_validation():
     with pytest.raises(ValueError):
         RecallMetrics(slice_values=())
     with pytest.raises(ValueError):
@@ -283,7 +283,7 @@ def test_D09_constructor_validation():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-def test_D09_update_is_sync_free():
+def test_update_is_sync_free():
     """update() performs no host synchronization: under CUDA sync debug mode
     'error' (which raises on any synchronizing call, including internal
     .item()/D2H transfers) the update runs clean. torch.bincount was
@@ -314,7 +314,7 @@ def test_D09_update_is_sync_free():
     assert metrics.compute()["acc"] == pytest.approx(1.0)
 
 
-def test_D09_two_rank_reduction_matches_combined():
+def test_two_rank_reduction_matches_combined():
     """Summing two accumulators' count tensors (what all_reduce(SUM) does in
     compute() under DDP) and deriving through the same compute() path
     matches one accumulator fed both halves."""
@@ -350,7 +350,7 @@ def test_D09_two_rank_reduction_matches_combined():
     assert rank0.compute() == combined.compute()
 
 
-def test_D09_unknown_slice_values_raise_in_compute():
+def test_unknown_slice_values_raise_in_compute():
     """Answers whose slice_id is not among slice_values are counted in a
     separate on-device counter and reported (ValueError) by compute()."""
     config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2,))
@@ -364,11 +364,11 @@ def test_D09_unknown_slice_values_raise_in_compute():
 
 
 # =============================================================================
-# Tests: D10 loss restricted to answers
+# Tests: loss restricted to answers
 # =============================================================================
 
 
-def test_D10_loss_equals_manual_answer_mean():
+def test_loss_equals_manual_answer_mean():
     import torch.nn.functional as F
 
     config = OverwriteConfig(
@@ -419,7 +419,7 @@ def test_D10_loss_equals_manual_answer_mean():
     )
 
 
-def test_D10_loss_equals_answer_mean_mqar():
+def test_loss_equals_answer_mean_mqar():
     import torch.nn.functional as F
 
     config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2, 4))
@@ -438,7 +438,7 @@ def test_D10_loss_equals_answer_mean_mqar():
     assert torch.allclose(repo_loss, manual, atol=1e-10, rtol=1e-10)
 
 
-class TestD11WriteDistanceMetrics:
+class TestWriteDistanceMetrics:
     """Accuracy and old-value leakage binned by the write distance."""
 
     def _hand_batch(self):

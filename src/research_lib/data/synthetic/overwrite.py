@@ -55,9 +55,9 @@ mask over the pair slots. The per-example random procedure is the spec's:
 
 Because the batch implementation draws its randomness in a different
 order than a per-example loop, its random streams are its own: generator
-+ seed reproduce every example bit-exactly. A spec-literal sequential
++ seed reproduce every example bit-exactly. A literal sequential
 reference procedure lives in the test suite
-(``test_D05_vectorized_matches_reference_distribution``) and is compared
+(``test_vectorized_matches_reference_distribution``) and is compared
 against this implementation distributionally.
 """
 

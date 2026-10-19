@@ -1,5 +1,5 @@
 # @package _global_
-# Phase 1 calibration: d_model selection (protocol §10 rule 2).
+# Phase 1 calibration: d_model selection.
 # single-state `full` on MQAR at d in {32, 64}, selection seeds 100-101.
 # Pick the smallest d whose MQAR accuracy lands in [0.5, 0.95];
 # fallback 32.

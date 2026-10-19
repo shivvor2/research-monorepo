@@ -17,7 +17,7 @@ class GatedDeltaCache:
 
     Attributes:
         state (Tensor): Recurrent state of shape ``(B, H, d_k, d_v)`` for the
-            single-state layer (PR 1).  The multi-state layer (PR 2) uses
+            single-state layer.  The multi-state layer uses
             ``(B, H, L, d_k, d_v)`` with one bucket per level.  Always fp32
             (fp64 in the fp64 test suite).
         conv_state (tuple[Tensor, Tensor, Tensor] | None): Short-conv caches

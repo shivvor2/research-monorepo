@@ -8,9 +8,8 @@ measuring the pre-registered primary statistic
 Δ_int = (X-GDN2 − X-KDA) − (GDN2 − KDA), X ∈ {LL, WS}
 
 on overwrite, class `distant`, K = 2·d_k, with per-seed bootstrap CIs.
-The protocol (`06_experiment_protocol.md` in the project notes) is the
-source of truth for every setting: grid, seeds, decision rules, and the
-calibration below.
+The experiment protocol is the source of truth for every setting:
+grid, seeds, decision rules, and the calibration below.
 
 ## Quick start
 
@@ -27,7 +26,7 @@ python 01_train.py --config-name=debug --multirun
 The pilot runs in the committed `uv.lock` (Linux x86_64, Python 3.13,
 Lightning ≥ 2.4); `uv sync --frozen` installs exactly that environment.
 **Do not run `uv lock --upgrade` or `uv add` between the first calibration
-run and the end of the pilot** (protocol §10.1). Every run record will
+run and the end of the pilot**. Every run record will
 store the SHA-256 of `uv.lock`, so a tier that mixed lock versions would
 be visible.
 

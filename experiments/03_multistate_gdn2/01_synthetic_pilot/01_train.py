@@ -16,7 +16,7 @@ Usage:
     python 01_train.py --config-name=debug --multirun
 
 One process = one run = one JSON under ``runs/<task>/<run_id>.json``
-(the protocol's unit of record; ``06_experiment_protocol.md`` §10).
+(the unit of record: one JSON per run).
 ``experiment.phase >= 2`` refuses to run until
 ``conf/frozen_protocol.yaml`` has ``frozen: true``, and ``optimizer.lr``
 is resolved from the frozen LR table by (task, layout, gate_mode).
@@ -72,7 +72,7 @@ from research_lib.utils.run_lock import exclusive_lock
 logger = logging.getLogger(__name__)
 
 # =============================================================================
-# Parameter targeting (weight-decay groups, protocol §2 / D-optimizer note)
+# Parameter targeting (weight-decay groups)
 # =============================================================================
 
 # Parameters routed to the VECTOR optimizer (AdamW, weight decay 0):
@@ -115,7 +115,7 @@ HASH_EXCLUDE: tuple[str, ...] = ("output", "logging", "launch", "data.num_worker
 
 
 def set_precision_flags() -> dict[str, bool]:
-    """fp32 without TF32 (protocol §2): both PyTorch TF32 switches off.
+    """fp32 without TF32: both PyTorch TF32 switches off.
 
     ``torch.set_float32_matmul_precision`` is left untouched: the matmul
     flag covers the reference layers' fp32 matmuls, and the cuDNN flag
@@ -585,7 +585,7 @@ def build_module(
         weight_decay=cfg.optimizer.weight_decay,
         betas=tuple(cfg.optimizer.betas),
     )
-    # Cosine from the peak to 0 over max_steps, no warmup (protocol §2):
+    # Cosine from the peak to 0 over max_steps, no warmup:
     # the optimizer starts at lr=0 and the scheduler sets the peak for
     # step 0 (the 02_pretrain.py convention).
     schedule_config = ScheduleConfig(
@@ -682,7 +682,7 @@ def create_callbacks(
             # The run identity excludes operational keys (see HASH_EXCLUDE).
             hash_exclude=HASH_EXCLUDE,
             # The lockfile hash is part of the run's provenance: a tier
-            # that mixed lock versions would be visible (protocol §10.1).
+            # that mixed lock versions would be visible.
             provenance_files=("uv.lock",),
             collectors=(
                 Collector(
@@ -815,7 +815,7 @@ def main(cfg: DictConfig) -> None:
     """Run one pilot training run (fit + test) and write the run JSON."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    # 0. Precision first: fp32 without TF32 (protocol §2). The cuDNN
+    # 0. Precision first: fp32 without TF32. The cuDNN
     # switch defaults to on, and BaseConv / the short convs run through
     # cuDNN; the matmul switch covers the reference layers' fp32 matmuls.
     # torch.set_float32_matmul_precision is left untouched.

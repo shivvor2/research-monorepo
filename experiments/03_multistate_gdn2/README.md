@@ -12,8 +12,7 @@ the GDN-2 state, so collateral erase is identical in single- and
 multi-state; the hypothesis is that the multi-state readout raises the
 *value* of preserving old content.
 
-Everything is pre-registered in the project documents (proposal,
-derivations and the experiment protocol); the protocol is the source of
+Everything is pre-registered; the experiment protocol is the source of
 truth for every experimental setting.
 
 ## Experiments
