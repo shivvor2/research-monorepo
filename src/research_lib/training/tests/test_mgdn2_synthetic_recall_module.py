@@ -23,6 +23,7 @@ from research_lib.layers.attention import MultistateGatedDelta
 from research_lib.training.configs import ScheduleConfig
 from research_lib.training.losses import AnswerLogits
 from research_lib.training.modules.mgdn2_synthetic_recall import (
+    LossOn,
     MGDN2SyntheticRecallModule,
 )
 from research_lib.training.param_utils import partition_parameters_with_names
@@ -543,6 +544,40 @@ class TestAnswerHead:
                 matrix_schedule_config=lr_schedule(),
                 vector_schedule_config=lr_schedule(),
             )
+
+    def test_headless_model_accepted_with_loss_on_all(self):
+        """The hidden_states/head requirement applies only when the
+        answer head is used: loss_on="all" never calls them, so a model
+        without them is accepted there and rejected under loss_on="answers"."""
+        matrix_config, vector_config = build_weight_decay_configs(
+            "grouped", weight_decay=0.1, betas=(0.9, 0.95)
+        )
+
+        class _NoHead(nn.Module):
+            def forward(self, x):
+                return x
+
+        def build(loss_on: str) -> MGDN2SyntheticRecallModule:
+            return MGDN2SyntheticRecallModule(
+                model=_NoHead(),
+                slice_values=(2, 4),
+                loss_on=loss_on,
+                answer_head=True,
+                matrix_optimizer_config=matrix_config,
+                vector_optimizer_config=vector_config,
+                matrix_schedule_config=lr_schedule(),
+                vector_schedule_config=lr_schedule(),
+            )
+
+        # loss_on="all" never calls hidden_states/head, so a model without
+        # them is accepted even with answer_head=True.
+        module = build("all")
+        assert module.answer_head is True
+        assert module.loss_on is LossOn.ALL
+
+        # On the answer path they are called directly, so they are required.
+        with pytest.raises(TypeError, match="hidden_states"):
+            build("answers")
 
 
 @pytest.mark.slow

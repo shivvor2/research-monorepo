@@ -100,8 +100,8 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
 
     Raises:
         ValueError: Unknown ``loss_on`` string.
-        TypeError: ``answer_head=True`` and the model lacks
-            ``hidden_states`` or ``head``.
+        TypeError: ``answer_head=True`` with ``loss_on="answers"``
+        and the model lacks ``hidden_states`` or ``head``.
     """
 
     def __init__(
@@ -116,7 +116,9 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
         super().__init__(**kwargs)
         self.loss_on = LossOn(loss_on)
         self.answer_head = bool(answer_head)
-        if self.answer_head:
+        if self.answer_head and self.loss_on is LossOn.ANSWERS:
+            # The answer path calls hidden_states/head directly, so they
+            # are required there; loss_on="all" never calls them.
             missing = [
                 name
                 for name in ("hidden_states", "head")
