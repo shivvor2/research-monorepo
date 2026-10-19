@@ -76,7 +76,7 @@ launch:
 
 output:
   runs_dir: ${hydra:runtime.cwd}/runs/${task.name}
-  # Final checkpoints are OFF by default (D27): final weights are saved
+  # Final checkpoints are OFF by default: final weights are saved
   # only for runs whose weights are needed, e.g. the mechanism probes; a
   # re-run in the same environment is close but not bit-identical. When
   # on, the checkpoint is saved atomically after fit and before the test

@@ -13,13 +13,13 @@ Run tests with::
 from __future__ import annotations
 
 import fcntl
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
 
 @contextmanager
-def exclusive_lock(path: Path | str) -> Iterator[bool]:
+def exclusive_lock(path: Path | str) -> Generator[bool, None, None]:
     """Yield ``True`` if an exclusive ``flock`` on ``path`` was acquired,
     else ``False``.
 
