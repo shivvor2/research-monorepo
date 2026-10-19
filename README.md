@@ -66,18 +66,38 @@ A monorepo containing:
 
 ## Installation (Development)
 
-Install the project in editable mode with development dependencies inside a managed virtual environment:
+The project uses [uv](https://docs.astral.sh/uv/) and commits a `uv.lock` that pins every dependency for Linux x86_64 (Python 3.13, PyTorch's CUDA 13 wheels). Install uv:
 
 ```bash
-pip install -e ".[dev]"
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+
+For development, create the environment (including the `dev` dependency group) and install the project in editable mode:
+
+```bash
+uv sync
+```
+
+On a machine that only runs experiments, install exactly the lock. This fails instead of re-resolving if `pyproject.toml` and `uv.lock` disagree:
+
+```bash
+uv sync --frozen
+```
+
+Run commands inside the environment with `uv run <cmd>`, or activate `.venv`:
+
+```bash
+uv run pytest -v
+```
+
+Add a dependency with `uv add <package>` (this updates `uv.lock`); remove one with `uv remove <package>`.
 
 Set up pre-commit hooks to ensure formatting consistency:
 ```bash
-pre-commit install
+uv run pre-commit install
 ```
 
 Verify the installation by running the test suite:
 ```bash
-pytest -v
+uv run pytest -v
 ```

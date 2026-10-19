@@ -9,7 +9,8 @@ authors = [{ name = "Loo Jun Zing", email = "jzloo11111@gmail.com" }]
 requires-python = ">=3.12"
 dependencies = [
     # Core DL
-    "torch>=2.1.0",
+    # 2.11 is the first PyPI Linux wheel built against CUDA 13 (no custom index).
+    "torch>=2.11",
 
     # Pytorch native external dependencies
     "rotary-embedding-torch",
@@ -32,14 +33,15 @@ dependencies = [
     "gradio",
 
     # Pytorch lightning (trainer) and ecosystem
-    "lightning",
+    # 2.4 is the first release where Ctrl-C exits the process instead of returning
+    # normally from Trainer.fit() (Lightning changelog 2.4.0, PR #19976).
+    "lightning>=2.4",
     "rich", # required for RichProgressBar
 
     # Model Optimization
     "bitsandbytes",
     "einops",
     "triton",
-    # "flash-attn", # Commented out: Install manually to ensure CUDA compatibility
 
     # Infrastructure & Config
     "wandb",
@@ -55,24 +57,14 @@ dependencies = [
     "python-dotenv"
 ]
 
-[project.optional-dependencies]
-dev = [
-    "pre-commit",
-    "black",
-    "isort",
-    "ruff",
-]
-flash-attn = [
-    "flash-attn>=2.5.0"
-]
-unsloth = [
-    "unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git"
-]
-# MUST install with --no-build-isolation tag
-xformers = [
-  "ninja",  # optional but recommended
-  "xformers == 0.0.33.post2"
-]
+[dependency-groups]
+dev = ["pre-commit", "black", "isort", "ruff"]
+
+[tool.uv]
+# The pilot runs only on Linux x86_64 (WSL, rented GPUs, the x86 cluster nodes).
+# Restricting the resolution avoids failures from packages without macOS or
+# Windows wheels (triton, bitsandbytes) and keeps the lock small.
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [tool.pytest.ini_options]
 markers = ["slow: long-running correctness tests (deselect with -m 'not slow')"]

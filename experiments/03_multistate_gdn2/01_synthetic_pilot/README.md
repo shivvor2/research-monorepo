@@ -22,6 +22,15 @@ python 01_train.py --config-name=test
 python 01_train.py --config-name=debug --multirun
 ```
 
+## Environment
+
+The pilot runs in the committed `uv.lock` (Linux x86_64, Python 3.13,
+Lightning ≥ 2.4); `uv sync --frozen` installs exactly that environment.
+**Do not run `uv lock --upgrade` or `uv add` between the first calibration
+run and the end of the pilot** (protocol §10.1). Every run record will
+store the SHA-256 of `uv.lock`, so a tier that mixed lock versions would
+be visible.
+
 ## Phase workflow (calibration is frozen before any multi-state run)
 
 1. **Phase 1 — calibration** (selection seeds 100–101; nothing here is
