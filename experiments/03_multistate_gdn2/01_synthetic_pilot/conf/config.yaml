@@ -96,9 +96,15 @@ logging:
     enabled: true
     save_dir: ${output.runs_dir}/curves   # curves next to the run records
   wandb:
+    # Rented machines: each completed run uploads its record, curve and
+    # optionally its checkpoint as a run_record artifact, and 03_pull.py
+    # copies them back into the local runs/ store. Logging is excluded
+    # from the run identity, so turning W&B on never changes a run.
     enabled: false
     project: MultistateGDN2
     entity: null
+    upload_record: true        # run JSON + curve as an artifact, done runs only
+    upload_checkpoint: false   # also the final checkpoint, if one was saved
 
 hydra:
   run:
