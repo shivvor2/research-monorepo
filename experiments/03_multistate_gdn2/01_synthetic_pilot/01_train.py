@@ -657,7 +657,7 @@ def per_slot_summary(key, value):
 
     if key.startswith("lambda_"):
         per_slot = value.float().mean(dim=0)  # average over heads -> (L,)
-        return {f"{key}/slot{l}": float(v) for l, v in enumerate(per_slot)}
+        return {f"{key}/slot{slot}": float(v) for slot, v in enumerate(per_slot)}
     return {key: float(value.float().mean())}
 
 
