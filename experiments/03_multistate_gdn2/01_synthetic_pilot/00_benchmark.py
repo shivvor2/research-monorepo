@@ -1201,50 +1201,66 @@ def measure_all(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
         return "overwrite_dk32" if task == "overwrite" and d_model == 64 else task
 
     # 1. The core grid: task x layout x gate x width, at every batch size.
-    for d_model in cfg.bench.d_models:
-        for task in cfg.bench.tasks:
-            task_file = task_file_for(str(task), int(d_model))
-            for layout in cfg.bench.layouts:
-                for gate_mode in cfg.bench.gate_modes:
-                    key = VariantKey(
-                        task_file, str(layout), str(gate_mode), int(d_model), 1.0
-                    )
-                    variant_cfg = variant_config(
-                        cfg, task_file, str(layout), str(gate_mode), int(d_model), 1.0
-                    )
-                    measure_variant(variant_cfg, key, cfg.bench.batch_sizes)
+    # Without CUDA the full grid would take hours of CPU time; the step
+    # timing of the first variant plus the data/validation times are the
+    # smoke check, and the GPU-only readings are skipped below.
+    core_variants = [
+        (
+            task_file_for(str(task), int(d_model)),
+            str(layout),
+            str(gate_mode),
+            int(d_model),
+        )
+        for d_model in cfg.bench.d_models
+        for task in cfg.bench.tasks
+        for layout in cfg.bench.layouts
+        for gate_mode in cfg.bench.gate_modes
+    ]
+    if not has_cuda:
+        core_variants = core_variants[:1]
+        results["notes"].append(
+            f"CPU smoke mode: only the first variant ({core_variants[0][0]}, "
+            f"{core_variants[0][1]}, {core_variants[0][2]}, d={core_variants[0][3]}) "
+            f"is stepped; everything else reports not measured"
+        )
+    for task_file, layout, gate_mode, d_model in core_variants:
+        key = VariantKey(task_file, layout, gate_mode, d_model, 1.0)
+        variant_cfg = variant_config(cfg, task_file, layout, gate_mode, d_model, 1.0)
+        measure_variant(variant_cfg, key, cfg.bench.batch_sizes)
 
     # 2. The extra variants at batch size 256: tier-5 matched bytes and
     # the long-T flavour (each per width; a variant without a task=
-    # override wraps the core task files).
-    for extra in cfg.bench.extra_variants:
-        overrides = dict(item.split("=", 1) for item in extra)
-        for d_model in cfg.bench.d_models:
-            if "task" in overrides:
-                task_files = [overrides["task"]]
-            else:
-                task_files = [
-                    task_file_for(str(task), int(d_model)) for task in cfg.bench.tasks
-                ]
-            for task_file in task_files:
-                key = VariantKey(
-                    task_file,
-                    overrides.get("model.layout", str(cfg.model.layout)),
-                    overrides.get("model.gate_mode", str(cfg.model.gate_mode)),
-                    int(d_model),
-                    float(overrides.get("model.expand_v", cfg.model.expand_v)),
-                )
-                if key in variants_by_key:
-                    continue
-                variant_cfg = variant_config(
-                    cfg,
-                    task_file,
-                    key.layout,
-                    key.gate_mode,
-                    key.d_model,
-                    key.expand_v,
-                )
-                measure_variant(variant_cfg, key, [int(cfg.bench.batch_sizes[-1])])
+    # override wraps the core task files). Skipped in CPU smoke mode.
+    if has_cuda:
+        for extra in cfg.bench.extra_variants:
+            overrides = dict(item.split("=", 1) for item in extra)
+            for d_model in cfg.bench.d_models:
+                if "task" in overrides:
+                    task_files = [overrides["task"]]
+                else:
+                    task_files = [
+                        task_file_for(str(task), int(d_model))
+                        for task in cfg.bench.tasks
+                    ]
+                for task_file in task_files:
+                    key = VariantKey(
+                        task_file,
+                        overrides.get("model.layout", str(cfg.model.layout)),
+                        overrides.get("model.gate_mode", str(cfg.model.gate_mode)),
+                        int(d_model),
+                        float(overrides.get("model.expand_v", cfg.model.expand_v)),
+                    )
+                    if key in variants_by_key:
+                        continue
+                    variant_cfg = variant_config(
+                        cfg,
+                        task_file,
+                        key.layout,
+                        key.gate_mode,
+                        key.d_model,
+                        key.expand_v,
+                    )
+                    measure_variant(variant_cfg, key, [int(cfg.bench.batch_sizes[-1])])
 
     # 3. Concurrency: (task_file, ws, full) at each width — the variant
     # the recommended runs-per-GPU reading is anchored on.
