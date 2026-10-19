@@ -7,6 +7,8 @@ Run with: pytest src/research_lib/training/callbacks/tests/test_run_summary.py -
 
 import hashlib
 import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -861,6 +863,30 @@ class TestRankZero:
         zero = SimpleNamespace(is_global_zero=True)
         cb._write(zero)
         assert (tmp_path / "rank.json").exists()
+
+
+class TestFsync:
+    """One write fsyncs the record file and the parent directory, so a
+    power cut cannot truncate the JSON the next relaunch reads."""
+
+    def test_write_fsyncs_the_file_and_the_directory(self, tmp_path, monkeypatch):
+        cb = RunSummaryCallback(tmp_path, "fsync", tiny_config_dict(), strict=True)
+        zero = SimpleNamespace(is_global_zero=True)
+        fsynced = []
+        monkeypatch.setattr(os, "fsync", lambda fd: fsynced.append(fd))
+        real_open = os.open
+        opened = {}
+
+        def recording_open(path, flags, *args, **kwargs):
+            fd = real_open(path, flags, *args, **kwargs)
+            opened[fd] = Path(path)
+            return fd
+
+        monkeypatch.setattr(os, "open", recording_open)
+        cb._write(zero)
+        assert len(fsynced) == 2
+        # The directory fsynced after the rename is the record's parent.
+        assert opened[fsynced[1]] == (tmp_path / "fsync.json").parent
 
 
 # ---------------------------------------------------------------------------

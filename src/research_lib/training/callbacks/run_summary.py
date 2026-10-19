@@ -79,7 +79,6 @@ from datetime import datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
-from uuid import uuid4
 
 import lightning as L
 import torch
@@ -88,6 +87,7 @@ from lightning.pytorch.trainer.states import TrainerFn
 from lightning.pytorch.utilities.exceptions import SIGTERMException
 
 from research_lib.training.param_utils import select_parameters
+from research_lib.utils.io import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -470,7 +470,8 @@ class RunSummaryCallback(L.Callback):
         return self.runs_dir / self.filename
 
     def _write(self, trainer: L.Trainer) -> None:
-        """Write the summary JSON atomically (temp file + rename).
+        """Write the summary JSON atomically and durably (temp file +
+        fsync + rename, through :func:`research_lib.utils.io.atomic_write`).
 
         Only the global rank-zero process writes. Under DDP every rank
         runs the callback and would race on the same temp file, so the
@@ -491,21 +492,18 @@ class RunSummaryCallback(L.Callback):
         self.summary["device"] = self._device()
         self.summary["provenance"] = self._provenance
         path = self.path
-        # The filename may contain subdirectories; create the file's
-        # parent (covers runs_dir itself).
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # A writer-unique temp name: two processes writing the same path
-        # (a relaunch racing the old process, or two machines sharing the
-        # runs directory) must not race on one temp file. The temp file is
+
+        def write(f: Any) -> None:
+            json.dump(self.summary, f, indent=2, sort_keys=True, default=str)
+
+        # The shared atomic writer: a writer-unique temp name (two
+        # processes writing the same path — a relaunch racing the old
+        # process, or two machines sharing the runs directory — must not
+        # race on one temp file), fsync of the file before the rename and
+        # of the parent directory after it, so a power loss cannot
+        # truncate the record the next relaunch reads. The temp file is
         # removed if the write raises, so a crashed write leaves nothing.
-        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(self.summary, f, indent=2, sort_keys=True, default=str)
-        except BaseException:
-            tmp.unlink(missing_ok=True)
-            raise
-        os.replace(tmp, path)
+        atomic_write(path, write, "w", encoding="utf-8")
         logger.info("RunSummaryCallback: wrote %s", path)
 
     def _compute_provenance(self) -> dict[str, str | None]:
