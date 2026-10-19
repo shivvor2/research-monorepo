@@ -710,7 +710,7 @@ class TestBuildModel:
 
 
 class TestPrecisionFlags:
-    """B05: fp32 without TF32 - both PyTorch TF32 switches off."""
+    """fp32 without TF32 - both PyTorch TF32 switches off."""
 
     def test_both_tf32_flags_off(self):
         flags = train.set_precision_flags()
@@ -723,7 +723,7 @@ class TestPrecisionFlags:
 
 
 class TestAssertFitFinished:
-    """B08: the post-fit guard passes only for a normally finished fit."""
+    """The post-fit guard passes only for a normally finished fit."""
 
     def test_finished_passes(self):
         trainer = SimpleNamespace(state=SimpleNamespace(status=TrainerStatus.FINISHED))
@@ -739,7 +739,7 @@ class TestAssertFitFinished:
 
 
 class TestShouldSkip:
-    """B10: the skip logic - done + same identity skips; everything else
+    """The skip logic - done + same identity skips; everything else
     falls through to the run."""
 
     def _record(self, tmp_path, status="test_done", config_hash="h", seed=0):
@@ -893,7 +893,7 @@ class TestPostFit:
 
 
 class TestStopRequested:
-    """B11: the STOP file lives in the launch directory (the original
+    """The STOP file lives in the launch directory (the original
     working directory, not the job dir)."""
 
     def _cfg(self):
@@ -918,7 +918,7 @@ class TestStopRequested:
 
 
 class TestInShard:
-    """B12: round-robin shard membership, with validation."""
+    """Round-robin shard membership, with validation."""
 
     def test_round_robin(self):
         assert train.in_shard(0, 0, 2) is True
@@ -941,7 +941,7 @@ class TestInShard:
 
 
 class TestSkipOnlyProtocolTiers:
-    """B13: the smoke and debug configs are tooling, not protocol tiers:
+    """The smoke and debug configs are tooling, not protocol tiers:
     they always run, whatever launch.skip_completed says."""
 
     def test_smoke_and_debug_tiers_are_not_protocol_tiers(self):
@@ -972,7 +972,7 @@ class TestSkipOnlyProtocolTiers:
 
 
 class TestSeedMajorSweepOrder:
-    """B14: tier sweeps run overwrite before mqar, seed-major: a partial
+    """Tier sweeps run overwrite before mqar, seed-major: a partial
     tier still yields complete paired Delta_i at the primary endpoint
     (overwrite, class distant) before any MQAR run starts."""
 
@@ -1021,7 +1021,7 @@ class TestSeedMajorSweepOrder:
 
 
 class TestCreateLoggers:
-    """B15: the CSV logger writes next to the run records:
+    """The CSV logger writes next to the run records:
     runs/<task>/curves/<run_id>/version_0."""
 
     def test_csv_logger_under_runs_curves(self, tmp_path):

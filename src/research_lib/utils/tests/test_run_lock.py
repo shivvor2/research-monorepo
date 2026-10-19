@@ -12,7 +12,7 @@ from research_lib.utils.run_lock import exclusive_lock
 
 
 class TestExclusiveLock:
-    """B09: a second acquisition through a separate open of the same file
+    """A second acquisition through a separate open of the same file
     returns False while the first is held, and True after it is released."""
 
     def test_second_acquisition_fails_while_held(self, tmp_path):

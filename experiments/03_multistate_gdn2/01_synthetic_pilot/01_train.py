@@ -884,7 +884,7 @@ def main(cfg: DictConfig) -> None:
         )
         return
 
-    # 1. Phase gate: >= 2 requires the frozen protocol (§8.4).
+    # 1. Phase gate: >= 2 requires the frozen protocol.
     frozen = load_frozen_protocol()
     if cfg.experiment.phase >= 2 and not bool(frozen.get("frozen", False)):
         raise RuntimeError(

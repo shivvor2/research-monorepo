@@ -6,7 +6,7 @@ writes CSVs plus ``summary.md`` under ``analysis/``:
 
 - the primary endpoint: Delta_int^LL and Delta_int^WS on
   overwrite, class ``distant``, K = 2 d_k, with bootstrap CIs and the
-  pre-registered decision-rule reading (§9);
+  pre-registered decision-rule reading;
 - the same for every other (task, slice, class) cell that has the four
   core cells;
 - predictions 1-4 (tiers 2-4) with the same bootstrap;

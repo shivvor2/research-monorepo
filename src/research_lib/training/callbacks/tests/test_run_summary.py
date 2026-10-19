@@ -512,7 +512,7 @@ class TestStatus:
         assert "KeyboardInterrupt" in summary["error"]
 
     def test_sigterm_is_interrupted_not_failed(self, tmp_path):
-        """B07: Lightning raises SIGTERMException at the next batch after
+        """Lightning raises SIGTERMException at the next batch after
         SIGTERM (kill, Slurm cancel/preemption, cloud stop): the run is
         interrupted, not failed, so a relaunch treats it as incomplete."""
         from lightning.pytorch.utilities.exceptions import SIGTERMException
@@ -919,7 +919,7 @@ class TestConfigHash:
 
 
 class TestConfigHashExclude:
-    """B01: configs differing only in an excluded key share the hash;
+    """Configs differing only in an excluded key share the hash;
     differing in any other key do not; the seed is still excluded."""
 
     def test_excluded_keys_share_the_hash(self):
@@ -964,7 +964,7 @@ class TestConfigHashExclude:
 
 
 class TestHashExcludeIdentity:
-    """B02/B03: the callback's identity uses the excluded hash, and the
+    """The callback's identity uses the excluded hash, and the
     record stores the sorted excluded keys."""
 
     def _fit(self, tmp_path, run_id, cb):
@@ -977,7 +977,7 @@ class TestHashExcludeIdentity:
         return read(tmp_path, run_id)
 
     def test_record_contains_hash_excluded_keys(self, tmp_path):
-        """B03."""
+        """The record stores the sorted excluded keys."""
         cb = RunSummaryCallback(
             tmp_path,
             "hx",
@@ -989,7 +989,7 @@ class TestHashExcludeIdentity:
         assert summary["hash_excluded_keys"] == ["data.num_workers", "output"]
 
     def test_different_runs_dir_is_the_same_identity(self, tmp_path):
-        """B02: a record written with runs_dir=A is accepted as the same
+        """A record written with runs_dir=A is accepted as the same
         identity by a callback for the same run whose config has
         output.runs_dir=B."""
         config_a = {"seed": 0, "output": {"runs_dir": "/a"}, "model": {"d": 16}}
@@ -1023,7 +1023,7 @@ class TestHashExcludeIdentity:
 
 
 class TestProvenance:
-    """B04: provenance hashes files relative to the repository root; a
+    """Provenance hashes files relative to the repository root; a
     missing file gives null."""
 
     def test_provenance_hashes_files_and_records_them(self, tmp_path, monkeypatch):
