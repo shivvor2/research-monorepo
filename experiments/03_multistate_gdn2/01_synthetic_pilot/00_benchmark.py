@@ -492,8 +492,17 @@ def recommended_concurrency(aggregates: Sequence[float]) -> int:
 
 
 def worker_main(cfg: DictConfig) -> None:
-    """One concurrency worker: steps for ``bench.concurrency_seconds``
-    after the warmup, prints one ``BENCH_RESULT`` JSON line on stdout.
+    """One concurrency worker: steps from ``bench.start_at`` (a shared
+    wall-clock start set by the parent) until ``bench.start_at +
+    bench.concurrency_seconds`` — a shared end time, not its own
+    duration — after ``bench.warmup_steps`` warmup steps, and prints one
+    ``BENCH_RESULT`` JSON line on stdout.
+
+    A worker that reaches the window after the shared start still
+    measures until the shared end and reports ``"late": true``: its
+    rate covers only part of the window, so the group's speedup may
+    read high (the summary says so). Without ``start_at`` the worker
+    falls back to measuring its own ``concurrency_seconds``.
 
     The worker is a subprocess of the benchmark itself, launched with
     the variant's config overrides; the parent aggregates the lines.
@@ -505,15 +514,18 @@ def worker_main(cfg: DictConfig) -> None:
     batch_size = int(cfg.bench.batch_sizes[0])
     seconds = float(cfg.bench.concurrency_seconds)
     warmup_steps = int(cfg.bench.warmup_steps)
+    start_at = cfg.bench.get("start_at", None)
+    start_at = float(start_at) if start_at is not None else None
     lr = benchmark_lr(cfg)
     logger.info(
-        "Benchmark worker: %s, %s, d=%s, B=%d, %.0f s after %d warmup steps",
+        "Benchmark worker: %s, %s, d=%s, B=%d, %.0f s after %d warmup steps%s",
         cfg.bench.task_file,
         cfg.model.layout,
         cfg.model.d_model,
         batch_size,
         seconds,
         warmup_steps,
+        f", shared start {start_at:.0f}" if start_at is not None else "",
     )
     L.seed_everything(0)
     module = build_benchmark_module(cfg, lr).to(device)
@@ -525,6 +537,7 @@ def worker_main(cfg: DictConfig) -> None:
         "elapsed_s": 0.0,
         "peak_memory_bytes": None,
         "oom": False,
+        "late": False,
     }
     try:
         if device.type == "cuda":
@@ -532,8 +545,17 @@ def worker_main(cfg: DictConfig) -> None:
         for _ in range(warmup_steps):
             one_step(module, optimizers, move_batch(next(batches), device))
         sync(device)
+        if start_at is not None:
+            if time.time() < start_at:
+                while time.time() < start_at:
+                    time.sleep(min(1.0, start_at - time.time()))
+            else:
+                result["late"] = True
+            window_end = start_at + seconds
+        else:
+            window_end = time.time() + seconds
         start = time.perf_counter()
-        while time.perf_counter() - start < seconds:
+        while time.time() < window_end:
             one_step(module, optimizers, move_batch(next(batches), device))
             result["steps"] += 1
         sync(device)
@@ -613,19 +635,61 @@ def summarize_group(
     return group
 
 
+def worker_command(
+    cfg: DictConfig,
+    task_file: str,
+    d_model: int,
+    batch_size: int,
+    seconds: int,
+    start_at: float,
+) -> list[str]:
+    """One concurrency worker's config overrides.
+
+    The parent's half of the shared-window protocol: the worker steps
+    from ``start_at`` until ``start_at + seconds`` (a shared end time,
+    not its own duration), so the N workers' timed windows overlap.
+
+    Args:
+        cfg: The resolved benchmark config (the batch size and window
+            length come from it).
+        task_file: The task-file label (also the Hydra task override).
+        d_model: The model width.
+        batch_size: The training batch size.
+        seconds: The timed window's length.
+        start_at: The shared window start (epoch seconds, wall clock).
+
+    Returns:
+        The override list to append to the subprocess command.
+    """
+    return [
+        "bench.mode=worker",
+        f"bench.task_file={task_file}",
+        f"task={task_file}",
+        "model.layout=ws",
+        "model.gate_mode=full",
+        f"model.d_model={d_model}",
+        f"bench.batch_sizes=[{batch_size}]",
+        f"bench.concurrency_seconds={seconds}",
+        f"bench.start_at={start_at:.3f}",
+    ]
+
+
 def run_concurrency_groups(
     cfg: DictConfig, task_file: str, d_model: int, device: torch.device
 ) -> list[dict[str, Any]]:
     """Aggregate throughput of ``N`` concurrent workers, N in
     ``bench.concurrency``, for one variant (task_file, ws, full, d).
 
-    One group per N. Each worker is a subprocess of this script
-    (``bench.mode=worker``) that composes the variant's config itself;
-    the parent parses the workers' ``BENCH_RESULT`` lines. Group entries
-    list the per-worker steps/s and peak memory, the aggregate
-    throughput (the sum of the rates), and the speedup relative to
-    N = 1. The N sequence stops at the first group whose workers OOM or
-    fail.
+    One group per N. Every worker of a group steps inside the **same**
+    timed window: the parent picks ``start_at = now + start_margin_s +
+    15 s per worker`` (the margin covers the workers' start-up), passes
+    it to the workers, and the workers step until the shared end. A
+    worker that only joins the window after the shared start reports
+    ``late`` and marks the group ``synchronized: false``. Each worker is
+    a subprocess of this script (``bench.mode=worker``) that composes
+    the variant's config itself; the parent parses the workers'
+    ``BENCH_RESULT`` lines through :func:`summarize_group`. The N
+    sequence stops at the first group whose workers OOM or fail.
 
     Returns:
         One entry per measured N; without CUDA a single entry with
@@ -637,30 +701,24 @@ def run_concurrency_groups(
     batch_size = int(cfg.bench.batch_sizes[-1])
     seconds = int(cfg.bench.concurrency_seconds)
     groups: list[dict[str, Any]] = []
-    base_command = [
-        sys.executable,
-        "-u",
-        str(script),
-        "bench.mode=worker",
-        f"bench.task_file={task_file}",
-        f"task={task_file}",
-        "model.layout=ws",
-        "model.gate_mode=full",
-        f"model.d_model={d_model}",
-        f"bench.batch_sizes=[{batch_size}]",
-        f"bench.concurrency_seconds={seconds}",
-    ]
     for n in cfg.bench.concurrency:
+        margin = float(cfg.bench.start_margin_s) + 15.0 * int(n)
+        start_at = time.time() + margin
+        command = [sys.executable, "-u", str(script)] + worker_command(
+            cfg, task_file, d_model, batch_size, seconds, start_at
+        )
         logger.info(
-            "Concurrency group N=%d (%s, ws, full, d=%d): starting %d workers...",
+            "Concurrency group N=%d (%s, ws, full, d=%d): %d workers, "
+            "shared window starting in %.0f s...",
             n,
             task_file,
             d_model,
             n,
+            margin,
         )
         processes = [
             subprocess.Popen(
-                base_command,
+                command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -1609,6 +1667,9 @@ def render_summary(results: Mapping[str, Any]) -> str:
                             if group.get("speedup") is not None
                             else "-"
                         ),
+                        "sync": (
+                            "no (late)" if group.get("synchronized") is False else "yes"
+                        ),
                         "per-worker peak MB": "/".join(
                             (
                                 f"{int(w.get('peak_memory_bytes') or 0) // 2**20}"
@@ -1626,6 +1687,13 @@ def render_summary(results: Mapping[str, Any]) -> str:
                 f"(batch size {results['bench']['batch_sizes'][-1]}):"
             )
             lines.extend(["", markdown_table(pd.DataFrame(group_rows)), ""])
+            if any(group.get("synchronized") is False for group in entry["groups"]):
+                lines.append(
+                    "_At least one worker started late: its rate covers only part "
+                    "of the shared window, so the aggregate and the speedup may "
+                    "read high — increase `bench.start_margin_s`._"
+                )
+                lines.append("")
             if recommended is None:
                 lines.append("_No reading: every group failed or OOM-ed._")
             else:

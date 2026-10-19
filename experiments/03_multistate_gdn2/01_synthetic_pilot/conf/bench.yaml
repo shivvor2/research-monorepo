@@ -42,6 +42,16 @@ bench:
   data_batches: 10
   concurrency: [1, 2, 4]
   concurrency_seconds: 60
+  # Internal (like task_file): the shared window's start (epoch s), set
+  # by the parent in worker mode. Every worker of a group steps until
+  # start_at + concurrency_seconds, so the timed windows overlap; a
+  # worker that only joins late reports it (the group's speedup may
+  # then read high).
+  start_at: null
+  # The parent adds this margin, plus 15 s per worker, to the window
+  # start, so the workers are warmed up before it opens. Too small:
+  # workers start late and the group is marked synchronized: false.
+  start_margin_s: 60
   mode: main        # main | worker (internal: one concurrency worker)
   task_file: mqar   # internal: the task-file label (set by the parent in
                     # worker mode; the task file of "overwrite" at d 64,

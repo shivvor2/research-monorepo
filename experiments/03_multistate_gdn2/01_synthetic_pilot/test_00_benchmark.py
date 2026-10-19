@@ -12,6 +12,7 @@ runs on CPU on a tiny configuration.
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -376,6 +377,61 @@ class TestMeasurementResilience:
         data = json.loads((Path(tmp_path) / "bench.json").read_text())
         assert data["complete"] is False
         assert len(data["variants"]) == 1
+
+
+class TestSynchronizedWindows:
+    """The concurrency workers share one timed window: the parent picks
+    a common start, every worker steps until the same end, and a worker
+    that starts late says so (its rate covers only part of the window,
+    so the group's speedup may read high)."""
+
+    def test_worker_command_carries_the_shared_start(self):
+        command = bench.worker_command(
+            make_bench_cfg(), "overwrite", 32, 256, 60, start_at=1750000000.5
+        )
+        assert "bench.mode=worker" in command
+        assert "task=overwrite" in command
+        assert "bench.start_at=1750000000.500" in command
+
+    def test_on_time_worker_uses_the_shared_window(self, capsys):
+        cfg = make_bench_cfg()
+        cfg.bench.concurrency_seconds = 1
+        cfg.bench.start_at = time.time() + 1.0
+        bench.worker_main(cfg)
+        result = bench.parse_worker_result(capsys.readouterr().out)
+        assert result is not None
+        assert result["late"] is False
+        # The window ends at start_at + seconds, so the measured time is
+        # the window length, not the worker's own duration.
+        assert result["elapsed_s"] == pytest.approx(1.0, abs=0.20)
+        assert result["steps"] >= 1
+
+    def test_late_worker_reports_late(self, capsys):
+        cfg = make_bench_cfg()
+        cfg.bench.concurrency_seconds = 1.5
+        cfg.bench.start_at = time.time() - 0.5  # the shared start went by
+        bench.worker_main(cfg)
+        result = bench.parse_worker_result(capsys.readouterr().out)
+        assert result is not None
+        assert result["late"] is True
+        assert result["steps"] >= 1  # it still measures until the shared end
+
+    def test_group_with_a_late_worker_is_not_synchronized(self):
+        on_time = {
+            "steps": 10,
+            "elapsed_s": 2.0,
+            "peak_memory_bytes": None,
+            "oom": False,
+            "late": False,
+        }
+        late = dict(on_time, late=True)
+        group = bench.summarize_group([(0, on_time)])
+        assert group["synchronized"] is True
+        group = bench.summarize_group([(0, late)])
+        assert group["synchronized"] is False
+        group = bench.summarize_group([(0, on_time), (0, late)])
+        assert group["synchronized"] is False
+        assert group["workers"][1]["late"] is True
 
 
 class TestSummary:
