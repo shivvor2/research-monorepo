@@ -10,6 +10,7 @@ runs on CPU on a tiny configuration.
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -267,6 +268,40 @@ class TestGridEstimate:
         assert seeds == sorted(seeds)
 
 
+def make_bench_cfg():
+    """A tiny CPU bench config: one variant, one batch size, tiny eval
+    sets — the CPU smoke grid of the resilience tests. The model vocab
+    matches the task files the variant composition loads (8192), as in
+    the real config."""
+    cfg = make_cfg()
+    cfg.model.vocab_size = 8192
+    cfg.bench = OmegaConf.create(
+        {
+            "d_models": [16],
+            "tasks": ["mqar"],
+            "layouts": ["ws"],
+            "gate_modes": ["full"],
+            "extra_variants": [],
+            "batch_sizes": [16],
+            "warmup_steps": 1,
+            "measure_steps": 2,
+            "profile_steps": 2,
+            "data_batches": 2,
+            "concurrency": [1],
+            "concurrency_seconds": 5,
+            "mode": "main",
+            "task_file": "mqar",
+            "start_at": None,
+            "start_margin_s": 60,
+        }
+    )
+    cfg.data.num_val_per_slice = 4
+    cfg.data.num_test_per_slice = 4
+    cfg.training.max_steps = 10
+    cfg.training.val_check_interval = 5
+    return cfg
+
+
 class TestConcurrencyResilience:
     """A group whose workers all fail records the failure instead of
     crashing the benchmark (the speedup needs both aggregates)."""
@@ -302,12 +337,54 @@ class TestConcurrencyResilience:
         assert group["speedup"] == pytest.approx(0.5)
 
 
+class TestMeasurementResilience:
+    """The benchmark writes bench.json as it goes, so a failure or an
+    interrupt never discards the measurements already made."""
+
+    def test_failed_concurrency_stage_is_recorded(self, tmp_path, monkeypatch):
+        def boom(cfg, task_file, d_model, device):
+            raise RuntimeError("simulated concurrency crash")
+
+        monkeypatch.setattr(bench, "run_concurrency_groups", boom)
+        bench.measure_all(make_bench_cfg(), torch.device("cpu"), Path(tmp_path))
+        bench_json = Path(tmp_path) / "bench.json"
+        summary = Path(tmp_path) / "summary.md"
+        assert bench_json.exists()
+        assert summary.exists()
+        data = json.loads(bench_json.read_text())
+        # The run finished: the crash hit one stage, was recorded, and
+        # the estimate and the summary still ran.
+        assert data["complete"] is True
+        assert data["variants"]  # the measured variant survived
+        assert any("concurrency stage failed" in note for note in data["notes"])
+
+    def test_interruption_keeps_the_last_snapshot(self, tmp_path, monkeypatch):
+        real_write = bench.write_bench_json
+        calls = {"n": 0}
+
+        def failing_write(results, out_dir):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("simulated interrupt")
+            return real_write(results, out_dir)
+
+        monkeypatch.setattr(bench, "write_bench_json", failing_write)
+        with pytest.raises(RuntimeError):
+            bench.measure_all(make_bench_cfg(), torch.device("cpu"), Path(tmp_path))
+        # The last snapshot that reached the disk holds the measured
+        # variant and says the run did not finish.
+        data = json.loads((Path(tmp_path) / "bench.json").read_text())
+        assert data["complete"] is False
+        assert len(data["variants"]) == 1
+
+
 class TestSummary:
     """summary.md has the expected sections; on CPU the GPU-only parts
     are skipped with a clear note."""
 
     def test_summary_sections_and_cpu_notes(self):
         results = {
+            "complete": True,
             "generated_at": "2026-10-20T00:00:00",
             "command": "python 00_benchmark.py",
             "device": {
@@ -372,6 +449,7 @@ class TestSummary:
             "notes": [],
         }
         summary = bench.render_summary(results)
+        assert "**Status: complete.**" in summary
         for section in (
             "## Environment",
             "## Step time and GPU usage per variant",

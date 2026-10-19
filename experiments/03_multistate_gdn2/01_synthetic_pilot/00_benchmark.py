@@ -1090,12 +1090,50 @@ def device_info() -> dict[str, Any]:
 # =============================================================================
 
 
-def measure_all(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
+def write_bench_json(results: Mapping[str, Any], out_dir: Path) -> None:
+    """A snapshot of the results dict as ``out_dir/bench.json``, atomically.
+
+    The benchmark writes a snapshot after every measured variant and
+    after each stage, so a crash or a Ctrl-C can never discard the
+    measurements already made: whatever finished is on disk, with
+    ``complete: false`` until the final write.
+
+    Args:
+        results: The current results dict (``complete`` flips only in
+            the final write).
+        out_dir: The benchmark's output directory.
+    """
+    from research_lib.utils.io import atomic_write
+
+    def write(file) -> None:
+        file.write(json.dumps(results, indent=2))
+        file.write("\n")
+
+    atomic_write(out_dir / "bench.json", write, "w", encoding="utf-8")
+
+
+def measure_all(cfg: DictConfig, device: torch.device, out_dir: Path) -> dict[str, Any]:
     """Run every measurement and the grid estimate; the results dict is
-    both ``bench.json`` and the input of :func:`render_summary`."""
+    both ``bench.json`` and the input of :func:`render_summary`.
+
+    ``bench.json`` is written after every measured variant and after
+    each stage (``complete: false`` until the final write), so an
+    interrupted or failed benchmark keeps everything that was measured.
+    The concurrency stage is protected: a failure there is recorded in
+    the notes and the estimate and the summary still run. On success
+    the summary is rendered and written, and the final ``bench.json``
+    carries ``complete: true``.
+
+    Args:
+        cfg: The resolved benchmark config.
+        device: The device to measure on.
+        out_dir: The benchmark's output directory (``bench/<timestamp>``
+            for a real run; any directory in the tests).
+    """
     lr = benchmark_lr(cfg)
     has_cuda = device.type == "cuda"
     results: dict[str, Any] = {
+        "complete": False,
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "command": " ".join(sys.argv),
         "device": device_info(),
@@ -1213,6 +1251,7 @@ def measure_all(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
         }
         variants_by_key[key] = row
         results["variants"].append(row)
+        write_bench_json(results, out_dir)
         logger.info(
             "Measured %s layout=%s gate=%s d=%d%s: %s ms at B=256, %s",
             key.task_file,
@@ -1293,10 +1332,18 @@ def measure_all(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
                     measure_variant(variant_cfg, key, [int(cfg.bench.batch_sizes[-1])])
 
     # 3. Concurrency: (task_file, ws, full) at each width — the variant
-    # the recommended runs-per-GPU reading is anchored on.
+    # the recommended runs-per-GPU reading is anchored on. The stage is
+    # protected: a failure must never discard the measurements already
+    # made — it is recorded in the notes and the estimate and the
+    # summary still run.
     for d_model in cfg.bench.d_models:
         task_file = task_file_for("overwrite", int(d_model))
-        groups = run_concurrency_groups(cfg, task_file, int(d_model), device)
+        try:
+            groups = run_concurrency_groups(cfg, task_file, int(d_model), device)
+        except Exception as exc:  # noqa: BLE001 — recorded, not fatal
+            logger.error("concurrency stage failed: %s", exc)
+            results["notes"].append(f"concurrency stage failed: {exc}")
+            groups = [{"n": 1, "skipped": "the concurrency stage failed"}]
         aggregate = [
             group["aggregate_steps_per_s"]
             for group in groups
@@ -1312,6 +1359,7 @@ def measure_all(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
                 ),
             }
         )
+        write_bench_json(results, out_dir)
 
     # 4. The grid estimate for both width interpretations.
     max_steps = int(cfg.training.max_steps)
@@ -1350,7 +1398,15 @@ def measure_all(cfg: DictConfig, device: torch.device) -> dict[str, Any]:
         }
     if frozen_d is not None:
         results["notes"].append(f"frozen protocol width: d_model={frozen_d}")
+    write_bench_json(results, out_dir)
 
+    # 5. Finalize: the summary is rendered and written, and the final
+    # bench.json says the run is complete. Anything that raised before
+    # here left the last snapshot on disk with "complete": false.
+    results["complete"] = True
+    summary = render_summary(results)
+    (out_dir / "summary.md").write_text(summary, encoding="utf-8")
+    write_bench_json(results, out_dir)
     return results
 
 
@@ -1382,6 +1438,15 @@ def render_summary(results: Mapping[str, Any]) -> str:
     from pilot_analysis.render import markdown_table
 
     lines: list[str] = ["# Multi-state GDN-2 pilot: timing benchmark", ""]
+    if results.get("complete", False):
+        lines.append("**Status: complete.**")
+    else:
+        lines.append(
+            "**Status: incomplete — this is a partial snapshot from a run "
+            "that did not finish (`complete: false` in bench.json); the "
+            "measurements below are what survived.**"
+        )
+    lines.append("")
     env = results["device"]
     versions = results["versions"]
     git = results["git"]
@@ -1820,12 +1885,10 @@ def main(cfg: DictConfig) -> None:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    results = measure_all(cfg, device)
-    summary = render_summary(results)
-    (out_dir / "summary.md").write_text(summary, encoding="utf-8")
-    (out_dir / "bench.json").write_text(
-        json.dumps(results, indent=2) + "\n", encoding="utf-8"
-    )
+    # measure_all writes bench.json as it goes (complete: false until the
+    # final write) and finishes the summary; a crash or a Ctrl-C leaves
+    # every measurement already made on disk.
+    results = measure_all(cfg, device, out_dir)
     logger.info("Benchmark written to %s", out_dir)
     logger.info("Cross-check command:")
     logger.info(
