@@ -553,6 +553,66 @@ def parse_worker_result(output: str) -> dict[str, Any] | None:
     return None
 
 
+def summarize_group(
+    worker_outputs: Sequence[tuple[int | str, dict[str, Any] | None]],
+    first_aggregate: float | None = None,
+) -> dict[str, Any]:
+    """One group entry from the parsed worker results.
+
+    A worker counts as failed on a non-zero exit, a missing
+    ``BENCH_RESULT`` line or a timeout. The aggregate is the sum of the
+    surviving workers' rates; the speedup needs **both** this group's
+    aggregate and the first group's, and stays ``None`` otherwise (a
+    failed group must never crash the benchmark). A worker that started
+    its timed window late marks the group ``synchronized: False`` (its
+    rate covers only part of the window, so the aggregate and the
+    speedup may read high).
+
+    Args:
+        worker_outputs: Per worker: ``(returncode or "timeout", parsed
+            BENCH_RESULT dict or None)``.
+        first_aggregate: The N=1 group's aggregate throughput (the
+            speedup denominator); ``None`` when the first group itself
+            has no aggregate.
+
+    Returns:
+        The group entry: ``workers`` (rate, peak memory, late flag),
+        ``aggregate_steps_per_s``, ``speedup``, ``synchronized``,
+        ``oom`` and ``failed``.
+    """
+    group: dict[str, Any] = {
+        "workers": [],
+        "aggregate_steps_per_s": None,
+        "speedup": None,
+        "synchronized": True,
+        "oom": False,
+        "failed": 0,
+    }
+    rates: list[float] = []
+    for status, result in worker_outputs:
+        if status != 0 or result is None:
+            group["failed"] += 1
+            continue
+        rate = result["steps"] / result["elapsed_s"] if result["elapsed_s"] > 0 else 0.0
+        group["workers"].append(
+            {
+                "steps_per_s": rate,
+                "peak_memory_bytes": result.get("peak_memory_bytes"),
+                "late": bool(result.get("late", False)),
+            }
+        )
+        if result.get("oom"):
+            group["oom"] = True
+        if result.get("late"):
+            group["synchronized"] = False
+        rates.append(rate)
+    if rates:
+        group["aggregate_steps_per_s"] = sum(rates)
+    if first_aggregate and group["aggregate_steps_per_s"] is not None:
+        group["speedup"] = group["aggregate_steps_per_s"] / first_aggregate
+    return group
+
+
 def run_concurrency_groups(
     cfg: DictConfig, task_file: str, d_model: int, device: torch.device
 ) -> list[dict[str, Any]]:
@@ -607,17 +667,9 @@ def run_concurrency_groups(
             )
             for _ in range(int(n))
         ]
-        outputs = [p.communicate()[0] for p in processes]
-        group: dict[str, Any] = {
-            "n": int(n),
-            "workers": [],
-            "aggregate_steps_per_s": None,
-            "speedup": None,
-            "oom": False,
-            "failed": 0,
-        }
-        rates: list[float] = []
-        for process, output in zip(processes, outputs):
+        worker_outputs: list[tuple[int | str, dict[str, Any] | None]] = []
+        for process in processes:
+            output = process.communicate()[0]
             if process.returncode != 0:
                 tail = "\n".join(output.splitlines()[-5:])
                 logger.error(
@@ -625,32 +677,10 @@ def run_concurrency_groups(
                     process.returncode,
                     tail,
                 )
-                group["failed"] += 1
-                continue
-            result = parse_worker_result(output)
-            if result is None:
-                group["failed"] += 1
-                continue
-            rate = (
-                result["steps"] / result["elapsed_s"]
-                if result["elapsed_s"] > 0
-                else 0.0
-            )
-            group["workers"].append(
-                {
-                    "steps_per_s": rate,
-                    "peak_memory_bytes": result.get("peak_memory_bytes"),
-                }
-            )
-            if result.get("oom"):
-                group["oom"] = True
-            rates.append(rate)
-        if rates:
-            group["aggregate_steps_per_s"] = sum(rates)
-        if len(groups) > 0 and groups[0].get("aggregate_steps_per_s"):
-            group["speedup"] = (
-                group["aggregate_steps_per_s"] / groups[0]["aggregate_steps_per_s"]
-            )
+            worker_outputs.append((process.returncode, parse_worker_result(output)))
+        first_aggregate = groups[0].get("aggregate_steps_per_s") if groups else None
+        group = summarize_group(worker_outputs, first_aggregate)
+        group["n"] = int(n)
         groups.append(group)
         if group["oom"] or group["failed"]:
             logger.warning("concurrency group N=%d: OOM or worker failure; stopping", n)

@@ -267,6 +267,41 @@ class TestGridEstimate:
         assert seeds == sorted(seeds)
 
 
+class TestConcurrencyResilience:
+    """A group whose workers all fail records the failure instead of
+    crashing the benchmark (the speedup needs both aggregates)."""
+
+    def test_group_of_failed_workers_reports_failure_without_speedup(self):
+        group = bench.summarize_group([(1, None), ("timeout", None)])
+        assert group["failed"] == 2
+        assert group["workers"] == []
+        assert group["aggregate_steps_per_s"] is None
+        assert group["speedup"] is None
+        # Even when the first group has an aggregate, a failed group has
+        # no speedup (the old code crashed with None / float here).
+        group = bench.summarize_group([(1, None)], first_aggregate=10.0)
+        assert group["speedup"] is None
+        # And a healthy group against a healthy first group still does.
+        group = bench.summarize_group(
+            [
+                (
+                    0,
+                    {
+                        "steps": 10,
+                        "elapsed_s": 2.0,
+                        "peak_memory_bytes": None,
+                        "oom": False,
+                        "late": False,
+                    },
+                )
+            ],
+            first_aggregate=10.0,
+        )
+        assert group["failed"] == 0
+        assert group["aggregate_steps_per_s"] == pytest.approx(5.0)
+        assert group["speedup"] == pytest.approx(0.5)
+
+
 class TestSummary:
     """summary.md has the expected sections; on CPU the GPU-only parts
     are skipped with a clear note."""
