@@ -55,6 +55,11 @@ training:
   precision: 32-true
   grad_clip_val: null
   loss_on: answers         # answers | all (full-sequence CE)
+  answer_head: true        # under loss_on: answers, evaluate the LM head only
+                           # at answer positions (exact: same loss,
+                           # gradients and metrics in exact arithmetic;
+                           # see the README). false restores the full head
+                           # (checks only; it changes the run identity).
   compile: false
   log_every_n_steps: 50
 

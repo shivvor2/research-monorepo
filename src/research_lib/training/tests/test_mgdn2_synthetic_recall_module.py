@@ -7,6 +7,8 @@ Run with: pytest src/research_lib/training/tests/test_mgdn2_synthetic_recall_mod
 
 import pytest
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from research_lib.architectures.config import ZoologyLMConfig
 from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
@@ -19,6 +21,7 @@ from research_lib.data.synthetic import (
 )
 from research_lib.layers.attention import MultistateGatedDelta
 from research_lib.training.configs import ScheduleConfig
+from research_lib.training.losses import AnswerLogits
 from research_lib.training.modules.mgdn2_synthetic_recall import (
     MGDN2SyntheticRecallModule,
 )
@@ -52,16 +55,22 @@ def tiny_overwrite_config() -> OverwriteConfig:
     )
 
 
-def tiny_model(layout: str = "single") -> ZoologyLM:
+def tiny_model(layout: str = "single", dtype=None) -> ZoologyLM:
     """Zoology harness with a BaseConv block and one gated-delta mixer."""
     mixers = zoology_mixers(
         2,
         16,
         make_mixer=lambda: MultistateGatedDelta(
-            hidden_size=16, num_heads=1, head_dim=16, layout=layout, t_max=32
+            hidden_size=16,
+            num_heads=1,
+            head_dim=16,
+            layout=layout,
+            t_max=32,
+            dtype=dtype,
         ),
+        dtype=dtype,
     )
-    return ZoologyLM(ZoologyLMConfig(vocab_size=64, d_model=16), mixers)
+    return ZoologyLM(ZoologyLMConfig(vocab_size=64, d_model=16), mixers, dtype=dtype)
 
 
 def lr_schedule(peak: float = 1e-3) -> ScheduleConfig:
@@ -84,16 +93,19 @@ def make_module(
     slice_values=(2, 4),
     with_classes=None,
     loss_on="answers",
+    answer_head=True,
+    dtype=None,
     decay_scheme: str = "grouped",
 ) -> MGDN2SyntheticRecallModule:
     matrix_config, vector_config = build_weight_decay_configs(
         decay_scheme, weight_decay=0.1, betas=(0.9, 0.95)
     )
     return MGDN2SyntheticRecallModule(
-        model=tiny_model(layout),
+        model=tiny_model(layout, dtype=dtype),
         slice_values=slice_values,
         with_classes=with_classes,
         loss_on=loss_on,
+        answer_head=answer_head,
         matrix_optimizer_config=matrix_config,
         vector_optimizer_config=vector_config,
         matrix_schedule_config=lr_schedule(),
@@ -127,7 +139,9 @@ class TestForwardAndLoss:
 
     def test_forward_ignores_extra_keys(self):
         """forward(**batch) on a full overwrite batch equals model(input_ids)."""
-        module = make_module(layout="ws")
+        # answer_head=False pins the full-logits path: with the default
+        # answer_head=True, forward returns AnswerLogits instead.
+        module = make_module(layout="ws", answer_head=False)
         batch = generate_overwrite(tiny_overwrite_config(), num_examples=4, seed=0)
         expected = module.model(batch["input_ids"])
         out = module.forward(**batch)
@@ -389,6 +403,146 @@ class TestValidationLogging:
         metrics = {k: float(v) for k, v in trainer.callback_metrics.items()}
         assert "test/acc" in metrics
         assert "test/acc/slice=2" in metrics
+
+
+@pytest.mark.slow
+class TestAnswerHeadTraining:
+    """100 fp64 CPU steps, one run per head mode, same seed and batches:
+    the loss trajectories agree at every step."""
+
+    @staticmethod
+    def _run(answer_head: bool) -> list[float]:
+        import lightning as L
+
+        # Identical weights and batches for both runs (the trajectories
+        # agree only when the two builds start from identical weights):
+        # repeat the RNG state before building the module.
+        torch.manual_seed(0)
+        module = make_module(
+            layout="ws",
+            slice_values=(2, 4),
+            answer_head=answer_head,
+            dtype=torch.float64,
+        )
+        dm = make_datamodule("mqar", batch_size=8)
+        losses = []
+
+        class _Recorder(L.Callback):
+            def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+                value = outputs["loss"] if isinstance(outputs, dict) else outputs
+                losses.append(float(value))
+
+        trainer = L.Trainer(
+            max_steps=100,
+            accelerator="cpu",
+            logger=False,
+            enable_progress_bar=False,
+            callbacks=[_Recorder()],
+            num_sanity_val_steps=0,
+            limit_val_batches=0,
+        )
+        trainer.fit(module, datamodule=dm)
+        return losses
+
+    def test_trajectories_agree(self):
+        losses_true = self._run(answer_head=True)
+        losses_false = self._run(answer_head=False)
+        assert len(losses_true) == len(losses_false) == 100
+        for step, (a, b) in enumerate(zip(losses_true, losses_false, strict=True)):
+            assert a == pytest.approx(b, rel=1e-8), (step, a, b)
+
+
+class TestAnswerHead:
+    """The answer-head module path: equivalence with the full head and
+    the loss_on switch."""
+
+    @staticmethod
+    def _validate(module, dm) -> dict[str, float]:
+        import lightning as L
+
+        trainer = L.Trainer(
+            accelerator="cpu",
+            logger=False,
+            enable_progress_bar=False,
+            num_sanity_val_steps=0,
+        )
+        trainer.validate(module, datamodule=dm)
+        return {k: float(v) for k, v in trainer.callback_metrics.items()}
+
+    @pytest.mark.parametrize("task", ["mqar", "overwrite"])
+    @pytest.mark.parametrize("layout", ["single", "ll"])
+    def test_answer_head_module_equivalence(self, task, layout):
+        """answer_head=True vs False: same training loss (a
+        training_step-equivalent forward + compute_loss) and the same
+        validation metrics, in fp64."""
+        batch = (
+            generate_mqar(tiny_mqar_config(), num_examples=4, seed=0)
+            if task == "mqar"
+            else generate_overwrite(tiny_overwrite_config(), num_examples=8, seed=0)
+        )
+        # Two independent builds must start from identical weights, so
+        # reseed before each; the module equivalence is exact only when
+        # the trunk weights match.
+        torch.manual_seed(0)
+        m_true = make_module(layout=layout, answer_head=True, dtype=torch.float64)
+        torch.manual_seed(0)
+        m_false = make_module(layout=layout, answer_head=False, dtype=torch.float64)
+
+        out_true = m_true.forward(**batch)
+        out_false = m_false.forward(**batch)
+        assert isinstance(out_true, AnswerLogits)
+        assert isinstance(out_false, torch.Tensor)
+        loss_true = m_true.compute_loss(out_true, batch)
+        loss_false = m_false.compute_loss(out_false, batch)
+        assert loss_true.detach() == pytest.approx(loss_false.detach(), rel=1e-12)
+
+        dm = make_datamodule(task, batch_size=8)
+        metrics_true = self._validate(m_true, dm)
+        metrics_false = self._validate(m_false, dm)
+        assert metrics_true.keys() == metrics_false.keys()
+        for key in metrics_true:
+            if key.endswith("/loss"):
+                assert metrics_true[key] == pytest.approx(metrics_false[key], rel=1e-12)
+            else:
+                assert metrics_true[key] == metrics_false[key], key
+
+    def test_loss_on_all_returns_full_logits(self):
+        """loss_on="all" keeps the full head even with answer_head=True:
+        forward returns (B, T, V) logits and the full-sequence CE."""
+        module = make_module(loss_on="all", answer_head=True)
+        batch = generate_mqar(tiny_mqar_config(), num_examples=4, seed=0)
+        out = module.forward(**batch)
+        assert isinstance(out, torch.Tensor)
+        assert out.shape == (4, 32, 64)
+        loss = module.compute_loss(out, batch)
+        expected = F.cross_entropy(
+            out[:, :-1].reshape(-1, 64), batch["input_ids"][:, 1:].reshape(-1)
+        )
+        assert loss.detach() == pytest.approx(expected.detach())
+        # labels are ignored under loss_on="all": passing them changes nothing.
+        out2 = module.forward(batch["input_ids"], labels=batch["labels"])
+        assert isinstance(out2, torch.Tensor)
+        torch.testing.assert_close(out2, out)
+
+    def test_answer_head_requires_hidden_states_and_head(self):
+        """answer_head=True raises TypeError naming the missing method."""
+        matrix_config, vector_config = build_weight_decay_configs(
+            "grouped", weight_decay=0.1, betas=(0.9, 0.95)
+        )
+
+        class _NoHead(nn.Module):
+            def forward(self, x):
+                return x
+
+        with pytest.raises(TypeError, match="hidden_states"):
+            MGDN2SyntheticRecallModule(
+                model=_NoHead(),
+                slice_values=(2, 4),
+                matrix_optimizer_config=matrix_config,
+                vector_optimizer_config=vector_config,
+                matrix_schedule_config=lr_schedule(),
+                vector_schedule_config=lr_schedule(),
+            )
 
 
 @pytest.mark.slow

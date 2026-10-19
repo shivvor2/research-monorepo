@@ -86,6 +86,24 @@ outside the anchor tier).
 
 4. **Phase 4 — long-T tier**: `+sweep=tier_longT` (T = 2048 sparse MQAR).
 
+## Training
+
+Under `training.loss_on: answers` (the default) the LM head is evaluated
+**only at the answer positions**: the trunk (embedding, mixers, final
+norm) still runs on every position, but `lm_head` is applied to the
+answer rows alone (`training.answer_head: true`, the default). This is
+exact — the loss is the mean cross-entropy over the answer positions,
+positions outside them appear neither in the sum nor in its denominator
+and already get exactly zero gradient (`ignore_index`), the head acts on
+each position separately, nothing after it mixes positions, and the
+metrics read only answer positions — so the loss, every gradient and
+every metric are identical to the full head in exact arithmetic (the
+fp64 equivalence tests in `src/research_lib/training/tests/` check
+this). In floating point the results differ at rounding level (different
+matmul shapes and reduction order), which is why this lands before the
+first protocol run. `training.answer_head: false` restores the full head
+(for checks only; it changes the run identity).
+
 ## Running, stopping and continuing
 
 **What `test_done` guarantees.** A run record with `status == "test_done"`
@@ -129,6 +147,7 @@ the second one skips it.
 **Curves.** The CSV logger writes next to the run records:
 `runs/<task>/curves/<run_id>/version_0/metrics.csv`. A relaunch removes
 a stale curves directory first (a relaunch is a fresh run).
+
 
 ## Analysis
 
