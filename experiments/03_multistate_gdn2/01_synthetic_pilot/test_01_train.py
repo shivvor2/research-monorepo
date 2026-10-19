@@ -839,6 +839,10 @@ def _fitted_post_fit(tmp_path, run_id="post"):
         callbacks=[cb],
         num_sanity_val_steps=0,
         limit_val_batches=0,
+        # The default checkpoint callback writes under the working
+        # directory otherwise, and the suite would leave a checkpoints/
+        # folder next to the tests.
+        default_root_dir=tmp_path,
     )
     module = _TinyFitModule()
     loader = torch.utils.data.DataLoader(
