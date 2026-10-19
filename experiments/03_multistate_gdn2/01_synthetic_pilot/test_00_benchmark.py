@@ -454,6 +454,23 @@ class TestWorkerLifecycle:
             assert process.poll() is not None
 
 
+class TestBusyFraction:
+    """The busy reading uses the unprofiled step time as its
+    denominator: the profiler's own CPU-tracing overhead would inflate
+    its wall time, and the first steps carry one-time costs the warmup
+    absorbs."""
+
+    def test_busy_fraction_on_hand_made_numbers(self):
+        # 5000 us of kernel time per step over a 10 ms unprofiled step.
+        assert bench.busy_fraction(50_000.0, 10, 10.0) == pytest.approx(0.5)
+        # Kernel time above the step time clips at 1.0.
+        assert bench.busy_fraction(200_000.0, 10, 10.0) == 1.0
+        assert bench.busy_fraction(0.0, 10, 10.0) == 0.0
+        # Degenerate inputs stay 0 (never a division blow-up).
+        assert bench.busy_fraction(50_000.0, 0, 10.0) == 0.0
+        assert bench.busy_fraction(50_000.0, 10, 0.0) == 0.0
+
+
 class TestSummary:
     """summary.md has the expected sections; on CPU the GPU-only parts
     are skipped with a clear note."""

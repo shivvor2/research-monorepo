@@ -335,19 +335,59 @@ def measure_step_times(
     return result
 
 
+def busy_fraction(kernel_us_total: float, steps: int, step_ms: float) -> float:
+    """GPU-busy fraction: CUDA kernel device time per step over the
+    **unprofiled** median step time at the same batch size.
+
+    The denominator is the step time from :func:`measure_step_times`,
+    not the profiler's wall time: the profiler's CPU tracing inflates
+    its wall time (most on launch-bound workloads), which would push
+    the reading down and the classification toward ``overhead-bound``.
+    Clipped to 1.0.
+
+    Args:
+        kernel_us_total: Sum of CUDA kernel device time over the
+            profiled steps, microseconds.
+        steps: The number of profiled steps.
+        step_ms: The unprofiled median step time at the same batch
+            size, milliseconds.
+
+    Returns:
+        The busy fraction in [0, 1]; 0 for degenerate inputs.
+    """
+    if steps <= 0 or not step_ms or step_ms <= 0:
+        return 0.0
+    return min(1.0, (kernel_us_total / steps) / (step_ms * 1000.0))
+
+
 def measure_busy_fraction(
     cfg: DictConfig,
     batch_size: int,
+    warmup_steps: int,
     profile_steps: int,
     device: torch.device,
     lr: float,
+    step_ms: float,
 ) -> tuple[float, float] | None:
     """(GPU-busy fraction, CUDA kernels per step) at one batch size.
 
-    Profiles ``profile_steps`` training steps with the PyTorch profiler
-    (CPU and CUDA activities). Busy = (sum of CUDA kernel device time) /
-    (wall time of those steps); kernels per step = profiled kernel
-    launches / steps.
+    Runs ``warmup_steps`` untraced steps first (the first steps carry
+    one-time costs: AdamW state allocation, allocator growth, cuBLAS and
+    cuDNN set-up), then profiles ``profile_steps`` steps with the
+    PyTorch profiler (CPU and CUDA activities). Busy is
+    :func:`busy_fraction`: kernel device time per profiled step over
+    the caller's unprofiled median step time at the same batch size.
+    Kernels per step = profiled kernel launches / steps.
+
+    Args:
+        cfg: The variant's resolved config.
+        batch_size: The training batch size.
+        warmup_steps: Untraced steps before the profiling.
+        profile_steps: Profiled steps.
+        device: The device to measure on.
+        lr: The peak learning rate (does not affect the timing).
+        step_ms: The unprofiled median step time at ``batch_size``,
+            milliseconds (the busy denominator).
 
     Returns:
         ``None`` without CUDA (the reading is not defined there).
@@ -360,13 +400,14 @@ def measure_busy_fraction(
     L.seed_everything(0)
     module = build_benchmark_module(cfg, lr).to(device)
     optimizers = optimizers_of(module)
-    batches = pregenerate_batches(cfg, batch_size, profile_steps)
-    wall_start = time.perf_counter()
+    batches = pregenerate_batches(cfg, batch_size, warmup_steps + profile_steps)
+    for step in range(warmup_steps):
+        one_step(module, optimizers, move_batch(batches[step], device))
+    torch.cuda.synchronize(device)
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        for step in range(profile_steps):
+        for step in range(warmup_steps, warmup_steps + profile_steps):
             one_step(module, optimizers, move_batch(batches[step], device))
             torch.cuda.synchronize(device)
-    wall_us = (time.perf_counter() - wall_start) * 1e6
     # Only the CUDA kernel records count: host dispatch events carry a
     # device-time too (the profiler propagates it), and summing them
     # would double-count the kernels' work.
@@ -375,7 +416,7 @@ def measure_busy_fraction(
     ]
     device_us = sum(event.device_time_total for event in kernel_events)
     kernels = sum(event.count for event in kernel_events)
-    busy = min(1.0, device_us / wall_us) if wall_us > 0 else 0.0
+    busy = busy_fraction(device_us, profile_steps, step_ms)
     return busy, kernels / profile_steps
 
 
@@ -1335,7 +1376,13 @@ def measure_all(cfg: DictConfig, device: torch.device, out_dir: Path) -> dict[st
         busy = kernels = None
         if has_cuda and oom_at is None and step_ms.get(256) is not None:
             measured = measure_busy_fraction(
-                variant_cfg, 256, int(cfg.bench.profile_steps), device, lr
+                variant_cfg,
+                256,
+                int(cfg.bench.warmup_steps),
+                int(cfg.bench.profile_steps),
+                device,
+                lr,
+                step_ms[256],
             )
             if measured is not None:
                 busy, kernels = measured
@@ -1532,8 +1579,10 @@ SUMMARY_EXPLANATION = """\
 - **[t256/t64]** is the step time at B=256 over B=64: near 1 the step
   does not grow with the batch size (overhead-bound), near 4 it grows
   proportionally (throughput-bound).
-- **busy** is the GPU-busy fraction: CUDA kernel device time over the
-  wall time of `profile_steps` profiled steps.
+- **busy** is the GPU-busy fraction: CUDA kernel device time per
+  profiled step (after untraced warmup steps) over the **unprofiled**
+  median step time at the same batch size — the profiler's own tracing
+  overhead never inflates the denominator.
 - **peak MB** is `torch.cuda.max_memory_allocated` over the step loop
   (model + optimizer state + one step's activations).
 - **reading**: `overhead-bound` (run several independent runs per GPU),
