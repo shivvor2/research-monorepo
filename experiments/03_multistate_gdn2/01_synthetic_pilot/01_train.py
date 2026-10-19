@@ -29,6 +29,8 @@ import json
 import logging
 import shutil
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -214,6 +216,40 @@ def should_skip(record_path: Path, identity: tuple[str, Any]) -> str | None:
     if (record.get("config_hash"), record.get("seed")) != identity:
         return None
     return "already test_done"
+
+
+@contextmanager
+def claim_run(
+    lock_path: Path | str,
+    record_path: Path | str | None,
+    identity: tuple[str, Any],
+) -> Generator[str | None, None, None]:
+    """Acquire the run lock and decide whether to run.
+
+    Yields a skip reason (or ``None`` to run) while the lock is held:
+    the record is read only after this process owns the run, so a run
+    that another process just completed is skipped instead of re-run (a
+    check before the lock would race with a process that finishes
+    between the check and the lock). ``record_path=None`` skips the
+    record check (the run always proceeds once the lock is acquired).
+
+    Args:
+        lock_path: The per-run lock file.
+        record_path: The run's record file, or ``None`` when the skip
+            check does not apply (e.g. the smoke and debug configs).
+        identity: The run's ``(config_hash, seed)``.
+
+    Yields:
+        str | None: The skip reason, or ``None`` to run.
+    """
+    with exclusive_lock(lock_path) as acquired:
+        if not acquired:
+            yield "running in another process"
+            return
+        reason = None
+        if record_path is not None:
+            reason = should_skip(Path(record_path), identity)
+        yield reason
 
 
 # =============================================================================
@@ -790,32 +826,32 @@ def main(cfg: DictConfig) -> None:
     # checks below need it).
     run_id = make_run_id(cfg, lr)
 
-    # 5. Skip completed: protocol tiers only (the smoke and debug configs
-    # always run). A record that is test_done with the same identity is
-    # done; anything else falls through (a different identity is refused
-    # by RunSummaryCallback; a non-done record is overwritten by the
-    # re-run).
-    if bool(cfg.launch.skip_completed) and str(cfg.experiment.tier) in PROTOCOL_TIERS:
-        record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
-        identity = (
-            config_hash(OmegaConf.to_container(cfg, resolve=True), HASH_EXCLUDE),
-            cfg.seed,
-        )
-        reason = should_skip(record_path, identity)
+    # 5. Claim the run: acquire the lock, then decide. The record is
+    # read only while this process owns the run, so a run that another
+    # process just completed is skipped instead of re-run (a check before
+    # the lock would race with a process that finishes between the check
+    # and the lock). The lock file of a completed run already exists, so
+    # taking the lock for a run that is then skipped costs nothing. The
+    # skip applies to protocol tiers only (the smoke and debug configs
+    # always run); a different identity is refused by RunSummaryCallback,
+    # a non-done record is overwritten by the re-run.
+    lock_path = Path(cfg.output.runs_dir) / f"{run_id}.lock"
+    record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
+    identity = (
+        config_hash(OmegaConf.to_container(cfg, resolve=True), HASH_EXCLUDE),
+        cfg.seed,
+    )
+    skip_completed = (
+        bool(cfg.launch.skip_completed) and str(cfg.experiment.tier) in PROTOCOL_TIERS
+    )
+    with claim_run(
+        lock_path, record_path if skip_completed else None, identity
+    ) as reason:
         if reason is not None:
             logger.info("skip %s: %s", run_id, reason)
             return
 
-    # 6. Run lock: exclusive, non-blocking, for the rest of the run. The
-    # lock file stays on disk (empty); it is not a record and 02_analyze.py
-    # reads only *.json.
-    lock_path = Path(cfg.output.runs_dir) / f"{run_id}.lock"
-    with exclusive_lock(lock_path) as acquired:
-        if not acquired:
-            logger.info("skip %s: running in another process", run_id)
-            return
-
-        # 7. Curves: a relaunch is a fresh run. The CSV logger appends to
+        # 6. Curves: a relaunch is a fresh run. The CSV logger appends to
         # an existing version_0 directory, so a stale one is removed
         # before the logger is created.
         if bool(cfg.logging.csv.enabled):

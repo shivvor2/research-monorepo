@@ -22,8 +22,10 @@ from typing import Any
 import pytest
 import torch
 from lightning.pytorch.loggers import CSVLogger
-from lightning.pytorch.trainer.states import TrainerStatus
+from lightning.pytorch.trainer.states import TrainerFn, TrainerStatus
 from omegaconf import OmegaConf
+
+from research_lib.utils.run_lock import exclusive_lock
 
 _SRC = Path(__file__).resolve().parents[3] / "src"
 if str(_SRC) not in sys.path:
@@ -766,6 +768,47 @@ class TestShouldSkip:
         path = tmp_path / "run.json"
         path.write_text("{not json")
         assert train.should_skip(path, ("h", 0)) is None
+
+
+class TestClaimRun:
+    """The skip decision is made while holding the run lock: a run that
+    another process completed between its pre-lock check and the lock
+    acquisition is skipped, not re-run."""
+
+    def test_skips_a_run_completed_while_waiting(self, tmp_path):
+        lock_path = tmp_path / "run.lock"
+        record_path = tmp_path / "run.json"
+        identity = ("h", 0)
+        # Another process is running the run: the lock is held and the
+        # record says `running`.
+        with exclusive_lock(lock_path):
+            record_path.write_text(
+                json.dumps({"status": "running", "config_hash": "h", "seed": 0})
+            )
+            # The other process finishes while this process is waiting:
+            # test_done is written before the lock is released.
+            record_path.write_text(
+                json.dumps({"status": "test_done", "config_hash": "h", "seed": 0})
+            )
+        # The lock is free now. Claiming the run must skip it: the
+        # record is read only after the lock is acquired, so the
+        # completed run is not re-run.
+        with train.claim_run(lock_path, record_path, identity) as reason:
+            assert reason == "already test_done"
+
+    def test_held_lock_skips_without_reading_the_record(self, tmp_path):
+        lock_path = tmp_path / "run.lock"
+        record_path = tmp_path / "run.json"
+        with exclusive_lock(lock_path):
+            with train.claim_run(lock_path, record_path, ("h", 0)) as reason:
+                assert reason == "running in another process"
+
+    def test_no_record_check_proceeds(self, tmp_path):
+        # record_path=None: the skip check does not apply (e.g. the smoke
+        # and debug configs); the run proceeds once the lock is acquired.
+        lock_path = tmp_path / "run.lock"
+        with train.claim_run(lock_path, None, ("h", 0)) as reason:
+            assert reason is None
 
 
 class TestStopRequested:
