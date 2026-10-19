@@ -25,14 +25,21 @@ Precision: fp32 throughout; ``torch.set_float32_matmul_precision`` is
 left at its default (TF32 would lower the reference layers' fp32 matmuls).
 """
 
+import json
 import logging
+import shutil
+import sys
 from pathlib import Path
+from typing import Any, cast
 
 import hydra
 import lightning as L
 import torch
+from hydra.core.hydra_config import HydraConfig
+from hydra.utils import get_original_cwd
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
+from lightning.pytorch.trainer.states import TrainerStatus
 from omegaconf import DictConfig, OmegaConf
 
 # Library imports
@@ -49,6 +56,7 @@ from research_lib.training.callbacks import (
     LayerStatsCallback,
     RunSummaryCallback,
     Stage,
+    config_hash,
     metrics_by_prefix,
     param_counts,
 )
@@ -56,6 +64,8 @@ from research_lib.training.configs import ScheduleConfig
 from research_lib.training.modules import MGDN2SyntheticRecallModule
 from research_lib.training.presets import build_weight_decay_configs
 from research_lib.training.scheduling import WarmupStableDecaySchedule
+from research_lib.utils.io import atomic_torch_save
+from research_lib.utils.run_lock import exclusive_lock
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +91,130 @@ VECTOR_TARGET_MODULES: list[str] = [
 ]
 
 TASK_CONFIGS = {"mqar": MQARConfig, "overwrite": OverwriteConfig}
+
+# =============================================================================
+# Run identity: config keys excluded from the hash
+# =============================================================================
+
+# Dotted config keys excluded from the run identity (config_hash). Each
+# one is safe because it cannot change a result:
+#   - output: runs_dir is an absolute path under the launch directory, so
+#     the same run launched from another directory or machine would get a
+#     different identity (and a record pulled from another machine would
+#     block a relaunch);
+#   - logging: logger settings (CSV/W&B on/off, save dirs) do not change
+#     the training stream or the metrics;
+#   - launch: execution controls (skip_completed, stop_file, shards) are
+#     operational, not experimental;
+#   - data.num_workers: the training stream is defined per
+#     (train_seed, batch index) independently of the worker count
+#     (SyntheticRecallDataModule docstring).
+HASH_EXCLUDE: tuple[str, ...] = ("output", "logging", "launch", "data.num_workers")
+
+
+def set_precision_flags() -> dict[str, bool]:
+    """fp32 without TF32 (protocol §2): both PyTorch TF32 switches off.
+
+    ``torch.set_float32_matmul_precision`` is left untouched: the matmul
+    flag covers the reference layers' fp32 matmuls, and the cuDNN flag
+    covers BaseConv / the short convs, which run through cuDNN and
+    default to TF32 on.
+
+    Returns:
+        The values read back, for the run record's ``precision_flags``.
+    """
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    return {
+        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
+        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
+    }
+
+
+def assert_fit_finished(trainer: L.Trainer) -> None:
+    """Raise unless the fit ended normally.
+
+    With Lightning < 2.4, Ctrl-C made ``fit()`` return normally and the
+    script would test a half-trained model and record ``test_done``; the
+    lock pins >= 2.4, the guard keeps the invariant independent of that.
+    ``status == "test_done"`` means fit ended normally (max steps or
+    early stop) AND the test pass completed on the final weights.
+
+    Raises:
+        RuntimeError: Naming the status, if it is not ``FINISHED``.
+    """
+    if trainer.state.status != TrainerStatus.FINISHED:
+        raise RuntimeError(
+            f"fit() ended with trainer.state.status={trainer.state.status!r}, "
+            f"not FINISHED; the model is not fully trained, refusing to test"
+        )
+
+
+def job_num(cfg: DictConfig) -> int:
+    """The Hydra job number (0 when not in a multirun).
+
+    ``hydra.job.num`` is set only in a multirun; a single run has no job
+    number, and the shard round-robin treats it as job 0.
+    """
+    job = cast(Any, HydraConfig.get().job)  # a DictConfig at runtime
+    return int(OmegaConf.select(job, "num", default=0))
+
+
+def stop_requested(cfg: DictConfig) -> Path | None:
+    """The STOP file path if it exists in the launch directory.
+
+    The launch directory is the original working directory (the
+    directory the command was run from; with ``job.chdir`` the job's cwd
+    is the job dir, so the STOP file must live next to the launch
+    command, not in the job dir).
+    """
+    path = Path(get_original_cwd()) / str(cfg.launch.stop_file)
+    return path if path.exists() else None
+
+
+def in_shard(job_num: int, shard_index: int, num_shards: int) -> bool:
+    """Round-robin shard membership: job ``k`` runs only in the process
+    with ``shard_index == k % num_shards``.
+
+    All shards must be launched with the identical sweep command; the
+    round-robin keeps every shard moving along the sweep's priority order
+    (overwrite before mqar, seed-major).
+
+    Raises:
+        ValueError: If ``num_shards < 1`` or ``shard_index`` is outside
+            ``[0, num_shards)``.
+    """
+    if num_shards < 1:
+        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
+    if not 0 <= shard_index < num_shards:
+        raise ValueError(
+            f"shard_index {shard_index} out of range for num_shards {num_shards}"
+        )
+    return job_num % num_shards == shard_index
+
+
+def should_skip(record_path: Path, identity: tuple[str, Any]) -> str | None:
+    """Skip reason for an existing run record, or ``None`` to run.
+
+    A record is done only when its status is ``test_done`` and its
+    ``(config_hash, seed)`` equals this run's identity. Any other record
+    falls through: a different identity is refused by
+    ``RunSummaryCallback`` as today; a non-done record is overwritten by
+    the re-run; a missing or unreadable record runs.
+    """
+    if not record_path.exists():
+        return None
+    try:
+        with open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if record.get("status") != "test_done":
+        return None
+    if (record.get("config_hash"), record.get("seed")) != identity:
+        return None
+    return "already test_done"
+
 
 # =============================================================================
 # Helpers
@@ -490,7 +624,9 @@ def per_slot_summary(key, value):
     return {key: float(value.float().mean())}
 
 
-def create_callbacks(cfg: DictConfig, run_id: str) -> list:
+def create_callbacks(
+    cfg: DictConfig, run_id: str, precision_flags: dict[str, bool]
+) -> list:
     """Early stopping (99% answer accuracy), the run summary, LR logging."""
     callbacks = [
         EarlyStopping(
@@ -507,6 +643,11 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
             packages=("torch", "lightning", "hydra-core", "omegaconf"),
             monitor="val/acc",
             mode="max",
+            # The run identity excludes operational keys (see HASH_EXCLUDE).
+            hash_exclude=HASH_EXCLUDE,
+            # The lockfile hash is part of the run's provenance: a tier
+            # that mixed lock versions would be visible (protocol §10.1).
+            provenance_files=("uv.lock",),
             collectors=(
                 Collector(
                     "params",
@@ -525,6 +666,10 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
                 # Also recorded via the config; kept top-level so analyses
                 # need not dig for it (one JSON per run, rsync-able).
                 "decay_scheme": str(cfg.optimizer.decay_scheme),
+                "precision_flags": precision_flags,
+                # Set by main() after the checkpoint is saved (before the
+                # test pass), so the test_done record names the file.
+                "final_checkpoint": None,
             },
         ),
         LearningRateMonitor(logging_interval="step"),
@@ -538,10 +683,19 @@ def create_callbacks(cfg: DictConfig, run_id: str) -> list:
 lr_resolved: dict[str, float | None] = {"value": None}
 
 
-def create_loggers(cfg: DictConfig) -> list | None:
+def create_loggers(cfg: DictConfig, run_id: str) -> list | None:
+    """CSV (next to the run records) and optional W&B loggers.
+
+    The CSV logger writes under ``<save_dir>/<run_id>/version_0``, so the
+    curves of one run live next to its run JSON (``runs/<task>/curves/``
+    in the base config; the smoke and debug configs keep their own
+    ``save_dir``).
+    """
     loggers = []
     if cfg.logging.csv.enabled:
-        loggers.append(CSVLogger(save_dir=cfg.logging.csv.save_dir, name="metrics"))
+        loggers.append(
+            CSVLogger(save_dir=cfg.logging.csv.save_dir, name=run_id, version=0)
+        )
     if cfg.logging.wandb.enabled:
         wandb_kwargs = {
             "project": cfg.logging.wandb.project,
@@ -565,10 +719,42 @@ def main(cfg: DictConfig) -> None:
     """Run one pilot training run (fit + test) and write the run JSON."""
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    # 0. Precision first: fp32 without TF32 (protocol §2). The cuDNN
+    # switch defaults to on, and BaseConv / the short convs run through
+    # cuDNN; the matmul switch covers the reference layers' fp32 matmuls.
+    # torch.set_float32_matmul_precision is left untouched.
+    precision_flags = set_precision_flags()
+    logger.info("Precision flags: %s", precision_flags)
+
     logger.info("=" * 80)
     logger.info("Resolved Configuration:")
     logger.info(OmegaConf.to_yaml(cfg))
     logger.info("=" * 80)
+
+    # 0b. STOP file: while it exists, no new run starts. In a multirun
+    # this ends the whole sweep (Hydra's job wrapper catches Exception,
+    # not SystemExit); in a single run it just exits. The file is never
+    # deleted by the script.
+    stop = stop_requested(cfg)
+    if stop is not None:
+        logger.info(
+            "STOP file found at %s; not starting job %d. Remove it to continue.",
+            stop,
+            job_num(cfg),
+        )
+        sys.exit(0)
+
+    # 0c. Shard: several processes on one machine split one sweep; job k
+    # runs only in the process with shard_index == k % num_shards. All
+    # shards must be launched with the identical sweep command.
+    if not in_shard(job_num(cfg), cfg.launch.shard_index, cfg.launch.num_shards):
+        logger.info(
+            "job %d not in shard %d of %d; skipping",
+            job_num(cfg),
+            cfg.launch.shard_index,
+            cfg.launch.num_shards,
+        )
+        return
 
     # 1. Phase gate: >= 2 requires the frozen protocol (§8.4).
     frozen = load_frozen_protocol()
@@ -600,68 +786,117 @@ def main(cfg: DictConfig) -> None:
     # endpoint is defined there); the error names the right task file.
     check_overwrite_k(cfg, frozen)
 
-    # 4. Seeds: the run seed fixes init AND the training stream.
-    L.seed_everything(cfg.seed)
-
-    # 5. Data.
-    datamodule = SyntheticRecallDataModule(
-        task=str(cfg.task.name),
-        task_config=build_task_config(cfg),
-        batch_size=cfg.training.batch_size,
-        num_val_per_slice=cfg.data.num_val_per_slice,
-        num_test_per_slice=cfg.data.num_test_per_slice,
-        train_seed=cfg.seed,
-        val_seed=cfg.task.val_seed,
-        test_seed=cfg.task.test_seed,
-        num_workers=cfg.data.num_workers,
-    )
-
-    # 6. Model + training module.
-    model = build_model(cfg)
-    if cfg.training.compile:
-        model = torch.compile(model)
-    module = build_module(cfg, model, lr)
-    num_params = sum(p.numel() for p in model.parameters())
-    gd_layer = first_gated_delta(model)
-    state_bytes = gd_layer.state_bytes() if gd_layer is not None else 0
-    logger.info(
-        "Model: %s parameters; recurrent state per mixer: %d bytes",
-        f"{num_params:,}",
-        state_bytes,
-    )
-
-    # 7. Callbacks and loggers.
+    # 4. Run ID, before any data or model is built (the skip and lock
+    # checks below need it).
     run_id = make_run_id(cfg, lr)
-    callbacks = create_callbacks(cfg, run_id)
-    loggers = create_loggers(cfg)
 
-    # 8. Trainer.
-    trainer = L.Trainer(
-        max_steps=cfg.training.max_steps,
-        val_check_interval=cfg.training.val_check_interval,
-        precision=cfg.training.precision,
-        callbacks=callbacks,
-        logger=loggers,
-        accelerator="auto",
-        devices="auto",
-        enable_progress_bar=True,
-        log_every_n_steps=cfg.training.log_every_n_steps,
-    )
+    # 5. Skip completed: protocol tiers only (the smoke and debug configs
+    # always run). A record that is test_done with the same identity is
+    # done; anything else falls through (a different identity is refused
+    # by RunSummaryCallback; a non-done record is overwritten by the
+    # re-run).
+    if bool(cfg.launch.skip_completed) and str(cfg.experiment.tier) in PROTOCOL_TIERS:
+        record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
+        identity = (
+            config_hash(OmegaConf.to_container(cfg, resolve=True), HASH_EXCLUDE),
+            cfg.seed,
+        )
+        reason = should_skip(record_path, identity)
+        if reason is not None:
+            logger.info("skip %s: %s", run_id, reason)
+            return
 
-    logger.info("Starting training (run_id=%s)...", run_id)
-    trainer.fit(module, datamodule=datamodule)
+    # 6. Run lock: exclusive, non-blocking, for the rest of the run. The
+    # lock file stays on disk (empty); it is not a record and 02_analyze.py
+    # reads only *.json.
+    lock_path = Path(cfg.output.runs_dir) / f"{run_id}.lock"
+    with exclusive_lock(lock_path) as acquired:
+        if not acquired:
+            logger.info("skip %s: running in another process", run_id)
+            return
 
-    # 9. Test on the final weights; the callback updates the run JSON.
-    trainer.test(module, datamodule=datamodule)
+        # 7. Curves: a relaunch is a fresh run. The CSV logger appends to
+        # an existing version_0 directory, so a stale one is removed
+        # before the logger is created.
+        if bool(cfg.logging.csv.enabled):
+            curves_dir = Path(cfg.logging.csv.save_dir) / run_id
+            if curves_dir.exists():
+                shutil.rmtree(curves_dir)
+                logger.info("Removed stale curves directory %s", curves_dir)
 
-    # 10. Optional final checkpoint for the mechanism probes.
-    if cfg.output.save_final_checkpoint:
-        path = Path(cfg.output.runs_dir) / f"{run_id}.pt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(model.state_dict(), path)
-        logger.info("Saved final checkpoint to %s", path)
+        # 8. Seeds: the run seed fixes init AND the training stream.
+        L.seed_everything(cfg.seed)
 
-    logger.info("Run complete (run_id=%s).", run_id)
+        # 9. Data.
+        datamodule = SyntheticRecallDataModule(
+            task=str(cfg.task.name),
+            task_config=build_task_config(cfg),
+            batch_size=cfg.training.batch_size,
+            num_val_per_slice=cfg.data.num_val_per_slice,
+            num_test_per_slice=cfg.data.num_test_per_slice,
+            train_seed=cfg.seed,
+            val_seed=cfg.task.val_seed,
+            test_seed=cfg.task.test_seed,
+            num_workers=cfg.data.num_workers,
+        )
+
+        # 10. Model + training module.
+        model = build_model(cfg)
+        if cfg.training.compile:
+            model = torch.compile(model)
+        module = build_module(cfg, model, lr)
+        num_params = sum(p.numel() for p in model.parameters())
+        gd_layer = first_gated_delta(model)
+        state_bytes = gd_layer.state_bytes() if gd_layer is not None else 0
+        logger.info(
+            "Model: %s parameters; recurrent state per mixer: %d bytes",
+            f"{num_params:,}",
+            state_bytes,
+        )
+
+        # 11. Callbacks and loggers.
+        callbacks = create_callbacks(cfg, run_id, precision_flags)
+        loggers = create_loggers(cfg, run_id)
+
+        # 12. Trainer.
+        trainer = L.Trainer(
+            max_steps=cfg.training.max_steps,
+            val_check_interval=cfg.training.val_check_interval,
+            precision=cfg.training.precision,
+            callbacks=callbacks,
+            logger=loggers,
+            accelerator="auto",
+            devices="auto",
+            enable_progress_bar=True,
+            log_every_n_steps=cfg.training.log_every_n_steps,
+        )
+
+        logger.info("Starting training (run_id=%s)...", run_id)
+        trainer.fit(module, datamodule=datamodule)
+
+        # 13. Post-fit guard: with Lightning < 2.4, Ctrl-C made fit()
+        # return normally and the script would test a half-trained model;
+        # the lock pins >= 2.4, the guard keeps the invariant independent
+        # of that. test_done means fit ended normally AND the test pass
+        # completed on the final weights.
+        assert_fit_finished(trainer)
+
+        # 14. Optional final checkpoint for the mechanism probes: saved
+        # after fit and before test, atomically (the test pass must never
+        # run on weights that were not saved; a partial file must never
+        # be observed).
+        if cfg.output.save_final_checkpoint:
+            path = Path(cfg.output.runs_dir) / f"{run_id}.pt"
+            atomic_torch_save(model.state_dict(), path)
+            logger.info("Saved final checkpoint to %s", path)
+            for cb in callbacks:
+                if isinstance(cb, RunSummaryCallback) and cb.extra is not None:
+                    cb.extra["final_checkpoint"] = path.name
+
+        # 15. Test on the final weights; the callback updates the run JSON.
+        trainer.test(module, datamodule=datamodule)
+
+        logger.info("Run complete (run_id=%s).", run_id)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,9 @@
 # gate {kda, full} x layout {single, ws, ll} x seeds 0-9, both tasks.
 # 120 runs. Requires phase 2 (frozen protocol).
 # Run: python 01_train.py +sweep=tier1_core --multirun
+# Sweep order: task (overwrite before mqar), then seed, then the rest:
+# a partial tier still yields complete paired Delta_i at the primary
+# endpoint (overwrite, class distant) before any MQAR run starts.
 
 experiment:
   phase: 2
@@ -12,7 +15,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      task: mqar,overwrite
+      task: overwrite,mqar
+      seed: range(0,10)
       model.gate_mode: kda,full
       model.layout: single,ws,ll
-      seed: range(0,10)

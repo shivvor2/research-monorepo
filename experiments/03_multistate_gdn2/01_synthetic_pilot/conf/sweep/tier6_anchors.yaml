@@ -4,6 +4,7 @@
 # only. 30 runs. Head counts follow the paper: 1 head at d = 16, 2
 # otherwise (one small anchor override file per dimension).
 # Run: python 01_train.py +sweep=tier6_anchors --multirun
+# Sweep order: seed first (MQAR only), then the rest.
 
 experiment:
   phase: 2
@@ -13,8 +14,8 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
+      seed: range(0,5)
       task: mqar
       model.gate_mode: gdn
       model.layout: single,ll
       +anchor: tier6_d16,tier6_d32,tier6_d64
-      seed: range(0,5)

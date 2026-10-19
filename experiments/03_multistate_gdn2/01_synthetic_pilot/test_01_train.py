@@ -12,12 +12,17 @@ the anchors -> their own entries keyed by d_model.
 """
 
 import importlib.util
+import itertools
+import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 import torch
+from lightning.pytorch.loggers import CSVLogger
+from lightning.pytorch.trainer.states import TrainerStatus
 from omegaconf import OmegaConf
 
 _SRC = Path(__file__).resolve().parents[3] / "src"
@@ -698,3 +703,249 @@ class TestBuildModel:
             model = train.build_model(model_cfg(layer_pattern=pattern))
             logits = model(torch.zeros(2, 12, dtype=torch.long))
             assert logits.shape == (2, 12, 64)
+
+
+class TestPrecisionFlags:
+    """B05: fp32 without TF32 - both PyTorch TF32 switches off."""
+
+    def test_both_tf32_flags_off(self):
+        flags = train.set_precision_flags()
+        assert flags == {
+            "cuda_matmul_allow_tf32": False,
+            "cudnn_allow_tf32": False,
+        }
+        assert torch.backends.cuda.matmul.allow_tf32 is False
+        assert torch.backends.cudnn.allow_tf32 is False
+
+
+class TestAssertFitFinished:
+    """B08: the post-fit guard passes only for a normally finished fit."""
+
+    def test_finished_passes(self):
+        trainer = SimpleNamespace(state=SimpleNamespace(status=TrainerStatus.FINISHED))
+        train.assert_fit_finished(trainer)  # no raise
+
+    @pytest.mark.parametrize(
+        "status", [TrainerStatus.INTERRUPTED, TrainerStatus.RUNNING]
+    )
+    def test_not_finished_raises(self, status):
+        trainer = SimpleNamespace(state=SimpleNamespace(status=status))
+        with pytest.raises(RuntimeError, match="not FINISHED"):
+            train.assert_fit_finished(trainer)
+
+
+class TestShouldSkip:
+    """B10: the skip logic - done + same identity skips; everything else
+    falls through to the run."""
+
+    def _record(self, tmp_path, status="test_done", config_hash="h", seed=0):
+        path = tmp_path / "run.json"
+        path.write_text(
+            json.dumps({"status": status, "config_hash": config_hash, "seed": seed})
+        )
+        return path
+
+    def test_missing_record_runs(self, tmp_path):
+        assert train.should_skip(tmp_path / "nope.json", ("h", 0)) is None
+
+    def test_done_same_identity_skips(self, tmp_path):
+        path = self._record(tmp_path)
+        assert train.should_skip(path, ("h", 0)) == "already test_done"
+
+    def test_done_other_identity_runs(self, tmp_path):
+        path = self._record(tmp_path)
+        assert train.should_skip(path, ("h", 1)) is None  # other seed
+        assert train.should_skip(path, ("g", 0)) is None  # other config
+
+    @pytest.mark.parametrize("status", ["running", "interrupted", "failed", "fit_done"])
+    def test_non_done_statuses_run(self, tmp_path, status):
+        path = self._record(tmp_path, status=status)
+        assert train.should_skip(path, ("h", 0)) is None
+
+    def test_unreadable_record_runs(self, tmp_path):
+        path = tmp_path / "run.json"
+        path.write_text("{not json")
+        assert train.should_skip(path, ("h", 0)) is None
+
+
+class TestStopRequested:
+    """B11: the STOP file lives in the launch directory (the original
+    working directory, not the job dir)."""
+
+    def _cfg(self):
+        return OmegaConf.create({"launch": {"stop_file": "STOP"}})
+
+    def test_no_stop_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        assert train.stop_requested(self._cfg()) is None
+
+    def test_stop_file_found(self, tmp_path, monkeypatch):
+        stop = tmp_path / "STOP"
+        stop.touch()
+        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        assert train.stop_requested(self._cfg()) == stop
+
+    def test_stop_file_elsewhere_is_not_seen(self, tmp_path, monkeypatch):
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "STOP").touch()
+        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        assert train.stop_requested(self._cfg()) is None
+
+
+class TestInShard:
+    """B12: round-robin shard membership, with validation."""
+
+    def test_round_robin(self):
+        assert train.in_shard(0, 0, 2) is True
+        assert train.in_shard(1, 0, 2) is False
+        assert train.in_shard(1, 1, 2) is True
+        assert train.in_shard(2, 0, 2) is True
+        assert train.in_shard(2, 1, 2) is False
+        assert train.in_shard(0, 0, 1) is True
+        assert train.in_shard(7, 0, 1) is True
+
+    def test_validation_errors(self):
+        with pytest.raises(ValueError, match="num_shards"):
+            train.in_shard(0, 0, 0)
+        with pytest.raises(ValueError, match="num_shards"):
+            train.in_shard(0, 0, -1)
+        with pytest.raises(ValueError, match="shard_index"):
+            train.in_shard(0, 2, 2)
+        with pytest.raises(ValueError, match="shard_index"):
+            train.in_shard(0, -1, 2)
+
+
+class TestSkipOnlyProtocolTiers:
+    """B13: the smoke and debug configs are tooling, not protocol tiers:
+    they always run, whatever launch.skip_completed says."""
+
+    def test_smoke_and_debug_tiers_are_not_protocol_tiers(self):
+        from hydra import compose, initialize_config_dir
+
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        with initialize_config_dir(config_dir=str(conf_dir), version_base=None):
+            for name in ("test", "debug"):
+                cfg = compose(config_name=name)
+                assert str(cfg.experiment.tier) not in train.PROTOCOL_TIERS
+
+    def test_protocol_tiers_are_all_present(self):
+        for tier in (
+            "calib_dmodel",
+            "calib_harness",
+            "calib_lr",
+            "calib_lr_anchors",
+            "tier1_core",
+            "tier2_gates",
+            "tier3_frozen",
+            "tier4_lambda",
+            "tier5_matched_bytes",
+            "tier6_anchors",
+            "tier_longT",
+            "R1",
+        ):
+            assert tier in train.PROTOCOL_TIERS
+
+
+class TestSeedMajorSweepOrder:
+    """B14: tier sweeps run overwrite before mqar, seed-major: a partial
+    tier still yields complete paired Delta_i at the primary endpoint
+    (overwrite, class distant) before any MQAR run starts."""
+
+    def test_tier_sweeps_are_seed_major(self):
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        tier_files = sorted((conf_dir / "sweep").glob("tier*.yaml"))
+        assert tier_files  # sanity: we found the tier files
+        for path in tier_files:
+            params = OmegaConf.select(
+                OmegaConf.load(path), "hydra.sweeper.params", default={}
+            )
+            names = list(params.keys())
+            grids = [sweeper_values(params[name]) for name in names]
+            jobs = [dict(zip(names, combo)) for combo in itertools.product(*grids)]
+            # Overwrite jobs come before MQAR jobs (Hydra's BasicSweeper
+            # iterates the Cartesian product in key order).
+            seen_mqar = False
+            for job in jobs:
+                task = str(job.get("task", ""))
+                if task.startswith("mqar"):
+                    seen_mqar = True
+                else:
+                    assert not seen_mqar, (path.name, job)
+            # Within one task, the seed is non-decreasing along the job
+            # order (seed-major: a partial tier covers every seed of the
+            # first task before moving on).
+            for task in {str(job.get("task", "")) for job in jobs}:
+                seeds = [
+                    int(job["seed"]) for job in jobs if str(job.get("task")) == task
+                ]
+                assert seeds == sorted(seeds), (path.name, task)
+
+    def test_calibration_sweeps_are_untouched(self):
+        """The calib_* files keep their own order (they are not tiers)."""
+        conf_dir = Path(__file__).resolve().parent / "conf"
+        calib_files = sorted((conf_dir / "sweep").glob("calib*.yaml"))
+        assert calib_files
+        for path in calib_files:
+            params = OmegaConf.select(
+                OmegaConf.load(path), "hydra.sweeper.params", default={}
+            )
+            names = list(params.keys())
+            # The seed is NOT the first or second key in the calibration
+            # sweeps (they vary the choice dimension fastest).
+            assert "seed" not in names[:2], path.name
+
+
+class TestCreateLoggers:
+    """B15: the CSV logger writes next to the run records:
+    runs/<task>/curves/<run_id>/version_0."""
+
+    def test_csv_logger_under_runs_curves(self, tmp_path):
+        runs_dir = tmp_path / "runs" / "mqar"
+        cfg = OmegaConf.create(
+            {
+                "logging": {
+                    "csv": {"enabled": True, "save_dir": str(runs_dir / "curves")},
+                    "wandb": {"enabled": False},
+                }
+            }
+        )
+        loggers = train.create_loggers(cfg, "run-1")
+        csv_logger = next(logger for logger in loggers if isinstance(logger, CSVLogger))
+        log_dir = Path(csv_logger.log_dir)
+        assert log_dir == runs_dir / "curves" / "run-1" / "version_0"
+
+    def test_csv_disabled_returns_only_wandb(self, tmp_path):
+        cfg = OmegaConf.create(
+            {
+                "logging": {
+                    "csv": {"enabled": False, "save_dir": "logs/csv"},
+                    "wandb": {"enabled": False},
+                }
+            }
+        )
+        assert train.create_loggers(cfg, "run-1") is None
+
+    def test_wandb_logger_keeps_the_project(self, tmp_path):
+        from lightning.pytorch.loggers import WandbLogger
+
+        cfg = OmegaConf.create(
+            {
+                "logging": {
+                    "csv": {"enabled": False, "save_dir": "logs/csv"},
+                    "wandb": {
+                        "enabled": True,
+                        "project": "MultistateGDN2",
+                        "entity": None,
+                    },
+                },
+                "experiment": {"name": "multistate_gdn2_synthetic_pilot"},
+            }
+        )
+        loggers = train.create_loggers(cfg, "run-1")
+        wandb_logger = next(
+            logger for logger in loggers if isinstance(logger, WandbLogger)
+        )
+        # WandbLogger.name is the project name (the run name lives on
+        # wandb's Run, which needs a live session).
+        assert wandb_logger.name == "MultistateGDN2"

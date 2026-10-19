@@ -2,6 +2,7 @@
 # Tier 3 frozen control (predictions 2, 3): fs x gate {kda, full} x
 # seeds 0-4, both tasks. 20 runs. Compare against the tier-1 ws rows.
 # Run: python 01_train.py +sweep=tier3_frozen --multirun
+# Sweep order: task (overwrite before mqar), then seed, then the rest.
 
 experiment:
   phase: 2
@@ -11,7 +12,7 @@ hydra:
   mode: MULTIRUN
   sweeper:
     params:
-      task: mqar,overwrite
+      task: overwrite,mqar
+      seed: range(0,5)
       model.gate_mode: kda,full
       model.layout: fs
-      seed: range(0,5)
