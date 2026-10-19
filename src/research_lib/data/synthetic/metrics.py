@@ -27,6 +27,16 @@ answers are OMITTED rather than emitted as 0.0 (a 0.0 would be
 indistinguishable from a real zero accuracy downstream), so classes and
 (slice, class) cells that never occur are absent from the dict.
 
+Predictions can arrive by three paths, all feeding the same counting
+body (:meth:`update_predictions`):
+
+- :meth:`update` with full ``(B, T, V)`` logits (the classic path);
+- :meth:`update_answers` with ``(N, V)`` answer-row logits, as produced
+  by :func:`research_lib.training.losses.answer_position_logits` (the
+  answer-position head of the pilot);
+- :meth:`update_predictions` directly with ``(B, T - 1)`` predicted
+  tokens.
+
 All counts live in ONE long tensor of shape ``(num_slices, 5, 3)`` (axis 1:
 the four placement classes plus a "no class" bucket used when class metrics
 are off, i.e. MQAR; axis 2: answers / correct / leaked).
@@ -200,7 +210,8 @@ class RecallMetrics:
     # ------------------------------------------------------------------ #
 
     def update(self, logits: torch.Tensor, batch: dict[str, torch.Tensor]) -> None:
-        """Accumulate one evaluation batch (free of host synchronization).
+        """Accumulate one evaluation batch from full logits (free of host
+        synchronization).
 
         Args:
             logits: ``(B, T, V)`` model logits.
@@ -211,7 +222,25 @@ class RecallMetrics:
                 ``slice_id`` is not among ``slice_values`` are counted in
                 the unknown-slice counter (reported by :meth:`compute`).
         """
-        preds, targets, mask = answer_predictions(logits, batch["labels"])
+        preds, _, _ = answer_predictions(logits, batch["labels"])
+        self.update_predictions(preds, batch)
+
+    def update_predictions(
+        self, preds: torch.Tensor, batch: dict[str, torch.Tensor]
+    ) -> None:
+        """Accumulate one evaluation batch from predicted next tokens.
+
+        The counting body behind :meth:`update` and
+        :meth:`update_answers` (free of host synchronization).
+
+        Args:
+            preds: ``(B, T - 1)`` long, the predicted next token at every
+                position (``argmax`` of the shifted logits); values at
+                non-answer positions are ignored.
+            batch: As in :meth:`update`.
+        """
+        targets = batch["labels"][:, 1:]
+        mask = targets != IGNORE_INDEX
         device = preds.device
         if self._counts is None or self._unknown is None:
             self._counts = torch.zeros(
@@ -301,6 +330,36 @@ class RecallMetrics:
             dist_flat.index_add_(
                 0, dist_flat_idx + 2, (leak & valid).reshape(-1).long()
             )
+
+    def update_answers(
+        self, answer_logits: torch.Tensor, batch: dict[str, torch.Tensor]
+    ) -> None:
+        """Accumulate one evaluation batch from answer-row logits.
+
+        ``answer_logits`` is ``(N, V)``, the rows of the answer positions
+        in row-major order, as produced by
+        :func:`research_lib.training.losses.answer_position_logits`.
+        The mask is recomputed from ``batch["labels"][:, 1:] != -100``,
+        ``preds = full((B, T - 1), -1)`` is filled with
+        ``preds.masked_scatter_(mask, answer_logits.argmax(-1))`` (no
+        host synchronization, keeping :meth:`update`'s property), and
+        :meth:`update_predictions` does the counting.
+
+        Args:
+            answer_logits: ``(N, V)`` logits at the answer positions, in
+                row-major order.
+            batch: As in :meth:`update`.
+        """
+        labels = batch["labels"]
+        mask = (labels[:, 1:] != IGNORE_INDEX).to(answer_logits.device)
+        preds = torch.full(
+            (labels.shape[0], labels.shape[1] - 1),
+            -1,
+            dtype=torch.long,
+            device=answer_logits.device,
+        )
+        preds.masked_scatter_(mask, answer_logits.argmax(-1))
+        self.update_predictions(preds, batch)
 
     # ------------------------------------------------------------------ #
     # Compute

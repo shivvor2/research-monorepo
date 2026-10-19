@@ -605,6 +605,7 @@ def build_module(
         slice_values=slice_values(cfg),
         with_classes=None,  # auto-detect (True for overwrite batches)
         loss_on=cfg.training.loss_on,
+        answer_head=cfg.training.answer_head,
         matrix_optimizer_config=matrix_optimizer_config,
         vector_optimizer_config=vector_optimizer_config,
         matrix_schedule_config=schedule_config,

@@ -213,6 +213,37 @@ class ZoologyLM(nn.Module):
     # Forward
     # ------------------------------------------------------------------ #
 
+    def hidden_states(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """The final hidden states, after the final RMSNorm, before the head.
+
+        The trunk (embedding, mixers, final norm) runs on every position;
+        only :meth:`head` can be restricted to a subset of positions (the
+        answer-position head of the synthetic pilot evaluates it only at
+        answer positions, which is exact: nothing after the head mixes
+        positions and the loss/metrics read only those positions).
+
+        Args:
+            input_ids (Tensor): Token ids of shape :math:`(B, T)`.
+
+        Returns:
+            Tensor: Hidden states of shape :math:`(B, T, d)`.
+        """
+        x = self.embedding(input_ids)
+        for block in self.blocks:
+            x = block(x)
+        return self.norm_f(x)
+
+    def head(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Apply the untied LM head to hidden states of any leading shape.
+
+        Args:
+            hidden (Tensor): Hidden states of shape :math:`(..., d)`.
+
+        Returns:
+            Tensor: Logits of shape :math:`(..., V)`.
+        """
+        return self.lm_head(hidden)
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """Return the logits for every position.
 
@@ -222,8 +253,4 @@ class ZoologyLM(nn.Module):
         Returns:
             Tensor: Logits of shape :math:`(B, T, V)`.
         """
-        x = self.embedding(input_ids)
-        for block in self.blocks:
-            x = block(x)
-        x = self.norm_f(x)
-        return self.lm_head(x)
+        return self.head(self.hidden_states(input_ids))

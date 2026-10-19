@@ -55,7 +55,15 @@ training:
   precision: 32-true
   grad_clip_val: null
   loss_on: answers         # answers | all (full-sequence CE)
-  compile: false
+  answer_head: true        # under loss_on: answers, evaluate the LM head only
+                           # at answer positions (exact: same loss,
+                           # gradients and metrics in exact arithmetic;
+                           # see the README). false restores the full head
+                           # (checks only; it changes the run identity).
+  compile: false           # with answer_head: true, the answer-head path
+                           # runs the model uncompiled (torch.compile
+                           # compiles only forward); use answer_head: false
+                           # for compiled runs
   log_every_n_steps: 50
 
 data:

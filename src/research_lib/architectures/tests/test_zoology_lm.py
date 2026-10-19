@@ -158,6 +158,32 @@ class TestZoologyLM:
         assert logits.shape == (2, 12, 64)
 
 
+class TestAnswerPositionHead:
+    """forward == head(hidden_states), exactly."""
+
+    def test_forward_equals_head_of_hidden_states(self):
+        torch.manual_seed(0)
+        mixers = zoology_mixers(2, 16, make_mixer=lambda: TupleMixer(16))
+        model = ZoologyLM(tiny_config(), mixers)
+        ids = torch.randint(0, 64, (2, 12))
+        torch.testing.assert_close(
+            model(ids), model.head(model.hidden_states(ids)), rtol=0, atol=0
+        )
+
+    def test_hidden_states_shape_and_head_contract(self):
+        """hidden_states is (B, T, d) after the final norm; head maps (..., d)
+        to (..., V) for any leading shape."""
+        torch.manual_seed(1)
+        mixers = zoology_mixers(2, 16, make_mixer=lambda: TupleMixer(16))
+        model = ZoologyLM(tiny_config(), mixers)
+        ids = torch.randint(0, 64, (3, 7))
+        hidden = model.hidden_states(ids)
+        assert hidden.shape == (3, 7, 16)
+        assert model.head(hidden).shape == (3, 7, 64)
+        # A single position works too (the answer rows are gathered first).
+        assert model.head(hidden[1, 3]).shape == (64,)
+
+
 class TestZoologyLMConfig:
     def test_state_mixer_coercion(self):
         config = ZoologyLMConfig(state_mixer="mlp")

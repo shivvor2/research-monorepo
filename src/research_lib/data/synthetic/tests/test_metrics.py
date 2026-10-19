@@ -7,12 +7,15 @@ Covers:
     leakage / other values
   * cross-entropy with the repo convention equals a manual mean over
     answer positions only
+  * update_answers: the answer-row path accumulates identically to update
 
 Run with: pytest src/research_lib/data/synthetic/tests/test_metrics.py -v
 """
 
 import pytest
 import torch
+
+from research_lib.training.losses import answer_position_logits
 
 from ..metrics import CLASS_NAMES, RecallMetrics, answer_predictions
 from ..mqar import MQARConfig, generate_mqar
@@ -575,3 +578,57 @@ class TestWriteDistanceMetrics:
             RecallMetrics(slice_values=(8,), distance_bins=(32, 16, 0))
         with pytest.raises(ValueError):
             RecallMetrics(slice_values=(8,), distance_bins=(-1, 16))
+
+
+# ---------------------------------------------------------------------------
+# update_answers: the answer-row metrics path
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateAnswers:
+    """update_answers accumulates the same counters as update.
+
+    The answer-head path evaluates the LM head only at the answer
+    positions and hands the metric its ``(N, V)`` answer rows; given
+    those, every accumulated metric is unchanged, on real batches from
+    both synthetic tasks.
+    """
+
+    @pytest.mark.parametrize("task", ["mqar", "overwrite"])
+    def test_update_answers_equals_update(self, task):
+        if task == "mqar":
+            config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2,))
+            batch = generate_mqar(config, num_examples=4, seed=0)
+        else:
+            config = OverwriteConfig(
+                vocab_size=512,
+                seq_len=128,
+                num_keys=(8,),
+                block_size=16,
+                distant_min_blocks=4,
+            )
+            batch = generate_overwrite(config, num_examples=4, seed=3, num_keys=8)
+
+        # A tiny untied LM: hidden states from an embedding, a linear head.
+        torch.manual_seed(0)
+        embed = torch.nn.Embedding(config.vocab_size, 16)
+        head = torch.nn.Linear(16, config.vocab_size)
+        hidden = embed(batch["input_ids"])
+        full_logits = head(hidden)
+        answers = answer_position_logits(hidden, head, batch["labels"])
+
+        metrics_full = RecallMetrics(slice_values=config.slices)
+        metrics_full.update(full_logits, batch)
+        metrics_answers = RecallMetrics(slice_values=config.slices)
+        metrics_answers.update_answers(answers.logits, batch)
+
+        result_full = metrics_full.compute()
+        result_answers = metrics_answers.compute()
+        assert "acc" in result_full
+        assert result_answers == result_full
+        # The class and write-distance fields are carried by the overwrite
+        # batch only, so those metric keys appear for overwrite only.
+        assert any("/class=" in key for key in result_full) == (task == "overwrite")
+        assert any(key.startswith("acc/dist=") for key in result_full) == (
+            task == "overwrite"
+        )
