@@ -715,6 +715,38 @@ def create_callbacks(
     return callbacks
 
 
+def create_callbacks_reset_curves(
+    cfg: DictConfig, run_id: str, precision_flags: dict[str, bool]
+) -> list:
+    """Build the callbacks (the run-identity check), then reset the curves.
+
+    The run-summary callback's constructor refuses a path that already
+    holds a **different** run's record, and that check must happen
+    before the stale curves directory is deleted: a relaunch that
+    edited a non-identity key (e.g. ``training.max_steps``) must be
+    refused with the recorded run's curves still in place, not refused
+    only after having destroyed them.
+
+    Args:
+        cfg: The resolved config (``output.runs_dir``, ``logging.csv.*``
+            and everything else ``create_callbacks`` reads).
+        run_id: The run ID (names the record and the curves directory).
+        precision_flags: Recorded in the run summary's ``extra``.
+
+    Returns:
+        The trainer callbacks. The loggers are created by the caller,
+    after this, so the CSV logger never appends to a stale
+    ``version_0`` directory.
+    """
+    callbacks = create_callbacks(cfg, run_id, precision_flags)
+    if bool(cfg.logging.csv.enabled):
+        curves_dir = Path(cfg.logging.csv.save_dir) / run_id
+        if curves_dir.exists():
+            shutil.rmtree(curves_dir)
+            logger.info("Removed stale curves directory %s", curves_dir)
+    return callbacks
+
+
 def run_summary_callback(callbacks: list) -> RunSummaryCallback | None:
     """The run-summary callback among ``callbacks`` (``None`` if absent)."""
     return next((cb for cb in callbacks if isinstance(cb, RunSummaryCallback)), None)
@@ -911,14 +943,15 @@ def main(cfg: DictConfig) -> None:
             logger.info("skip %s: %s", run_id, reason)
             return
 
-        # 6. Curves: a relaunch is a fresh run. The CSV logger appends to
-        # an existing version_0 directory, so a stale one is removed
-        # before the logger is created.
-        if bool(cfg.logging.csv.enabled):
-            curves_dir = Path(cfg.logging.csv.save_dir) / run_id
-            if curves_dir.exists():
-                shutil.rmtree(curves_dir)
-                logger.info("Removed stale curves directory %s", curves_dir)
+        # 6. Callbacks first, then the curves reset, then the loggers.
+        # The run-summary callback's constructor refuses a record of a
+        # different run under this run ID, so it is built before the
+        # stale curves directory is deleted (a refused relaunch must not
+        # destroy the recorded run's curves); the loggers are created
+        # only after the reset, because the CSV logger appends to an
+        # existing version_0 directory.
+        callbacks = create_callbacks_reset_curves(cfg, run_id, precision_flags)
+        loggers = create_loggers(cfg, run_id)
 
         # 8. Seeds: the run seed fixes init AND the training stream.
         L.seed_everything(cfg.seed)
@@ -950,11 +983,7 @@ def main(cfg: DictConfig) -> None:
             state_bytes,
         )
 
-        # 11. Callbacks and loggers.
-        callbacks = create_callbacks(cfg, run_id, precision_flags)
-        loggers = create_loggers(cfg, run_id)
-
-        # 12. Trainer.
+        # 11. Trainer.
         trainer = L.Trainer(
             max_steps=cfg.training.max_steps,
             val_check_interval=cfg.training.val_check_interval,
@@ -970,14 +999,14 @@ def main(cfg: DictConfig) -> None:
         logger.info("Starting training (run_id=%s)...", run_id)
         trainer.fit(module, datamodule=datamodule)
 
-        # 13. Post-fit steps: the fit-finished guard and the optional
+        # 12. Post-fit steps: the fit-finished guard and the optional
         # final checkpoint. These run outside trainer.fit()/trainer.test(),
         # so Lightning's on_exception never fires for them; post_fit
         # records a failure on the run summary (status "failed",
         # failed_stage "fit") and re-raises.
         post_fit(cfg, trainer, module, callbacks, run_id)
 
-        # 14. Test on the final weights; the callback updates the run JSON.
+        # 13. Test on the final weights; the callback updates the run JSON.
         trainer.test(module, datamodule=datamodule)
 
         logger.info("Run complete (run_id=%s).", run_id)

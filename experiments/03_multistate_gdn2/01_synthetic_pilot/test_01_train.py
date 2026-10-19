@@ -1073,3 +1073,75 @@ class TestCreateLoggers:
         # WandbLogger.name is the project name (the run name lives on
         # wandb's Run, which needs a live session).
         assert wandb_logger.name == "MultistateGDN2"
+
+
+def _callbacks_cfg(runs_dir, curves_dir):
+    """A config with everything create_callbacks and the curves reset read."""
+    return OmegaConf.create(
+        {
+            "seed": 0,
+            "output": {"runs_dir": str(runs_dir)},
+            "training": {
+                "early_stop_threshold": 0.99,
+                "collect_mixer_stats": False,
+            },
+            "logging": {
+                "csv": {"enabled": True, "save_dir": str(curves_dir)},
+                "wandb": {"enabled": False},
+            },
+            "optimizer": {"decay_scheme": "grouped"},
+            "experiment": {"name": "test", "tier": "tier1_core"},
+        }
+    )
+
+
+class TestCallbacksBeforeCurvesReset:
+    """The run identity is checked before the stale curves are deleted:
+    a relaunch refused for another run's record must leave that run's
+    curves directory in place; an accepted relaunch still resets it."""
+
+    def _curves(self, curves_dir, run_id):
+        curves = curves_dir / run_id
+        curves.mkdir(parents=True)
+        (curves / "metrics.csv").write_text("step,acc\n0,0.0\n")
+        return curves
+
+    def test_refused_relaunch_keeps_the_curves(self, tmp_path):
+        runs_dir = tmp_path / "runs"
+        curves_dir = tmp_path / "curves"
+        run_id = "run-1"
+        # A record of a *different* run under this run ID: what a relaunch
+        # after editing a non-identity key (e.g. training.max_steps) sees.
+        runs_dir.mkdir(parents=True)
+        (runs_dir / f"{run_id}.json").write_text(
+            json.dumps({"config_hash": "another-run", "seed": 0})
+        )
+        curves = self._curves(curves_dir, run_id)
+
+        cfg = _callbacks_cfg(runs_dir, curves_dir)
+        with pytest.raises(FileExistsError, match="different run"):
+            train.create_callbacks_reset_curves(cfg, run_id, {})
+        # The other run's curves were not deleted.
+        assert (curves / "metrics.csv").read_text() == "step,acc\n0,0.0\n"
+
+    def test_accepted_relaunch_resets_the_curves(self, tmp_path):
+        runs_dir = tmp_path / "runs"
+        curves_dir = tmp_path / "curves"
+        run_id = "run-1"
+        cfg = _callbacks_cfg(runs_dir, curves_dir)
+        runs_dir.mkdir(parents=True)
+        identity = (
+            train.config_hash(
+                OmegaConf.to_container(cfg, resolve=True), train.HASH_EXCLUDE
+            ),
+            cfg.seed,
+        )
+        (runs_dir / f"{run_id}.json").write_text(
+            json.dumps({"config_hash": identity[0], "seed": identity[1]})
+        )
+        curves = self._curves(curves_dir, run_id)
+
+        callbacks = train.create_callbacks_reset_curves(cfg, run_id, {})
+        # The relaunch is a fresh run: the stale curves directory is gone.
+        assert not curves.exists()
+        assert any(isinstance(cb, RunSummaryCallback) for cb in callbacks)
