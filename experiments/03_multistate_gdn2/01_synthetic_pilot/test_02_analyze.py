@@ -595,6 +595,26 @@ class TestReportRegistry:
         with pytest.raises(SystemExit, match="unknown report"):
             cli.expand_names(["no_such_report"])
 
+    def test_unknown_name_is_an_error_even_alongside_all(self):
+        # `all` on the line must not swallow a mistyped name: every
+        # requested name other than `all` is validated.
+        with pytest.raises(SystemExit, match="unknown report"):
+            cli.expand_names(["all", "no_such_report"])
+
+    def test_all_plus_an_excluded_report_appends_it(self):
+        # `all calibration` runs every report plus calibration, the
+        # excluded report appended after the expansion, once.
+        names, is_all = cli.expand_names(["all", "calibration"])
+        assert is_all
+        assert names == [n for n in REPORTS if n not in SUMMARY_EXCLUDES] + [
+            "calibration"
+        ]
+
+    def test_all_plus_an_included_report_does_not_duplicate(self):
+        names, is_all = cli.expand_names(["all", "primary"])
+        assert is_all
+        assert names == [n for n in REPORTS if n not in SUMMARY_EXCLUDES]
+
     def test_titles_cover_the_registry(self):
         assert set(REPORT_TITLES) == set(REPORTS)
 
@@ -889,3 +909,44 @@ class TestCommandLine:
         )
         assert result.returncode != 0
         assert "unknown report" in result.stderr
+
+    def test_unknown_report_fails_loudly_even_with_all(self, runs_dir, tmp_path):
+        # `all no_such_report` must fail the same way: `all` never
+        # hides a mistyped name.
+        result = self._run_cli(
+            "all",
+            "no_such_report",
+            "--runs-dir",
+            str(runs_dir),
+            cwd=Path(__file__).resolve().parent,
+        )
+        assert result.returncode != 0
+        assert "unknown report" in result.stderr
+
+    def test_all_plus_calibration_runs_calibration_outside_the_summary(
+        self, runs_dir, tmp_path
+    ):
+        out_dir = tmp_path / "analysis"
+        result = self._run_cli(
+            "all",
+            "calibration",
+            "--runs-dir",
+            str(runs_dir),
+            "--out-dir",
+            str(out_dir),
+            cwd=Path(__file__).resolve().parent,
+        )
+        assert result.returncode == 0, result.stderr
+        # Every report ran, calibration included: it wrote its own
+        # markdown and tables.
+        for name in REPORTS:
+            assert (out_dir / f"{name}.md").exists(), name
+        assert (out_dir / "calibration_lr.csv").exists()
+        # The summary covers every report except calibration: its
+        # section never enters it.
+        summary = (out_dir / "summary.md").read_text()
+        assert "## Calibration readings" not in summary
+        for name in REPORTS:
+            if name in SUMMARY_EXCLUDES:
+                continue
+            assert REPORT_TITLES[name] in summary, name

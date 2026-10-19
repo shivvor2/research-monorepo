@@ -8,6 +8,7 @@ requested report's tables as CSVs and its section as markdown.
 Usage:
     python 02_analyze.py                                  # every report
     python 02_analyze.py primary gates calibration        # a selection
+    python 02_analyze.py all calibration                  # everything, plus
     python 02_analyze.py --list                           # report names
     python 02_analyze.py --runs-dir runs --out-dir analysis
 
@@ -16,7 +17,9 @@ Outputs (under ``--out-dir``, default ``analysis/``):
 - ``<name>.md`` and ``<stem>.csv`` per report;
 - ``summary.md`` for ``all``: every report's section concatenated, in
   registry order. The ``calibration`` report is registered but never
-  part of ``all`` — it is a Phase-1 reading, run on its own.
+  part of ``all`` — it is a Phase-1 reading, run on its own. Naming it
+  alongside ``all`` runs it and writes its own files; its section
+  still never enters the summary.
 """
 
 import argparse
@@ -39,21 +42,26 @@ def expand_names(requested: list[str]) -> tuple[list[str], bool]:
     """Resolve the requested report names to an ordered, deduplicated list.
 
     ``all`` expands to every report except the summary excludes
-    (``calibration``); other names are kept in their given order.
+    (``calibration``). A report named alongside ``all`` that the
+    expansion leaves out is appended after it, in request order.
+    Every requested name other than ``all`` must be a registered
+    report, whatever else is on the line.
 
     Raises:
         SystemExit: Via argparse-style error listing the valid names.
     """
-    if "all" in requested:
-        return [n for n in REPORTS if n not in SUMMARY_EXCLUDES], True
-    names = []
     for name in requested:
-        if name not in REPORTS:
+        if name != "all" and name not in REPORTS:
             valid = ", ".join(["all", *REPORTS])
             raise SystemExit(f"unknown report {name!r}; available: {valid}")
-        if name not in names:
+    is_all = "all" in requested
+    names = [n for n in REPORTS if n not in SUMMARY_EXCLUDES] if is_all else []
+    for name in requested:
+        if name == "all" or name in names:
+            continue
+        if not is_all or name in SUMMARY_EXCLUDES:
             names.append(name)
-    return names, False
+    return names, is_all
 
 
 def main() -> None:
@@ -63,7 +71,10 @@ def main() -> None:
     parser.add_argument(
         "reports",
         nargs="*",
-        help="report names (default: all, which excludes calibration)",
+        help=(
+            "report names (default: all, which excludes calibration; "
+            "name calibration to add it)"
+        ),
     )
     parser.add_argument("--runs-dir", default="runs", help="run JSON root")
     parser.add_argument("--out-dir", default="analysis", help="output directory")
@@ -96,7 +107,7 @@ def main() -> None:
         (out_dir / f"{name}.md").write_text(report.markdown, encoding="utf-8")
         for stem, frame in report.tables.items():
             frame.to_csv(out_dir / f"{stem}.csv", index=False)
-        if is_all:
+        if is_all and name not in SUMMARY_EXCLUDES:
             sections.append(report.markdown)
         logger.info("Wrote %s (report %s)", out_dir, name)
 
