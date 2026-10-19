@@ -152,14 +152,52 @@ a stale curves directory first (a relaunch is a fresh run).
 
 ## Analysis
 
+The analysis answers different questions at different times, so it is
+one report per question (`pilot_analysis/`), all reading the same run
+records (`runs/<task>/*.json`); only `test_done` records enter any
+statistic.
+
 ```bash
-python 02_analyze.py            # runs/ -> analysis/ (CSVs + summary.md)
+python 02_analyze.py --list              # every report, one line each
+python 02_analyze.py                     # all: CSVs + <name>.md per report, plus summary.md
+python 02_analyze.py primary anchors     # a selection: writes only those
+python 02_analyze.py calibration         # the Phase-1 readings (never part of all)
 ```
 
-Writes the primary endpoint (Δ_int with bootstrap CIs and the
-pre-registered decision-rule readings), Δ_int for every other measured
-cell, predictions 1–4, the anchor table next to Log-Linear Table 2, λ /
-erase statistics per slot, and the missing-run report per tier.
+The reports: the primary endpoint (Δ_int with bootstrap CIs and the
+pre-registered decision-rule readings, with the uniform-decay
+robustness table next to it), Δ_int for every measured cell, one
+report per prediction (gate decomposition, transported vs the frozen
+control, λ controls), write distance, the long-sequence tier, the
+anchors next to Log-Linear Table 2, matched bytes, λ / erase
+statistics per slot, and the missing / incomplete runs. Each report
+writes `analysis/<name>.md` and its tables as `analysis/<stem>.csv`;
+`all` additionally writes `analysis/summary.md` — every report's
+section, in registry order.
+
+### Calibration report
+
+Each calibration sweep ends with a choice that is written by hand into
+`conf/frozen_protocol.yaml` and `conf/config.yaml` and committed — the
+report computes the readings, it never edits configuration files:
+
+1. run a calibration sweep (`+sweep=calib_dmodel`, then
+   `+sweep=calib_harness`, then `+sweep=calib_lr` and
+   `+sweep=calib_lr_anchors`);
+2. run `python 02_analyze.py calibration`: the d_model verdict (the
+   smallest d whose mean best validation accuracy lies in [0.5, 0.95];
+   fallback 32), the harness numbers next to the published range (a
+   judgment: keep the default unless far outside), the selected LR per
+   core configuration (best mean; ties: fewer mean steps to the best
+   value, then the smaller LR), the anchor LRs, missing runs per
+   calibration tier, and a `frozen_protocol.yaml` snippet filled from
+   the readings (`null` for the steps that have not run);
+3. copy the snippet into `conf/frozen_protocol.yaml`, make the harness
+   choice (its block stays `null` in the snippet on purpose), and set
+   the matching values in `conf/config.yaml` (`model.d_model`, and the
+   harness switches `model.layer_pattern` / `model.state_mixer`);
+4. commit before the next sweep; when everything is filled in, set
+   `frozen: true` and commit — only then can Phase 2 run.
 
 ## Device-count rule
 
