@@ -1,0 +1,13 @@
+layout,gate_mode,metric,n_seeds,mean
+ll,full,test/acc/dist=32-64,10,0.7
+ll,full,test/leak/dist=32-64,10,0.0
+ll,kda,test/acc/dist=32-64,10,0.5
+ll,kda,test/leak/dist=32-64,10,0.0
+single,full,test/acc/dist=32-64,10,0.5
+single,full,test/leak/dist=32-64,10,0.0
+single,kda,test/acc/dist=32-64,10,0.4
+single,kda,test/leak/dist=32-64,10,0.0
+ws,full,test/acc/dist=32-64,10,0.5999999999999999
+ws,full,test/leak/dist=32-64,10,0.0
+ws,kda,test/acc/dist=32-64,10,0.45
+ws,kda,test/leak/dist=32-64,10,0.0

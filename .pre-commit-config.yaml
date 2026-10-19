@@ -4,7 +4,12 @@ repos:
     hooks:
     -   id: check-yaml
     -   id: end-of-file-fixer
+        # The frozen byte-identity fixtures hold raw tool output (an empty
+        # pandas CSV is a lone newline byte); the fixer would rewrite the
+        # very bytes the tests compare against.
+        exclude: '^experiments/03_multistate_gdn2/01_synthetic_pilot/fixtures/'
     -   id: trailing-whitespace
+        exclude: '^experiments/03_multistate_gdn2/01_synthetic_pilot/fixtures/'
 -   repo: https://github.com/psf/black
     rev: 25.9.0
     hooks:
