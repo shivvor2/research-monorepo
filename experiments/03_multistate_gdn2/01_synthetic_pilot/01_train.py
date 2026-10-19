@@ -715,6 +715,66 @@ def create_callbacks(
     return callbacks
 
 
+def run_summary_callback(callbacks: list) -> RunSummaryCallback | None:
+    """The run-summary callback among ``callbacks`` (``None`` if absent)."""
+    return next((cb for cb in callbacks if isinstance(cb, RunSummaryCallback)), None)
+
+
+def post_fit(
+    cfg: DictConfig,
+    trainer: L.Trainer,
+    module: L.LightningModule,
+    callbacks: list,
+    run_id: str,
+) -> None:
+    """The post-fit steps: the fit-finished guard and the optional final
+    checkpoint.
+
+    These run outside ``trainer.fit()`` / ``trainer.test()``, so
+    Lightning's ``on_exception`` never fires for them; a failure here is
+    recorded on the run summary (``status == "failed"``,
+    ``failed_stage == "fit"``) and re-raised.
+
+    Args:
+        cfg: The resolved config (``output.save_final_checkpoint``,
+            ``output.runs_dir``).
+        trainer: The fitted trainer (its ``state.status`` must be
+            ``FINISHED``).
+        module: The training module; its ``.model`` state dict is saved
+            as the final checkpoint.
+        callbacks: The trainer's callbacks (the run-summary callback is
+            updated on failure).
+        run_id: The run ID (names the checkpoint file).
+
+    Raises:
+        RuntimeError: If the fit did not end normally.
+        The exception raised by the checkpoint save, if any.
+    """
+    try:
+        # With Lightning < 2.4, Ctrl-C made fit() return normally and
+        # the script would test a half-trained model; the lock pins
+        # >= 2.4, the guard keeps the invariant independent of that.
+        # test_done means fit ended normally AND the test pass completed
+        # on the final weights.
+        assert_fit_finished(trainer)
+        # The final checkpoint for the mechanism probes: saved after fit
+        # and before test, atomically (the test pass must never run on
+        # weights that were not saved; a partial file must never be
+        # observed).
+        if cfg.output.save_final_checkpoint:
+            path = Path(cfg.output.runs_dir) / f"{run_id}.pt"
+            atomic_torch_save(module.model.state_dict(), path)
+            logger.info("Saved final checkpoint to %s", path)
+            summary_cb = run_summary_callback(callbacks)
+            if summary_cb is not None and summary_cb.extra is not None:
+                summary_cb.extra["final_checkpoint"] = path.name
+    except BaseException as exc:
+        summary_cb = run_summary_callback(callbacks)
+        if summary_cb is not None:
+            summary_cb.on_exception(trainer, module, exc)
+        raise
+
+
 # A tiny mutable holder so create_callbacks can record the resolved LR.
 lr_resolved: dict[str, float | None] = {"value": None}
 
@@ -910,26 +970,14 @@ def main(cfg: DictConfig) -> None:
         logger.info("Starting training (run_id=%s)...", run_id)
         trainer.fit(module, datamodule=datamodule)
 
-        # 13. Post-fit guard: with Lightning < 2.4, Ctrl-C made fit()
-        # return normally and the script would test a half-trained model;
-        # the lock pins >= 2.4, the guard keeps the invariant independent
-        # of that. test_done means fit ended normally AND the test pass
-        # completed on the final weights.
-        assert_fit_finished(trainer)
+        # 13. Post-fit steps: the fit-finished guard and the optional
+        # final checkpoint. These run outside trainer.fit()/trainer.test(),
+        # so Lightning's on_exception never fires for them; post_fit
+        # records a failure on the run summary (status "failed",
+        # failed_stage "fit") and re-raises.
+        post_fit(cfg, trainer, module, callbacks, run_id)
 
-        # 14. Optional final checkpoint for the mechanism probes: saved
-        # after fit and before test, atomically (the test pass must never
-        # run on weights that were not saved; a partial file must never
-        # be observed).
-        if cfg.output.save_final_checkpoint:
-            path = Path(cfg.output.runs_dir) / f"{run_id}.pt"
-            atomic_torch_save(model.state_dict(), path)
-            logger.info("Saved final checkpoint to %s", path)
-            for cb in callbacks:
-                if isinstance(cb, RunSummaryCallback) and cb.extra is not None:
-                    cb.extra["final_checkpoint"] = path.name
-
-        # 15. Test on the final weights; the callback updates the run JSON.
+        # 14. Test on the final weights; the callback updates the run JSON.
         trainer.test(module, datamodule=datamodule)
 
         logger.info("Run complete (run_id=%s).", run_id)

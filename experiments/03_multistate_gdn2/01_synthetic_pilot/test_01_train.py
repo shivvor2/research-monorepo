@@ -19,12 +19,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import lightning as L
 import pytest
 import torch
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.trainer.states import TrainerFn, TrainerStatus
 from omegaconf import OmegaConf
 
+from research_lib.training.callbacks import RunSummaryCallback
 from research_lib.utils.run_lock import exclusive_lock
 
 _SRC = Path(__file__).resolve().parents[3] / "src"
@@ -809,6 +811,85 @@ class TestClaimRun:
         lock_path = tmp_path / "run.lock"
         with train.claim_run(lock_path, None, ("h", 0)) as reason:
             assert reason is None
+
+
+class _TinyFitModule(L.LightningModule):
+    """A minimal module for the post-fit tests: ``.model`` is a Linear."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Linear(2, 2)
+
+    def training_step(self, batch, batch_idx):
+        return self.model.weight.sum()
+
+    def configure_optimizers(self):
+        return torch.optim.SGD(self.parameters(), lr=0.1)
+
+
+def _fitted_post_fit(tmp_path, run_id="post"):
+    """A 1-step CPU fit with a run-summary callback attached."""
+    runs_dir = tmp_path / "runs"
+    cb = RunSummaryCallback(runs_dir, run_id, {"seed": 0}, strict=True)
+    trainer = L.Trainer(
+        max_steps=1,
+        accelerator="cpu",
+        logger=False,
+        enable_progress_bar=False,
+        callbacks=[cb],
+        num_sanity_val_steps=0,
+        limit_val_batches=0,
+    )
+    module = _TinyFitModule()
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(torch.zeros(8, 2), torch.zeros(8, 2)),
+        batch_size=4,
+    )
+    trainer.fit(module, train_dataloaders=loader)
+    return cb, trainer, module, runs_dir
+
+
+class TestPostFit:
+    """Failures after fit() must reach the run record: the guard and the
+    checkpoint save run outside trainer.fit()/trainer.test(), so
+    Lightning's on_exception never fires for them; post_fit records the
+    failure itself (status "failed", failed_stage "fit")."""
+
+    def test_checkpoint_failure_reaches_the_record(self, tmp_path, monkeypatch):
+        cb, trainer, module, runs_dir = _fitted_post_fit(tmp_path, "ckpt")
+        cfg = OmegaConf.create(
+            {"output": {"save_final_checkpoint": True, "runs_dir": str(runs_dir)}}
+        )
+
+        def boom(*args, **kwargs):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(train, "atomic_torch_save", boom)
+        with pytest.raises(OSError, match="disk full"):
+            train.post_fit(cfg, trainer, module, [cb], "ckpt")
+        record = json.loads((runs_dir / "ckpt.json").read_text())
+        assert record["status"] == "failed"
+        assert "OSError" in record["error"] and "disk full" in record["error"]
+        assert record["failed_stage"] == "fit"
+
+    def test_guard_failure_reaches_the_record(self, tmp_path):
+        runs_dir = tmp_path / "runs"
+        cb = RunSummaryCallback(runs_dir, "guard", {"seed": 0}, strict=True)
+        trainer = SimpleNamespace(
+            state=SimpleNamespace(
+                status=TrainerStatus.INTERRUPTED, fn=TrainerFn.FITTING
+            ),
+            is_global_zero=True,
+        )
+        cfg = OmegaConf.create(
+            {"output": {"save_final_checkpoint": False, "runs_dir": str(runs_dir)}}
+        )
+        with pytest.raises(RuntimeError, match="not FINISHED"):
+            train.post_fit(cfg, trainer, _TinyFitModule(), [cb], "guard")
+        record = json.loads((runs_dir / "guard.json").read_text())
+        assert record["status"] == "failed"
+        assert "not FINISHED" in record["error"]
+        assert record["failed_stage"] == "fit"
 
 
 class TestStopRequested:
