@@ -9,10 +9,11 @@ the full path already gives them exactly zero gradient
 nothing after it mixes positions, and the metrics read only positions in
 :math:`A`.  So computing the head only on :math:`A` gives the same loss,
 the same gradients for every parameter and the same metrics, in exact
-arithmetic; in floating point the results differ at rounding level
-(different matmul shapes and reduction order), which is why this lands
-before the first protocol run.  The trunk (embedding, mixers, final
-norm) still runs on every position.
+arithmetic.  In floating point the two paths differ at rounding level
+(different matmul shapes and reduction order), so runs with the
+answer-position head and with the full head are not bit-identical;
+``training.answer_head`` is therefore part of the run identity.  The
+trunk (embedding, mixers, final norm) still runs on every position.
 
 The helpers are not task-specific: any causal LM with ``-100`` labels
 can use them.

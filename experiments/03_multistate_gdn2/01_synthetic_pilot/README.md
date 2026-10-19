@@ -99,9 +99,11 @@ each position separately, nothing after it mixes positions, and the
 metrics read only answer positions — so the loss, every gradient and
 every metric are identical to the full head in exact arithmetic (the
 fp64 equivalence tests in `src/research_lib/training/tests/` check
-this). In floating point the results differ at rounding level (different
-matmul shapes and reduction order), which is why this lands before the
-first protocol run. `training.answer_head: false` restores the full head
+this). In floating point the two paths differ at rounding level
+(different matmul shapes and reduction order), so runs with the
+answer-position head and with the full head are not bit-identical;
+`training.answer_head` is therefore part of the run identity.
+`training.answer_head: false` restores the full head
 (for checks only; it changes the run identity).
 
 ## Running, stopping and continuing
@@ -147,7 +149,6 @@ the second one skips it.
 **Curves.** The CSV logger writes next to the run records:
 `runs/<task>/curves/<run_id>/version_0/metrics.csv`. A relaunch removes
 a stale curves directory first (a relaunch is a fresh run).
-
 
 ## Analysis
 
