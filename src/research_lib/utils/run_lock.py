@@ -12,6 +12,7 @@ Run tests with::
 
 from __future__ import annotations
 
+import errno
 import fcntl
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -27,6 +28,13 @@ def exclusive_lock(path: Path | str) -> Generator[bool, None, None]:
     (also on SIGKILL). Linux/POSIX only; per host: not reliable on
     network filesystems.
 
+    Only lock **contention** yields ``False`` (``EWOULDBLOCK`` /
+    ``EAGAIN`` from the non-blocking ``flock``): every other
+    :class:`OSError` propagates, so a filesystem whose ``flock`` does not
+    work at all (``ENOLCK`` / ``EOPNOTSUPP`` on some network or FUSE
+    mounts) fails the run loudly instead of silently skipping it as
+    "running in another process".
+
     Args:
         path: Lock file path (its parent is created; the file itself is
             created empty if missing and left on disk).
@@ -40,7 +48,9 @@ def exclusive_lock(path: Path | str) -> Generator[bool, None, None]:
     with open(path, "a+") as f:
         try:
             fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        except OSError as e:
+            if e.errno not in (errno.EWOULDBLOCK, errno.EAGAIN):
+                raise
             yield False
             return
         try:

@@ -4,6 +4,8 @@ Target: src/research_lib/utils/run_lock.py
 Run with: pytest src/research_lib/utils/tests/test_run_lock.py -v
 """
 
+import errno
+
 import pytest
 
 from research_lib.utils.run_lock import exclusive_lock
@@ -44,3 +46,32 @@ class TestExclusiveLock:
                 raise RuntimeError("boom")
         with exclusive_lock(path) as again:
             assert again is True
+
+
+class TestLockErrorsPropagate:
+    """Only lock contention yields False; every other OSError from
+    flock (ENOLCK / EOPNOTSUPP on a filesystem without working flock,
+    EINTR, ...) propagates instead of silently skipping every run."""
+
+    def test_enolck_propagates(self, tmp_path, monkeypatch):
+        import fcntl
+
+        def raise_enolck(*args, **kwargs):
+            raise OSError(errno.ENOLCK, "no record locks available")
+
+        monkeypatch.setattr(fcntl, "flock", raise_enolck)
+        with (
+            pytest.raises(OSError, match="no record locks"),
+            exclusive_lock(tmp_path / "run.lock"),
+        ):
+            pass  # pragma: no cover - never reached
+
+    def test_ewouldblock_still_yields_false(self, tmp_path, monkeypatch):
+        import fcntl
+
+        def raise_ewouldblock(*args, **kwargs):
+            raise OSError(errno.EWOULDBLOCK, "resource temporarily unavailable")
+
+        monkeypatch.setattr(fcntl, "flock", raise_ewouldblock)
+        with exclusive_lock(tmp_path / "run.lock") as acquired:
+            assert acquired is False
