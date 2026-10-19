@@ -575,6 +575,71 @@ def parse_worker_result(output: str) -> dict[str, Any] | None:
     return None
 
 
+def run_worker_processes(
+    command: Sequence[str], n: int, timeout_s: float
+) -> tuple[list[tuple[int | str, dict[str, Any] | None]], list[subprocess.Popen]]:
+    """Launch ``n`` copies of ``command`` and wait for each with the
+    timeout; reap every straggler in a ``finally``.
+
+    A worker that does not finish within ``timeout_s`` is reported as
+    ``("timeout", None)`` (a failed worker). Whatever happens — a
+    timeout, an unexpected error, a Ctrl-C — the ``finally`` terminates
+    every still-running worker, gives it 10 s to exit, then kills and
+    reaps it, so a hung worker can neither block the benchmark forever
+    nor keep running on the GPU past its group.
+
+    Args:
+        command: The command line (the worker's program and overrides).
+        n: How many copies to launch.
+        timeout_s: Per-worker wait timeout, seconds.
+
+    Returns:
+        ``(outputs, processes)``: per worker ``(returncode, parsed
+        BENCH_RESULT dict)`` or ``("timeout", None)``; the processes,
+        all reaped (``poll() is not None``).
+    """
+    processes: list[subprocess.Popen] = []
+    outputs: list[tuple[int | str, dict[str, Any] | None]] = []
+    try:
+        for _ in range(int(n)):
+            processes.append(
+                subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            )
+        for process in processes:
+            try:
+                output, _ = process.communicate(timeout=timeout_s)
+                outputs.append((process.returncode, parse_worker_result(output)))
+            except subprocess.TimeoutExpired:
+                outputs.append(("timeout", None))
+    finally:
+        for process in processes:
+            if process.poll() is None:
+                process.terminate()
+        deadline = time.monotonic() + 10.0
+        for process in processes:
+            if process.poll() is not None:
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                pass
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+        for process in processes:
+            if process.poll() is None:
+                process.wait()
+    return outputs, processes
+
+
 def summarize_group(
     worker_outputs: Sequence[tuple[int | str, dict[str, Any] | None]],
     first_aggregate: float | None = None,
@@ -716,26 +781,15 @@ def run_concurrency_groups(
             n,
             margin,
         )
-        processes = [
-            subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            for _ in range(int(n))
-        ]
-        worker_outputs: list[tuple[int | str, dict[str, Any] | None]] = []
-        for process in processes:
-            output = process.communicate()[0]
-            if process.returncode != 0:
-                tail = "\n".join(output.splitlines()[-5:])
-                logger.error(
-                    "benchmark worker failed (exit %s):\n%s",
-                    process.returncode,
-                    tail,
-                )
-            worker_outputs.append((process.returncode, parse_worker_result(output)))
+        # The wait timeout covers the start margin, the window and a
+        # fixed allowance for warmup and exit; a worker that outlives it
+        # is timed out, counted as failed, and terminated (see
+        # run_worker_processes).
+        timeout_s = margin + seconds + 120.0
+        worker_outputs, processes = run_worker_processes(command, int(n), timeout_s)
+        for status, _ in worker_outputs:
+            if status not in (0, "timeout"):
+                logger.error("benchmark worker failed (exit %s)", status)
         first_aggregate = groups[0].get("aggregate_steps_per_s") if groups else None
         group = summarize_group(worker_outputs, first_aggregate)
         group["n"] = int(n)

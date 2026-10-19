@@ -434,6 +434,26 @@ class TestSynchronizedWindows:
         assert group["workers"][1]["late"] is True
 
 
+class TestWorkerLifecycle:
+    """A hung worker times out, counts as failed, and is reaped — it can
+    never block the benchmark or run on past its group."""
+
+    def test_worker_timeout_is_reaped_and_counts_as_failed(self):
+        outputs, processes = bench.run_worker_processes(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            n=1,
+            timeout_s=1.0,
+        )
+        assert outputs == [("timeout", None)]
+        group = bench.summarize_group(outputs)
+        assert group["failed"] == 1
+        assert group["aggregate_steps_per_s"] is None
+        assert group["speedup"] is None
+        # Every launched process was terminated and reaped.
+        for process in processes:
+            assert process.poll() is not None
+
+
 class TestSummary:
     """summary.md has the expected sections; on CPU the GPU-only parts
     are skipped with a clear note."""
