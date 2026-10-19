@@ -56,6 +56,10 @@ from pilot_analysis.protocol import (
     TIER_CALIB_LR_ANCHORS,
 )
 
+# The W&B run-record artifact contract, shared with 03_pull.py: the
+# artifact name, the metadata, and the paths inside the artifact.
+from wandb_artifacts import artifact_name, run_record_metadata
+
 # Library imports
 from research_lib.architectures.config import ZoologyLMConfig
 from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
@@ -808,13 +812,121 @@ def post_fit(
 lr_resolved: dict[str, float | None] = {"value": None}
 
 
+def wandb_logger_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
+    """The W&B logger keyword arguments of one run.
+
+    One W&B run per pilot run, named by the run ID (the run record's
+    name); the tier becomes the W&B group, the phase the job type, and
+    the experiment / task / model identity the tags, so the runs of
+    later experiments of the project stay apart inside the same W&B
+    project (the experiment name is the first tag). The resolved
+    config is passed to W&B for browsing.
+
+    Args:
+        cfg: The resolved configuration (``logging.wandb.*``,
+            ``experiment.*``, ``task.name``, ``model.*``).
+        run_id: The run ID (also the run record's file stem).
+
+    Returns:
+        The keyword arguments for ``lightning.pytorch.loggers.WandbLogger``.
+    """
+    tier = cfg.experiment.get("tier", None)
+    entity = cfg.logging.wandb.get("entity", None)
+    return {
+        "project": str(cfg.logging.wandb.project),
+        "entity": str(entity) if entity else None,
+        "name": run_id,
+        "group": str(tier) if tier else "none",
+        "job_type": f"phase{cfg.experiment.phase}",
+        "tags": [
+            str(cfg.experiment.name),
+            str(cfg.task.name),
+            str(cfg.model.layout),
+            str(cfg.model.gate_mode),
+            str(cfg.model.lambda_mode),
+            f"d{cfg.model.d_model}",
+        ],
+        "config": OmegaConf.to_container(cfg, resolve=True),
+        "save_dir": "logs/wandb",
+        "log_model": False,
+    }
+
+
+def upload_run_record_artifact(cfg: DictConfig, run_id: str) -> None:
+    """Upload a completed run to W&B as a ``run_record`` artifact.
+
+    Runs only when W&B is enabled and ``logging.wandb.upload_record`` is
+    set. The artifact's paths are the 03_pull.py contract: the run JSON
+    as ``<task>/<run_id>.json``, the curves CSV as
+    ``<task>/curves/<run_id>/metrics.csv`` and, when
+    ``logging.wandb.upload_checkpoint`` is set and the final checkpoint
+    was saved, ``<task>/<run_id>.pt``. The metadata carries the run's
+    identity and provenance, so the pull script can decide skip /
+    conflict / download without fetching the artifact.
+
+    An upload failure is logged at ERROR level and does not fail the
+    run: the local record is already ``test_done``, and
+    ``03_pull.py --check`` reports what the canonical store still
+    misses. The job waits for the upload (``artifact.wait()``) so it
+    does not end before the artifact is complete.
+    """
+    if not bool(cfg.logging.wandb.enabled) or not bool(cfg.logging.wandb.upload_record):
+        return
+    try:
+        import wandb
+        from wandb import Artifact
+
+        record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
+        if not record_path.exists():
+            logger.error(
+                "run record %s not found; skipping the W&B artifact upload",
+                record_path,
+            )
+            return
+        with open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+        if record.get("status") != "test_done":
+            logger.error(
+                "run record %s has status %r, not test_done; skipping the W&B "
+                "artifact upload",
+                record_path,
+                record.get("status"),
+            )
+            return
+        if wandb.run is None:
+            logger.error("no live W&B run; skipping the artifact upload")
+            return
+        task = str(cfg.task.name)
+        artifact = Artifact(
+            artifact_name(run_id),
+            type="run_record",
+            metadata=run_record_metadata(record),
+        )
+        artifact.add_file(record_path, name=f"{task}/{run_id}.json")
+        curves = Path(cfg.logging.csv.save_dir) / run_id / "version_0" / "metrics.csv"
+        if curves.exists():
+            artifact.add_file(curves, name=f"{task}/curves/{run_id}/metrics.csv")
+        if bool(cfg.logging.wandb.upload_checkpoint):
+            checkpoint = Path(cfg.output.runs_dir) / f"{run_id}.pt"
+            if checkpoint.exists():
+                artifact.add_file(checkpoint, name=f"{task}/{run_id}.pt")
+        wandb.log_artifact(artifact)
+        artifact.wait()  # the job must not end before the upload completes
+        logger.info("Uploaded run record artifact %s", artifact_name(run_id))
+    except Exception as exc:  # an upload failure never fails a completed run
+        logger.error("W&B artifact upload failed for %s: %s", run_id, exc)
+
+
 def create_loggers(cfg: DictConfig, run_id: str) -> list | None:
     """CSV (next to the run records) and optional W&B loggers.
 
     The CSV logger writes under ``<save_dir>/<run_id>/version_0``, so the
     curves of one run live next to its run JSON (``runs/<task>/curves/``
     in the base config; the smoke and debug configs keep their own
-    ``save_dir``).
+    ``save_dir``). The W&B logger gets one run per pilot run (see
+    :func:`wandb_logger_kwargs`); ``wandb.finish()`` closes it at the
+    end of the job (:func:`main`), so the next job of a Hydra multirun
+    starts its own run.
     """
     loggers = []
     if cfg.logging.csv.enabled:
@@ -822,15 +934,7 @@ def create_loggers(cfg: DictConfig, run_id: str) -> list | None:
             CSVLogger(save_dir=cfg.logging.csv.save_dir, name=run_id, version=0)
         )
     if cfg.logging.wandb.enabled:
-        wandb_kwargs = {
-            "project": cfg.logging.wandb.project,
-            "name": cfg.experiment.name,
-            "save_dir": "logs/wandb",
-            "log_model": False,
-        }
-        if cfg.logging.wandb.entity is not None:
-            wandb_kwargs["entity"] = cfg.logging.wandb.entity
-        loggers.append(WandbLogger(**wandb_kwargs))
+        loggers.append(WandbLogger(**wandb_logger_kwargs(cfg, run_id)))
     return loggers if loggers else None
 
 
@@ -841,9 +945,46 @@ def create_loggers(cfg: DictConfig, run_id: str) -> list | None:
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
-    """Run one pilot training run (fit + test) and write the run JSON."""
+    """Run one pilot training run (fit + test) and write the run JSON.
+
+    W&B credentials are required before anything is built when W&B is
+    enabled, so a misconfigured rented machine fails fast. The W&B run
+    is closed after the job no matter how it ends: in a Hydra multirun
+    all jobs share one process, and a job that does not close its run
+    makes the next job reuse it (its log lines and curves land in the
+    first job's run). The exit code records the outcome on the run W&B
+    shows; a job that raised also propagates its exception.
+    """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    if bool(cfg.logging.wandb.enabled):
+        # The repo-root .env is loaded by research_lib.utils.secrets at
+        # import; on a rented machine the key comes from the
+        # environment. Only W&B is needed here (no other service).
+        from research_lib.utils.secrets import check_auth
+
+        check_auth(["WANDB_API_KEY"])
+
+    error: BaseException | None = None
+    try:
+        run_job(cfg)
+    except BaseException as exc:
+        error = exc
+        raise
+    finally:
+        if bool(cfg.logging.wandb.enabled):
+            import wandb
+
+            if wandb.run is not None:
+                wandb.finish(exit_code=1 if error is not None else 0)
+
+
+def run_job(cfg: DictConfig) -> None:
+    """The body of one pilot run (fit + test) and the run JSON write.
+
+    Wrapped by :func:`main`, which checks the W&B credentials first and
+    closes the W&B run afterwards.
+    """
     # 0. Precision first: fp32 without TF32. The cuDNN
     # switch defaults to on, and BaseConv / the short convs run through
     # cuDNN; the matmul switch covers the reference layers' fp32 matmuls.
@@ -1005,6 +1146,13 @@ def main(cfg: DictConfig) -> None:
 
         # 13. Test on the final weights; the callback updates the run JSON.
         trainer.test(module, datamodule=datamodule)
+
+        # 14. W&B artifact (rented machines): the completed run's
+        # record, curve and optionally its checkpoint go to W&B, where
+        # 03_pull.py picks them up for the canonical store. The upload
+        # waits for completion but never fails the run (the local
+        # record is already test_done).
+        upload_run_record_artifact(cfg, run_id)
 
         logger.info("Run complete (run_id=%s).", run_id)
 
