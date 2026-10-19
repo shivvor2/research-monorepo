@@ -568,11 +568,6 @@ def worker_main(cfg: DictConfig) -> None:
         warmup_steps,
         f", shared start {start_at:.0f}" if start_at is not None else "",
     )
-    L.seed_everything(0)
-    module = build_benchmark_module(cfg, lr).to(device)
-    optimizers = optimizers_of(module)
-    dm = make_datamodule(cfg, batch_size, num_workers=int(cfg.data.num_workers))
-    batches = iter(dm.train_dataloader())
     result: dict[str, Any] = {
         "steps": 0,
         "elapsed_s": 0.0,
@@ -581,6 +576,11 @@ def worker_main(cfg: DictConfig) -> None:
         "late": False,
     }
     try:
+        L.seed_everything(0)
+        module = build_benchmark_module(cfg, lr).to(device)
+        optimizers = optimizers_of(module)
+        dm = make_datamodule(cfg, batch_size, num_workers=int(cfg.data.num_workers))
+        batches = iter(dm.train_dataloader())
         if device.type == "cuda":
             torch.cuda.reset_peak_memory_stats(device)
         for _ in range(warmup_steps):
@@ -604,7 +604,13 @@ def worker_main(cfg: DictConfig) -> None:
         if device.type == "cuda":
             result["peak_memory_bytes"] = int(torch.cuda.max_memory_allocated(device))
     except torch.cuda.OutOfMemoryError:
+        # The build is inside the guard too: under memory pressure with
+        # several peers, a model build (not just a step) can OOM, and
+        # the worker must report it cleanly instead of crashing or
+        # dying without a BENCH_RESULT line.
         result["oom"] = True
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
     print(f"BENCH_RESULT {json.dumps(result)}", flush=True)
 
 
@@ -655,7 +661,14 @@ def run_worker_processes(
             try:
                 output, _ = process.communicate(timeout=timeout_s)
                 outputs.append((process.returncode, parse_worker_result(output)))
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as exc:
+                partial = (exc.output or b"").decode(errors="replace")
+                tail = "\n".join(partial.splitlines()[-10:])
+                logger.error(
+                    "benchmark worker timed out after %.0f s; partial output:\n%s",
+                    timeout_s,
+                    tail or "(no output)",
+                )
                 outputs.append(("timeout", None))
     finally:
         for process in processes:

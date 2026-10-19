@@ -453,6 +453,25 @@ class TestWorkerLifecycle:
         for process in processes:
             assert process.poll() is not None
 
+    def test_timeout_logs_the_workers_partial_output(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger=bench.__name__):
+            outputs, _ = bench.run_worker_processes(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    "import time; print('ALIVE'); time.sleep(60)",
+                ],
+                n=1,
+                timeout_s=1.0,
+            )
+        assert outputs == [("timeout", None)]
+        # The partial output is logged, so a hung worker is diagnosable.
+        assert any("timed out" in record.message for record in caplog.records)
+        assert any("ALIVE" in record.message for record in caplog.records)
+
 
 class TestBusyFraction:
     """The busy reading uses the unprofiled step time as its
