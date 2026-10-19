@@ -12,10 +12,13 @@ fewer mean steps to the best value, then the smaller LR. The report
 computes the readings; the frozen-protocol snippet mirrors them.
 """
 
+import json
+
 import pandas as pd
 import pytest
 from omegaconf import OmegaConf
 from pilot_analysis.protocol import CALIBRATION_TIERS, DMODEL_FALLBACK, SELECTION_SEEDS
+from pilot_analysis.records import load_runs
 from pilot_analysis.reports import calibration
 
 
@@ -241,6 +244,51 @@ class TestLRSelection:
         assert selected.iloc[0]["n_seeds"] == 2
         assert selected.iloc[0]["mean_best_acc"] == pytest.approx(0.81)
         assert selected.iloc[0]["mean_best_step"] == pytest.approx(22)
+
+    def test_inherited_lr_read_from_the_record_s_lr_resolved(self, tmp_path):
+        # optimizer.lr is null on the command line: the training script
+        # resolves the LR from the frozen table and records the value
+        # the run actually used as lr_resolved. The reading must enter
+        # that run at the resolved LR, not drop it for lacking a grid
+        # point.
+        for seed in SELECTION_SEEDS:
+            run = {
+                "run_id": f"calib_lr-overwrite-ws-full-d32-s{seed}",
+                "config": {
+                    "model": {
+                        "layout": "ws",
+                        "gate_mode": "full",
+                        "lambda_mode": "mlp",
+                        "d_model": 32,
+                        "num_heads": 2,
+                        "head_dim": None,
+                        "layer_pattern": "zoology",
+                        "state_mixer": "none",
+                    },
+                    "task": {"name": "overwrite"},
+                    "experiment": {"tier": "calib_lr", "phase": 1},
+                    "optimizer": {"lr": None},
+                },
+                "seed": seed,
+                "lr_resolved": 0.003,
+                "stopping": {
+                    "early_stopped": False,
+                    "best_value": 0.8,
+                    "best_step": 20,
+                },
+                "status": "test_done",
+            }
+            (tmp_path / f"r{seed}.json").write_text(json.dumps(run))
+        table = load_runs(tmp_path)
+        assert set(table["lr"]) == {0.003}
+        readings = calibration.run(table)
+        lr_table = readings["lr"]
+        assert len(lr_table) == 1
+        assert lr_table.iloc[0]["lr"] == 0.003
+        assert bool(lr_table.iloc[0]["selected"])
+        # The snippet carries the resolved selection.
+        snippet = OmegaConf.create(readings["snippet"])
+        assert snippet.lr_table.overwrite.ws.full == 0.003
 
     def test_rows_without_lr_never_enter_a_selection(self):
         rows = [

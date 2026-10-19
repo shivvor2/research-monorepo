@@ -18,6 +18,12 @@ def load_runs(runs_dir: Path) -> pd.DataFrame:
     lambda_mode, d_model, head_dim, layer_pattern, state_mixer, lr, seed,
     tier, phase, decay_scheme), stopping (early_stopped, best_value,
     best_step) and the test metrics into ``test/<key>`` columns.
+
+    The ``lr`` column is the learning rate the run actually used: the
+    record's top-level ``lr_resolved`` (the training script resolves a
+    null ``optimizer.lr`` from the frozen table and stores the value it
+    used), falling back to ``config.optimizer.lr`` only for records that
+    predate ``lr_resolved``.
     """
     records = []
     for path in sorted(runs_dir.glob("**/*.json")):
@@ -42,7 +48,11 @@ def load_runs(runs_dir: Path) -> pd.DataFrame:
             "head_dim": model.get("head_dim"),
             "layer_pattern": model.get("layer_pattern"),
             "state_mixer": model.get("state_mixer"),
-            "lr": (cfg.get("optimizer") or {}).get("lr"),
+            "lr": (
+                summary["lr_resolved"]
+                if "lr_resolved" in summary
+                else (cfg.get("optimizer") or {}).get("lr")
+            ),
             "seed": summary.get("seed"),
             "tier": (cfg.get("experiment") or {}).get("tier"),
             "phase": (cfg.get("experiment") or {}).get("phase"),
