@@ -1,0 +1,59 @@
+# =============================================================================
+# Benchmark config: the Phase-1 timing step (00_benchmark.py)
+# =============================================================================
+# Usage:
+#   python 00_benchmark.py                                  # full pass (GPU)
+#   python 00_benchmark.py bench.d_models=[64]              # a shorter pass
+#   python 00_benchmark.py bench.concurrency_seconds=30     # faster groups
+#
+# Measures, per core configuration (task x layout x gate x width):
+# step time at batch sizes 64/128/256, peak memory, the GPU-busy
+# fraction from the profiler, data-generation time per batch and the
+# time of one validation pass; then the aggregate throughput of 1, 2
+# and 4 concurrent runs on one GPU; and from those an upper-bound
+# estimate of the grid's GPU-hours per tier and per phase.
+# Writes bench/<YYYY-MM-DD_HH-MM-SS>/{bench.json,summary.md} under the
+# launch directory (git-ignored).
+
+defaults:
+  - config
+  - _self_
+
+experiment:
+  tier: bench
+
+optimizer:
+  # The frozen-protocol LR when present, 0.003 otherwise; the LR does
+  # not affect timing (it only scales the AdamW update).
+  lr: null
+
+bench:
+  d_models: [32, 64]
+  tasks: [overwrite, mqar]     # "overwrite" runs as overwrite_dk32 at d 64
+  layouts: [single, ws, fs, ll]
+  gate_modes: [kda, full]
+  extra_variants:              # measured at batch size 256 only
+    - [model.layout=single, model.gate_mode=full, model.expand_v=10]  # tier 5
+    - [task=mqar_longT, model.layout=ll, model.gate_mode=full]        # long-T
+  batch_sizes: [64, 128, 256]
+  warmup_steps: 10
+  measure_steps: 30
+  profile_steps: 10
+  data_batches: 10
+  concurrency: [1, 2, 4]
+  concurrency_seconds: 60
+  # Internal (like task_file): the shared window's start (epoch s), set
+  # by the parent in worker mode. Every worker of a group steps until
+  # start_at + concurrency_seconds, so the timed windows overlap; a
+  # worker that only joins late reports it (the group's speedup may
+  # then read high).
+  start_at: null
+  # The parent adds this margin, plus 15 s per worker, to the window
+  # start, so the workers are warmed up before it opens. Too small:
+  # workers start late and the group is marked synchronized: false.
+  start_margin_s: 60
+  mode: main        # main | worker (internal: one concurrency worker)
+  task_file: mqar   # internal: the task-file label (set by the parent in
+                    # worker mode; the task file of "overwrite" at d 64,
+                    # and the only way to tell mqar_longT from mqar, whose
+                    # task files share the task name)

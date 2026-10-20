@@ -235,6 +235,8 @@ perfectly while DDP mostly adds communication overhead.
   curves of each run, next to its record.
 - `runs/<task>/<run_id>.lock` — empty per-run lock file (not a record;
   the analysis reads only `*.json`).
+- `bench/<timestamp>/{bench.json,summary.md}` — the timing benchmark
+  outputs (git-ignored).
 - `logs/` — optional wandb logs; `outputs/`, `multirun/` — hydra job
   dirs; `analysis/` — the analysis output. All git-ignored.
 - Final checkpoints are **off** by default (`output.save_final_checkpoint`):
@@ -253,6 +255,55 @@ perfectly while DDP mostly adds communication overhead.
    sides).
 3. Lock the environment: record `pip freeze` plus torch/CUDA versions
    with the experiment (they are in every run JSON under `versions`).
+
+## Timing (benchmark)
+
+Before any protocol run, measure the machine: `00_benchmark.py` reports,
+per core configuration (task x layout x gate, at d in {32, 64}), the
+median ms per training step at batch sizes 64/128/256, the peak memory,
+the GPU-busy fraction from the profiler, the data-generation time per
+batch, the time of one validation pass, and the aggregate throughput of
+1, 2 and 4 concurrent runs on one GPU:
+
+```bash
+python 00_benchmark.py                 # a few minutes; writes bench/<timestamp>/
+```
+
+It reuses the training script's builders, measured batches are
+pre-generated (data generation is excluded from the step time), and the
+validation pass is the real one (loss plus metrics over the fixed
+validation set). The concurrency workers are subprocesses of the same
+script with the variant's config overrides, so they compose the exact
+config the training script would.
+
+Read `bench/<timestamp>/summary.md` for:
+
+- **overhead-bound / throughput-bound / data-bound** per configuration:
+  overhead-bound means the step time is nearly flat in the batch size
+  (kernel launches, Python) — run several independent runs per GPU;
+  throughput-bound means it grows with the batch size — one run per
+  GPU; data-bound means the data time per batch exceeds the step time
+  times `data.num_workers` — raise the worker count;
+- **runs per GPU**: the smallest concurrency whose aggregate throughput
+  is within 10% of the best measured;
+- the **grid estimate**: upper-bound GPU-hours per tier and per phase
+  (no early stopping; test ~ validation), the wall clock at the
+  **measured speedup** of the recommended runs per GPU (N runs side by
+  side are not N times faster), and whether Phase 1 + Phase 2 exceed
+  the one-week budget (then rent).
+
+The summary ends with a **cross-check**: one real 1,000-step run of the
+core configuration. The run's `timing.steps_per_second` is steps per
+second, the benchmark's step time is ms per step — convert with
+**ms per step = 1000 / `steps_per_second`**. The real run also pays for
+data loading, logging and the two validation passes, so its step time
+should come out somewhat **slower** than the benchmark's, not equal to
+it.
+
+On a machine without CUDA the benchmark measures **one** variant (step
+time, data time, validation time) as a smoke check and reports the rest
+of the grid and the GPU-only readings (busy fraction, peak memory,
+concurrency) as not measured in the summary.
 
 ## Reference timings
 
