@@ -52,6 +52,7 @@ readings (busy fraction, peak memory, concurrency) are skipped with a
 note, and the grid estimate reports what is not measured.
 """
 
+import gc
 import hashlib
 import importlib.util
 import itertools
@@ -1256,6 +1257,34 @@ def device_info() -> dict[str, Any]:
 # =============================================================================
 
 
+def prepare_concurrency(device: torch.device) -> int | None:
+    """The parent's reserved CUDA memory just before the concurrency
+    workers launch, after releasing everything the measurement stage
+    left behind.
+
+    The measurement functions' locals (the last module and its
+    optimizers, the profiler buffers, the validation batches) are
+    unreachable by the time the concurrency stage starts, but the
+    caching allocator still holds every block they freed, and the
+    workers that launch next each reserve 2+ GB — the parent's retained
+    footprint can be what tips the card over. Collect any cycles, empty
+    the caching allocator back to the driver, and report what the
+    allocator has reserved.
+
+    Args:
+        device: The device the benchmark measured on.
+
+    Returns:
+        ``torch.cuda.memory_reserved()`` in bytes after the release, or
+        ``None`` without CUDA (nothing to release).
+    """
+    if device.type != "cuda":
+        return None
+    gc.collect()
+    torch.cuda.empty_cache()
+    return torch.cuda.memory_reserved(device)
+
+
 def write_bench_json(results: Mapping[str, Any], out_dir: Path) -> None:
     """A snapshot of the results dict as ``out_dir/bench.json``, atomically.
 
@@ -1507,7 +1536,11 @@ def measure_all(cfg: DictConfig, device: torch.device, out_dir: Path) -> dict[st
     # the recommended runs-per-GPU reading is anchored on. The stage is
     # protected: a failure must never discard the measurements already
     # made — it is recorded in the notes and the estimate and the
-    # summary still run.
+    # summary still run. The parent releases its GPU memory first (the
+    # caching allocator holds the measurement stage's freed blocks; with
+    # several 2+ GB workers about to start, that footprint can tip the
+    # card over), and the reserved size is recorded with the runs.
+    results["parent_reserved_bytes_before_concurrency"] = prepare_concurrency(device)
     for d_model in cfg.bench.d_models:
         task_file = task_file_for("overwrite", int(d_model))
         try:
@@ -1757,6 +1790,14 @@ def render_summary(results: Mapping[str, Any]) -> str:
 
     lines.append("## Concurrency (runs per GPU)")
     lines.append("")
+    parent_reserved = results.get("parent_reserved_bytes_before_concurrency")
+    if parent_reserved is not None:
+        lines.append(
+            f"The parent's reserved CUDA memory just before the workers "
+            f"launched (after its release pass): "
+            f"{parent_reserved / 2 ** 20:.0f} MB."
+        )
+        lines.append("")
     if not results["concurrency"] or any(
         group.get("skipped")
         for entry in results["concurrency"]

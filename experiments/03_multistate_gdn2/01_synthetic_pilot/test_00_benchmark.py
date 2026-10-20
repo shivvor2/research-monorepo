@@ -396,7 +396,7 @@ class TestSynchronizedWindows:
     def test_on_time_worker_uses_the_shared_window(self, capsys):
         cfg = make_bench_cfg()
         cfg.bench.concurrency_seconds = 1
-        cfg.bench.start_at = time.time() + 1.0
+        cfg.bench.start_at = time.time() + 5.0  # comfortable build margin
         bench.worker_main(cfg)
         result = bench.parse_worker_result(capsys.readouterr().out)
         assert result is not None
@@ -490,6 +490,38 @@ class TestBusyFraction:
         assert bench.busy_fraction(50_000.0, 10, 0.0) == 0.0
 
 
+class TestParentMemoryRelease:
+    """The parent releases its GPU memory before the concurrency workers
+    launch: the caching allocator holds the measurement stage's freed
+    blocks (the last module and optimizers, the profiler, the validation
+    sets), and the workers each reserve 2+ GB — the parent's retained
+    footprint can be what tips the card over."""
+
+    def test_prepare_concurrency_empty_caches_when_cuda(self, monkeypatch):
+        releases = {"n": 0}
+
+        def fake_empty_cache():
+            releases["n"] += 1
+
+        monkeypatch.setattr(bench.torch.cuda, "empty_cache", fake_empty_cache)
+        monkeypatch.setattr(
+            bench.torch.cuda, "memory_reserved", lambda device=None: 1_234_567_890
+        )
+        reserved = bench.prepare_concurrency(torch.device("cuda"))
+        assert reserved == 1_234_567_890
+        assert releases["n"] == 1  # the cache was emptied once
+
+    def test_prepare_concurrency_without_cuda_does_nothing(self, monkeypatch):
+        releases = {"n": 0}
+
+        def fake_empty_cache():
+            releases["n"] += 1
+
+        monkeypatch.setattr(bench.torch.cuda, "empty_cache", fake_empty_cache)
+        assert bench.prepare_concurrency(torch.device("cpu")) is None
+        assert releases["n"] == 0
+
+
 class TestSummary:
     """summary.md has the expected sections; on CPU the GPU-only parts
     are skipped with a clear note."""
@@ -551,6 +583,7 @@ class TestSummary:
                     "val_set_gen_s": 0.5,
                 }
             ],
+            "parent_reserved_bytes_before_concurrency": 125_829_120,
             "concurrency": [
                 {"d_model": 32, "groups": [{"n": 1, "skipped": "no CUDA"}]}
             ],
@@ -562,6 +595,8 @@ class TestSummary:
         }
         summary = bench.render_summary(results)
         assert "**Status: complete.**" in summary
+        assert "The parent's reserved CUDA memory" in summary
+        assert "120 MB" in summary
         for section in (
             "## Environment",
             "## Step time and GPU usage per variant",
