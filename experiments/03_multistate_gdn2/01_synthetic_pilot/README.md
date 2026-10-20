@@ -288,17 +288,22 @@ Read `bench/<timestamp>/summary.md` for:
   is within 10% of the best measured;
 - the **grid estimate**: upper-bound GPU-hours per tier and per phase
   (no early stopping; test ~ validation), the wall clock at the
-  recommended concurrency, and whether Phase 1 + Phase 2 exceed the
-  one-week budget (then rent).
+  **measured speedup** of the recommended runs per GPU (N runs side by
+  side are not N times faster), and whether Phase 1 + Phase 2 exceed
+  the one-week budget (then rent).
 
 The summary ends with a **cross-check**: one real 1,000-step run of the
-core configuration, whose `timing.steps_per_second` (which includes data
-loading, logging and validation) should be close to the benchmark's step
-time.
+core configuration. The run's `timing.steps_per_second` is steps per
+second, the benchmark's step time is ms per step — convert with
+**ms per step = 1000 / `steps_per_second`**. The real run also pays for
+data loading, logging and the two validation passes, so its step time
+should come out somewhat **slower** than the benchmark's, not equal to
+it.
 
-On a machine without CUDA only the step timing, the data time and the
-validation time are measured (a smoke check); the GPU-only readings are
-skipped with a note in the summary.
+On a machine without CUDA the benchmark measures **one** variant (step
+time, data time, validation time) as a smoke check and reports the rest
+of the grid and the GPU-only readings (busy fraction, peak memory,
+concurrency) as not measured in the summary.
 
 ## Reference timings
 
