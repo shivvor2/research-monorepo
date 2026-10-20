@@ -702,6 +702,20 @@ class TestSummary:
         # The one-week verdict on the serial total: 400 h > 168 h -> rent.
         assert "exceeds the one-week budget (168 h)" in summary
 
+    def test_concurrency_skip_reason_renders_the_recorded_reason(self):
+        results = self._phase_results()
+        results["concurrency"] = [
+            {
+                "d_model": 32,
+                "task_file": "overwrite",
+                "groups": [{"n": 1, "skipped": "the concurrency stage failed"}],
+            }
+        ]
+        summary = bench.render_summary(results)
+        section = summary.split("## Concurrency (runs per GPU)")[1]
+        assert "Skipped: the concurrency stage failed." in section
+        assert "no CUDA device found" not in section
+
     def test_summary_sections_and_cpu_notes(self):
         results = {
             "complete": True,

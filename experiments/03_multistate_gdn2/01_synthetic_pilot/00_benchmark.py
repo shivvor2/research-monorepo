@@ -1845,10 +1845,26 @@ def render_summary(results: Mapping[str, Any]) -> str:
         for entry in results["concurrency"]
         for group in entry["groups"]
     ):
-        lines.append(
-            "_Skipped: no CUDA device found._ Aggregate throughput of 1, 2 "
-            "and 4 concurrent runs on one GPU needs a GPU."
+        # The recorded skip reason is reported verbatim; the no-CUDA
+        # wording is kept only for the reason that states it.
+        reasons = sorted(
+            {
+                group.get("skipped")
+                for entry in results["concurrency"]
+                for group in entry["groups"]
+                if group.get("skipped")
+            }
         )
+        if not reasons:
+            lines.append("_No concurrency measurement._")
+        for reason in reasons:
+            if reason == "no CUDA":
+                lines.append(
+                    "_Skipped: no CUDA device found._ Aggregate throughput of 1, "
+                    "2 and 4 concurrent runs on one GPU needs a GPU."
+                )
+            else:
+                lines.append(f"_Skipped: {reason}._")
     else:
         for entry in results["concurrency"]:
             group_rows = []
@@ -1887,14 +1903,21 @@ def render_summary(results: Mapping[str, Any]) -> str:
             )
             lines.extend(["", markdown_table(pd.DataFrame(group_rows)), ""])
             if any(group.get("synchronized") is False for group in entry["groups"]):
+                late = [
+                    group["n"]
+                    for group in entry["groups"]
+                    if group.get("synchronized") is False
+                ]
                 lines.append(
-                    "_At least one worker started late: its rate covers only part "
-                    "of the shared window, so the aggregate and the speedup may "
-                    "read high — increase `bench.start_margin_s`._"
+                    f"_A worker of N={', '.join(str(n) for n in late)} started "
+                    "late: its rate covers only part of the shared window, the "
+                    "aggregate and the speedup may read high, and the group does "
+                    "not contribute to the recommendation — increase "
+                    "`bench.start_margin_s`._"
                 )
                 lines.append("")
             if recommended is None:
-                lines.append("_No reading: every group failed or OOM-ed._")
+                lines.append("_No reading: no complete, synchronized group._")
             else:
                 lines.append(
                     f"Recommended runs per GPU: **{recommended}** (the smallest "
