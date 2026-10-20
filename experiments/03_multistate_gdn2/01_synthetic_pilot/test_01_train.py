@@ -1067,7 +1067,18 @@ class TestCreateLoggers:
                         "entity": None,
                     },
                 },
-                "experiment": {"name": "multistate_gdn2_synthetic_pilot"},
+                "experiment": {
+                    "name": "multistate_gdn2_synthetic_pilot",
+                    "tier": "tier1_core",
+                    "phase": 1,
+                },
+                "task": {"name": "overwrite"},
+                "model": {
+                    "layout": "ws",
+                    "gate_mode": "full",
+                    "lambda_mode": "task_mlp",
+                    "d_model": 32,
+                },
             }
         )
         loggers = train.create_loggers(cfg, "run-1")
