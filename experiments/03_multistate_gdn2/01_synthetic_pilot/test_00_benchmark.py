@@ -580,6 +580,128 @@ class TestSummary:
     """summary.md has the expected sections; on CPU the GPU-only parts
     are skipped with a clear note."""
 
+    @staticmethod
+    def _phase_results() -> dict:
+        """A results dict whose d=32 phase totals are computable
+        (Phase 1 calibration = 200 GPU-hours, Phase 2 core = 200) and
+        whose frozen width is noted as d=32, so only the d=32 verdict
+        line renders."""
+        tiers = [
+            ("calib_dmodel", 100.0),
+            ("calib_harness", 50.0),
+            ("calib_lr", 40.0),
+            ("calib_lr_anchors", 10.0),
+            ("tier1_core", 200.0),
+        ]
+        return {
+            "complete": True,
+            "generated_at": "2026-10-20T00:00:00",
+            "command": "python 00_benchmark.py",
+            "device": {
+                "device": "cpu",
+                "count": 0,
+                "name": None,
+                "capability": None,
+                "driver": None,
+            },
+            "versions": {
+                "python": "3.13",
+                "torch": "2.9.1",
+                "cuda_runtime": None,
+                "lightning": "2.6.0",
+                "hydra_core": "1.3.2",
+                "omegaconf": "2.3.0",
+            },
+            "git": {"commit": "abc123", "dirty": False},
+            "lock_hash": "deadbeef" * 4,
+            "precision_flags": {
+                "cuda_matmul_allow_tf32": False,
+                "cudnn_allow_tf32": False,
+            },
+            "max_steps": 20000,
+            "val_check_interval": 500,
+            "variants": [],
+            "task_timings": [],
+            "lr": 0.003,
+            "num_workers": 2,
+            "bench": {"batch_sizes": [256]},
+            "concurrency": [],
+            "estimates": {
+                str(d): {
+                    "tiers": [
+                        {
+                            "tier": name,
+                            "runs": 1,
+                            "measured": 1,
+                            "per_run_s": 1.0,
+                            "gpu_hours": hours,
+                            "note": "",
+                        }
+                        for name, hours in tiers
+                    ]
+                }
+                for d in (32, 64)
+            },
+            "notes": ["frozen protocol width: d_model=32"],
+        }
+
+    def test_wall_clock_divides_by_the_measured_speedup(self):
+        # N=2 measured a 1.01x speedup: the wall clock is the serial
+        # total / 1.01 (396 h), not / 2 (200 h).
+        results = self._phase_results()
+        results["concurrency"] = [
+            {
+                "d_model": 32,
+                "task_file": "overwrite",
+                "groups": [
+                    {
+                        "n": 1,
+                        "aggregate_steps_per_s": 10.0,
+                        "oom": False,
+                        "failed": 0,
+                        "synchronized": True,
+                        "speedup": None,
+                        "workers": [],
+                    },
+                    {
+                        "n": 2,
+                        "aggregate_steps_per_s": 10.1,
+                        "oom": False,
+                        "failed": 0,
+                        "synchronized": True,
+                        "speedup": 1.01,
+                        "workers": [],
+                    },
+                ],
+                "recommended_runs_per_gpu": 2,
+                "recommended_speedup": 1.01,
+            }
+        ]
+        summary = bench.render_summary(results)
+        assert "400 GPU-hours serial" in summary
+        assert "1.01x speedup" in summary
+        # 400 / 1.01 = 396.0; dividing by the concurrency N=2 would have
+        # printed "200 hours of wall clock".
+        assert "396 hours of wall clock" in summary
+        assert "200 hours of wall clock" not in summary
+
+    def test_wall_clock_without_a_speedup_uses_the_serial_total(self):
+        results = self._phase_results()
+        results["concurrency"] = [
+            {
+                "d_model": 32,
+                "task_file": "overwrite",
+                "groups": [{"n": 1, "skipped": "no CUDA"}],
+                "recommended_runs_per_gpu": None,
+                "recommended_speedup": None,
+            }
+        ]
+        summary = bench.render_summary(results)
+        assert "400 GPU-hours serial" in summary
+        assert "wall clock not computable: no concurrency measurement" in summary
+        # The one-week verdict on the serial total: 400 h > 168 h -> rent.
+        assert "exceeds the one-week budget (168 h)" in summary
+
     def test_summary_sections_and_cpu_notes(self):
         results = {
             "complete": True,

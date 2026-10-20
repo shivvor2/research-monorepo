@@ -1942,7 +1942,7 @@ def render_summary(results: Mapping[str, Any]) -> str:
     lines.append("")
 
     # Phase totals, serial GPU-hours, and the wall clock at the
-    # recommended concurrency.
+    # measured speedup of the recommended concurrency.
     phases = {
         "Phase 1 (calibration)": (
             "calib_dmodel",
@@ -1970,6 +1970,11 @@ def render_summary(results: Mapping[str, Any]) -> str:
         entry["d_model"]: entry["recommended_runs_per_gpu"]
         for entry in results["concurrency"]
         if entry.get("recommended_runs_per_gpu") is not None
+    }
+    recommended_speedup = {
+        entry["d_model"]: entry["recommended_speedup"]
+        for entry in results["concurrency"]
+        if entry.get("recommended_speedup") is not None
     }
     phase_rows = []
     phase_serial: dict[str, int | None] = {}
@@ -2030,10 +2035,13 @@ def render_summary(results: Mapping[str, Any]) -> str:
             + phase_serial["Phase 2 (core tier)"][interpretation]
         )
         concurrency = recommended.get(d)
-        if concurrency is None:
-            verdict = "*not computable: no concurrency reading (no CUDA).*"
-        else:
-            wall_clock = total / concurrency
+        speedup = recommended_speedup.get(d)
+        if concurrency is not None and speedup is not None:
+            # The wall clock divides by the **measured** speedup: N runs
+            # side by side are not N times faster (the reduced grid
+            # measured e.g. 1.01 at N=2). At the recommended N=1 the
+            # speedup is 1.
+            wall_clock = total / speedup
             verdict = (
                 "**exceeds the one-week budget (168 h)** — rent"
                 if wall_clock > 168.0
@@ -2041,8 +2049,22 @@ def render_summary(results: Mapping[str, Any]) -> str:
             )
             lines.append(
                 f"**Phase 1 + Phase 2 at d={d}: {total:.0f} GPU-hours serial; "
-                f"at the recommended {concurrency} runs per GPU: "
-                f"{wall_clock:.0f} hours of wall clock — {verdict}.**"
+                f"at the measured {speedup:.2f}x speedup of the recommended "
+                f"{concurrency} runs per GPU: {wall_clock:.0f} hours of wall "
+                f"clock — {verdict}.**"
+            )
+        else:
+            # No usable speedup (no CUDA, or no complete N=1 group): the
+            # one-week verdict falls back to the serial total.
+            verdict = (
+                "**exceeds the one-week budget (168 h)** — rent"
+                if total > 168.0
+                else "**fits inside the one-week budget (168 h)** — run locally"
+            )
+            lines.append(
+                f"**Phase 1 + Phase 2 at d={d}: {total:.0f} GPU-hours serial; "
+                f"wall clock not computable: no concurrency measurement — "
+                f"serial-only verdict: {verdict}.**"
             )
     lines.append("")
 
