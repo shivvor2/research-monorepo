@@ -154,12 +154,66 @@ class TestReadings:
         assert bench.data_bound(50.0, 20.0, 0) is False
 
     def test_recommended_concurrency(self):
-        # The smallest N within 10% of the best aggregate.
-        assert bench.recommended_concurrency([10.0, 18.0, 19.0]) == 2
-        assert bench.recommended_concurrency([10.0, 10.5, 10.9]) == 1
-        assert bench.recommended_concurrency([5.0, 9.0, 10.0, 9.4]) == 2
-        assert bench.recommended_concurrency([100.0]) == 1
+        # The smallest measured N within 10% of the best aggregate, from
+        # (n, aggregate) pairs — a position in the list is not an N.
+        assert bench.recommended_concurrency([(1, 10.0), (2, 18.0), (4, 19.0)]) == 2
+        assert bench.recommended_concurrency([(1, 10.0), (2, 10.5), (4, 10.9)]) == 1
+        assert (
+            bench.recommended_concurrency([(1, 5.0), (2, 9.0), (4, 10.0), (8, 9.4)])
+            == 2
+        )
+        assert bench.recommended_concurrency([(1, 100.0)]) == 1
         assert bench.recommended_concurrency([]) == 1
+        # A best at N=4 comes back as 4 (a before-N list only held
+        # positions); near-ties resolve to the smaller measured N.
+        assert bench.recommended_concurrency([(1, 10.0), (2, 10.2), (4, 19.0)]) == 4
+        assert bench.recommended_concurrency([(1, 10.0), (2, 9.5)]) == 1
+        assert bench.recommended_concurrency([(1, 10.0), (4, 10.5)]) == 1
+
+    def test_eligible_groups_exclude_oom_failed_and_late(self):
+        # Only a complete, synchronized, non-OOM group with a rate may
+        # feed the recommendation: a partial failure aggregates fewer
+        # workers than N, and a late worker's rate covers only part of
+        # the shared window (its aggregate may read high).
+        groups = [
+            {
+                "n": 1,
+                "aggregate_steps_per_s": 10.0,
+                "oom": False,
+                "failed": 0,
+                "synchronized": True,
+            },
+            {
+                "n": 2,
+                "aggregate_steps_per_s": 3.0,
+                "oom": False,
+                "failed": 1,
+                "synchronized": True,
+            },
+            {
+                "n": 2,
+                "aggregate_steps_per_s": 8.0,
+                "oom": False,
+                "failed": 0,
+                "synchronized": False,
+            },
+            {
+                "n": 4,
+                "aggregate_steps_per_s": 5.0,
+                "oom": True,
+                "failed": 0,
+                "synchronized": True,
+            },
+            {
+                "n": 4,
+                "aggregate_steps_per_s": None,
+                "oom": False,
+                "failed": 4,
+                "synchronized": True,
+            },
+        ]
+        assert bench.eligible_groups(groups) == [(1, 10.0)]
+        assert bench.recommended_concurrency(bench.eligible_groups(groups)) == 1
 
 
 class TestGridEstimate:

@@ -516,16 +516,52 @@ def data_bound(data_ms: float | None, step_ms: float | None, num_workers: int) -
     return data_ms > step_ms * num_workers
 
 
-def recommended_concurrency(aggregates: Sequence[float]) -> int:
-    """The smallest N (1-based) whose aggregate throughput is within 10%
-    of the best measured (``aggregates`` in increasing-N order)."""
-    if not aggregates:
+def recommended_concurrency(groups: Sequence[tuple[int, float]]) -> int:
+    """The smallest **measured N** whose aggregate throughput is within
+    10% of the best measured. 1 when nothing was measured.
+
+    Args:
+        groups: ``(n, aggregate_steps_per_s)`` pairs. Each pair holds
+            the N that was actually measured: a position in a list is
+            not an N (with ``bench.concurrency: [1, 2, 4]`` the third
+            entry is N=4).
+
+    Returns:
+        The smallest measured N within 10% of the best aggregate; 1 for
+        an empty ``groups``.
+    """
+    if not groups:
         return 1
-    threshold = 0.9 * max(aggregates)
-    for n, value in enumerate(aggregates, start=1):
+    threshold = 0.9 * max(value for _, value in groups)
+    for n, value in groups:
         if value >= threshold:
             return n
-    return len(aggregates)
+    return groups[-1][0]
+
+
+def eligible_groups(groups: Sequence[Mapping[str, Any]]) -> list[tuple[int, float]]:
+    """The ``(n, aggregate_steps_per_s)`` pairs that may feed the
+    recommendation: the group needs a measured rate, every worker must
+    have finished (a partial failure aggregates fewer workers than N),
+    no OOM, and the workers must have shared one window (a worker that
+    started late covers only part of the window, so the aggregate may
+    read high).
+
+    Args:
+        groups: The recorded group entries.
+
+    Returns:
+        The eligible ``(n, aggregate)`` pairs, in group order.
+    """
+    return [
+        (int(group["n"]), float(group["aggregate_steps_per_s"]))
+        for group in groups
+        if group.get("aggregate_steps_per_s") is not None
+        and not group.get("skipped")
+        and not group["oom"]
+        and not group["failed"]
+        and group.get("synchronized") is not False
+    ]
 
 
 # =============================================================================
@@ -1549,19 +1585,25 @@ def measure_all(cfg: DictConfig, device: torch.device, out_dir: Path) -> dict[st
             logger.error("concurrency stage failed: %s", exc)
             results["notes"].append(f"concurrency stage failed: {exc}")
             groups = [{"n": 1, "skipped": "the concurrency stage failed"}]
-        aggregate = [
-            group["aggregate_steps_per_s"]
-            for group in groups
-            if group.get("aggregate_steps_per_s") is not None and not group["oom"]
-        ]
+        # Only complete, synchronized, non-OOM groups may feed the
+        # recommendation; the speedup of the recommended N is the
+        # aggregate of that group over the N=1 group's (both must be
+        # eligible: a late or failed N=1 group leaves no baseline).
+        eligible = eligible_groups(groups)
+        recommended_n = recommended_concurrency(eligible) if eligible else None
+        recommended_speedup = None
+        if recommended_n is not None:
+            base = next((value for n, value in eligible if n == 1), None)
+            if base is not None:
+                at_n = next(value for n, value in eligible if n == recommended_n)
+                recommended_speedup = at_n / base
         results["concurrency"].append(
             {
                 "d_model": int(d_model),
                 "task_file": task_file,
                 "groups": groups,
-                "recommended_runs_per_gpu": (
-                    recommended_concurrency(aggregate) if aggregate else None
-                ),
+                "recommended_runs_per_gpu": recommended_n,
+                "recommended_speedup": recommended_speedup,
             }
         )
         write_bench_json(results, out_dir)
