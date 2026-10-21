@@ -6,11 +6,26 @@ import csv
 import json
 import logging
 import math
+import re
 from pathlib import Path
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
+
+_RE_SLICE_KEY = re.compile(r"^(\d+)$")
+
+
+def _slice_key_value(key: str, prefix: str) -> int | None:
+    """Return the slice integer from a key like ``acc/slice=32``.
+
+    Returns ``None`` for compound keys like ``acc/slice=32/class=distant``.
+    """
+    if not key.startswith(prefix):
+        return None
+    rest = key[len(prefix) :]
+    m = _RE_SLICE_KEY.match(rest)
+    return int(m.group(1)) if m else None
 
 
 def _weighted_mean_from_slices(
@@ -18,20 +33,24 @@ def _weighted_mean_from_slices(
 ) -> float | None:
     """Weighted mean of per-slice accuracies.
 
+    Only exact ``<prefix><digits>`` keys are used; compound keys like
+    ``acc/slice=32/class=distant`` or ``acc/slice=32/dist=0-16`` are
+    ignored.
+
     Args:
         metric_dict: a metric section (e.g. ``summary["test"]``).
         prefix: the slice-key prefix, e.g. ``"acc/slice="``.
         weights: mapping from slice value to weight.
 
     Returns:
-        The weighted mean, or ``None`` when no slice keys are present.
+        The weighted mean, or ``None`` when no plain slice keys are present.
     """
     total_weight = 0.0
     weighted_sum = 0.0
     for key, value in metric_dict.items():
-        if not key.startswith(prefix):
+        slice_val = _slice_key_value(key, prefix)
+        if slice_val is None:
             continue
-        slice_val = int(key[len(prefix) :])
         weight = weights.get(slice_val, 0.0)
         total_weight += weight
         weighted_sum += float(value) * weight
@@ -62,8 +81,8 @@ def _normalize_overall_test_acc(record: dict) -> float | None:
     # Build uniform weights when num_per_slice is a scalar.
     weights: dict[int, float] = {}
     for key in test:
-        if key.startswith("acc/slice="):
-            slice_val = int(key[len("acc/slice=") :])
+        slice_val = _slice_key_value(key, "acc/slice=")
+        if slice_val is not None:
             weights[slice_val] = float(num_per_slice)
     if not weights:
         return test.get("acc")
@@ -101,19 +120,25 @@ def _best_val_from_curves(record: dict) -> tuple[float | None, int | None, str]:
     data_cfg = cfg.get("data", {})
     num_per_slice = data_cfg.get("num_val_per_slice")
     if num_per_slice is None:
-        return stopping.get("best_value"), stopping.get("best_step"), "stopping"
+        return stopping.get("best_value"), stopping.get("best_step"), "legacy_pooled"
     # Locate the curve CSV.
     json_path = Path(record.get("json_path", ""))
     if not json_path.exists():
         return None, None, "unavailable"
     run_id = record.get("run_id", "")
-    launch_dir = json_path.parent.parent.parent  # runs_dir parent
-    csv_save_dir = (cfg.get("logging") or {}).get("csv", {}).get("save_dir", "")
-    if not csv_save_dir:
-        return None, None, "unavailable"
-    curves_path = launch_dir / csv_save_dir / run_id / "version_0" / "metrics.csv"
+    # The canonical location: <runs_dir>/curves/<run_id>/version_0/metrics.csv
+    curves_dir = json_path.parent / "curves"
+    curves_path = curves_dir / run_id / "version_0" / "metrics.csv"
     if not curves_path.exists():
-        return None, None, "unavailable"
+        # Fallback to the recorded logging.csv.save_dir (absolute or relative).
+        csv_save_dir = (cfg.get("logging") or {}).get("csv", {}).get("save_dir", "")
+        if csv_save_dir:
+            launch_dir = json_path.parent.parent.parent  # runs_dir parent
+            curves_path = (
+                launch_dir / csv_save_dir / run_id / "version_0" / "metrics.csv"
+            )
+        if not curves_path.exists():
+            return None, None, "unavailable"
     try:
         with curves_path.open(newline="") as f:
             reader = csv.DictReader(f)
@@ -126,11 +151,9 @@ def _best_val_from_curves(record: dict) -> tuple[float | None, int | None, str]:
                 weights: dict[int, float] = {}
                 vals: dict[int, float] = {}
                 for col, raw in row.items():
-                    if not col.startswith("val/acc/slice="):
+                    slice_val = _slice_key_value(col, "val/acc/slice=")
+                    if slice_val is None or raw == "":
                         continue
-                    if raw == "":
-                        continue
-                    slice_val = int(col[len("val/acc/slice=") :])
                     weights[slice_val] = float(num_per_slice)
                     vals[slice_val] = float(raw)
                 if not vals:

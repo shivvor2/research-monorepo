@@ -400,17 +400,17 @@ class TestSnippet:
             (32, "ll", 0.001, (0.9, 0.95)),
         ):
             for seed, value in zip(SELECTION_SEEDS, accs, strict=True):
-                rows.append(
-                    _calib_row(
-                        "calib_lr_anchors",
-                        seed,
-                        value,
-                        lr=lr,
-                        d_model=d_model,
-                        layout=layout,
-                        gate_mode="gdn",
-                    )
+                row = _calib_row(
+                    "calib_lr_anchors",
+                    seed,
+                    value,
+                    lr=lr,
+                    d_model=d_model,
+                    layout=layout,
+                    gate_mode="gdn",
                 )
+                row["expand_v"] = 2.0
+                rows.append(row)
         return pd.DataFrame(rows)
 
     def test_snippet_parses_and_matches_the_readings(self):
