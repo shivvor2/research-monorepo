@@ -1,6 +1,9 @@
 # @package _global_
 # Anchor dimension override: d = 16, 1 head (Log-Linear head counts).
+# The published Gated DeltaNet configuration (Log-Linear Table 2,
+# through Zoology and fla) uses a value width of twice the key width.
 
 model:
   d_model: 16
   num_heads: 1
+  expand_v: 2.0

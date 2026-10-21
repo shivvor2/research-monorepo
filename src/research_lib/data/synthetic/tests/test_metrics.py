@@ -585,6 +585,178 @@ class TestWriteDistanceMetrics:
 # ---------------------------------------------------------------------------
 
 
+class TestPerSequenceAccuracy:
+    """Per-sequence mean accuracy (not pooled over answers)."""
+
+    def test_equal_slice_sizes_matches_pooled_mean(self):
+        """When every sequence has the same number of answers,
+        the per-sequence mean equals the unweighted mean of per-slice
+        accuracies (and also the pooled-over-answers figure)."""
+        # Two slices, two examples per slice, one answer each.
+        labels = torch.full((4, 4), -100, dtype=torch.long)
+        # Slice 4: both correct.
+        labels[0, 2] = 5
+        labels[1, 2] = 6
+        # Slice 8: one correct, one wrong.
+        labels[2, 2] = 7
+        labels[3, 2] = 8
+        logits = torch.zeros(4, 4, 10, dtype=torch.float64)
+        logits[0, 1, 5] = 10.0  # correct
+        logits[1, 1, 6] = 10.0  # correct
+        logits[2, 1, 7] = 10.0  # correct
+        logits[3, 1, 0] = 10.0  # wrong (target 8)
+        metrics = RecallMetrics(slice_values=(4, 8))
+        metrics.update(
+            logits,
+            {
+                "labels": labels,
+                "slice_id": torch.tensor([4, 4, 8, 8], dtype=torch.long),
+            },
+        )
+        out = metrics.compute()
+        # Per-sequence mean: (1.0 + 1.0 + 1.0 + 0.0) / 4 = 0.75.
+        assert out["acc"] == pytest.approx(0.75)
+        # Per-slice: both 1.0 and 0.5; unweighted mean = 0.75.
+        assert out["acc/slice=4"] == pytest.approx(1.0)
+        assert out["acc/slice=8"] == pytest.approx(0.5)
+
+    def test_unequal_slice_sizes_differs_from_pooled(self):
+        """When slices have different numbers of sequences, the
+        per-sequence mean differs from the pooled-over-answers figure."""
+        # Slice 4: 1 example, 1 answer, correct -> 1.0.
+        # Slice 8: 3 examples, 1 answer each, all wrong -> 0.0.
+        labels = torch.full((4, 4), -100, dtype=torch.long)
+        labels[0, 2] = 5  # slice 4, correct
+        labels[1, 2] = 6  # slice 8, wrong
+        labels[2, 2] = 7  # slice 8, wrong
+        labels[3, 2] = 8  # slice 8, wrong
+        logits = torch.zeros(4, 4, 10, dtype=torch.float64)
+        logits[0, 1, 5] = 10.0  # correct
+        logits[1, 1, 0] = 10.0  # wrong
+        logits[2, 1, 0] = 10.0  # wrong
+        logits[3, 1, 0] = 10.0  # wrong
+        metrics = RecallMetrics(slice_values=(4, 8))
+        metrics.update(
+            logits,
+            {
+                "labels": labels,
+                "slice_id": torch.tensor([4, 8, 8, 8], dtype=torch.long),
+            },
+        )
+        out = metrics.compute()
+        # Per-sequence mean: (1.0 + 0.0 + 0.0 + 0.0) / 4 = 0.25.
+        assert out["acc"] == pytest.approx(0.25)
+        # Pooled-over-answers: 1 correct / 4 answers = 0.25 — same here
+        # because each sequence has exactly 1 answer. So let's use a case
+        # where answers-per-sequence differ.
+        #
+        # Two sequences: slice 4 has 1 answer (correct), slice 8 has 3
+        # answers (all wrong).
+        labels2 = torch.full((2, 6), -100, dtype=torch.long)
+        labels2[0, 2] = 5  # slice 4, 1 answer
+        labels2[1, 2] = 6  # slice 8
+        labels2[1, 3] = 7  # slice 8
+        labels2[1, 4] = 8  # slice 8
+        logits2 = torch.zeros(2, 6, 10, dtype=torch.float64)
+        logits2[0, 1, 5] = 10.0  # correct
+        logits2[1, 1, 0] = 10.0  # wrong
+        logits2[1, 2, 0] = 10.0  # wrong
+        logits2[1, 3, 0] = 10.0  # wrong
+        metrics2 = RecallMetrics(slice_values=(4, 8))
+        metrics2.update(
+            logits2,
+            {
+                "labels": labels2,
+                "slice_id": torch.tensor([4, 8], dtype=torch.long),
+            },
+        )
+        out2 = metrics2.compute()
+        # Per-sequence mean: seq0 = 1.0, seq1 = 0.0 / 3 = 0.0 -> (1.0 + 0.0) / 2 = 0.5.
+        assert out2["acc"] == pytest.approx(0.5)
+        # Pooled-over-answers would be 1 / 4 = 0.25.
+        # Per-slice: slice 4 = 1.0, slice 8 = 0.0; unweighted mean = 0.5.
+        assert out2["acc/slice=4"] == pytest.approx(1.0)
+        assert out2["acc/slice=8"] == pytest.approx(0.0)
+
+    def test_accumulation_over_batches(self):
+        """Accumulating over several batches equals one batch with all rows."""
+        labels = torch.full((4, 4), -100, dtype=torch.long)
+        labels[0, 2] = 5  # correct
+        labels[1, 2] = 6  # wrong
+        labels[2, 2] = 7  # correct
+        labels[3, 2] = 8  # wrong
+        logits = torch.zeros(4, 4, 10, dtype=torch.float64)
+        logits[0, 1, 5] = 10.0
+        logits[1, 1, 0] = 10.0
+        logits[2, 1, 7] = 10.0
+        logits[3, 1, 0] = 10.0
+        batch = {
+            "labels": labels,
+            "slice_id": torch.tensor([4, 4, 8, 8], dtype=torch.long),
+        }
+        metrics_single = RecallMetrics(slice_values=(4, 8))
+        metrics_single.update(logits, batch)
+        out_single = metrics_single.compute()
+
+        metrics_batch = RecallMetrics(slice_values=(4, 8))
+        metrics_batch.update(logits[:2], {k: v[:2] for k, v in batch.items()})
+        metrics_batch.update(logits[2:], {k: v[2:] for k, v in batch.items()})
+        out_batch = metrics_batch.compute()
+        assert out_batch["acc"] == out_single["acc"]
+        assert out_batch["acc/slice=4"] == out_single["acc/slice=4"]
+        assert out_batch["acc/slice=8"] == out_single["acc/slice=8"]
+
+    def test_update_answers_gives_same_per_sequence_accuracy(self):
+        """The answer-row path (update_answers) and the full-logits path
+        (update) yield the same per-sequence accuracy."""
+        config = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2,))
+        batch = generate_mqar(config, num_examples=4, seed=0)
+        torch.manual_seed(0)
+        embed = torch.nn.Embedding(config.vocab_size, 16)
+        head = torch.nn.Linear(16, config.vocab_size)
+        hidden = embed(batch["input_ids"])
+        full_logits = head(hidden)
+        from research_lib.training.losses import answer_position_logits
+
+        answers = answer_position_logits(hidden, head, batch["labels"])
+
+        metrics_full = RecallMetrics(slice_values=config.slices)
+        metrics_full.update(full_logits, batch)
+        metrics_ans = RecallMetrics(slice_values=config.slices)
+        metrics_ans.update_answers(answers.logits, batch)
+        assert metrics_full.compute()["acc"] == metrics_ans.compute()["acc"]
+
+    def test_distributed_all_reduce_covers_new_counters(self):
+        """Two accumulators' per-sequence counters sum correctly."""
+        labels = torch.full((4, 4), -100, dtype=torch.long)
+        labels[0, 2] = 5  # correct
+        labels[1, 2] = 6  # wrong
+        labels[2, 2] = 7  # correct
+        labels[3, 2] = 8  # wrong
+        logits = torch.zeros(4, 4, 10, dtype=torch.float64)
+        logits[0, 1, 5] = 10.0
+        logits[1, 1, 0] = 10.0
+        logits[2, 1, 7] = 10.0
+        logits[3, 1, 0] = 10.0
+        batch = {
+            "labels": labels,
+            "slice_id": torch.tensor([4, 4, 8, 8], dtype=torch.long),
+        }
+        rank0 = RecallMetrics(slice_values=(4, 8))
+        rank1 = RecallMetrics(slice_values=(4, 8))
+        rank0.update(logits[:2], {k: v[:2] for k, v in batch.items()})
+        rank1.update(logits[2:], {k: v[2:] for k, v in batch.items()})
+        # Simulate all_reduce(SUM) on the new counters.
+        rank0._seq_acc_sum += rank1._seq_acc_sum
+        rank0._seq_count += rank1._seq_count
+        # Also the legacy counts.
+        rank0._counts += rank1._counts
+        rank0._unknown += rank1._unknown
+        combined = RecallMetrics(slice_values=(4, 8))
+        combined.update(logits, batch)
+        assert rank0.compute()["acc"] == combined.compute()["acc"]
+
+
 class TestUpdateAnswers:
     """update_answers accumulates the same counters as update.
 

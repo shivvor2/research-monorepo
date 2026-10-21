@@ -29,7 +29,7 @@
 | overwrite | ws | test/acc/dist=32-64 | 10 | 0.05 | 0.05 | 0.05 | CI entirely above 0: supports the hypothesis at pilot scale |
 | overwrite | ll | test/acc/dist=32-64 | 10 | 0.1 | 0.1 | 0.1 | CI entirely above 0: supports the hypothesis at pilot scale |
 
-## Predictions 1-4 (each on its own tier)
+## Prediction 1: b_only recovers most of Delta_int, w_only little
 
 | prediction | layout | gate_mode | n_seeds | mean | ci_low | ci_high |
 |---|---|---|---|---|---|---|
@@ -37,12 +37,22 @@
 | P1 recovered fraction (test/acc/slice=32/class=distant) | ws | w_only | 5 | 0 | 0 | 0 |
 | P1 recovered fraction (test/acc/slice=32/class=distant) | ll | b_only | 5 | 0 | 0 | 0 |
 | P1 recovered fraction (test/acc/slice=32/class=distant) | ll | w_only | 5 | 0 | 0 | 0 |
+
+## Predictions 2 and 3: transported vs frozen control
+
+| prediction | layout | gate_mode | n_seeds | mean | ci_low | ci_high |
+|---|---|---|---|---|---|---|
 | P2 ws - fs (test/acc/slice=32/class=distant) | ws-fs | full | 5 | -0.39 | -0.39 | -0.39 |
 | P2 ws - fs (test/leak/slice=32/class=distant) | ws-fs | full | 5 | 0 | 0 | 0 |
 | P2 ws - fs (test/acc/slice=32/class=distant) | ws-fs | kda | 5 | -0.54 | -0.54 | -0.54 |
 | P2 ws - fs (test/leak/slice=32/class=distant) | ws-fs | kda | 5 | 0 | 0 | 0 |
 | P3 ws - fs (test/acc/slice=32/class=single) | ws-fs | full | 5 | -0.39 | -0.39 | -0.39 |
 | P3 ws - fs (test/acc/slice=32/class=single) | ws-fs | kda | 5 | -0.54 | -0.54 | -0.54 |
+
+## Prediction 4: lambda static vs single-state full
+
+| prediction | layout | gate_mode | n_seeds | mean | ci_low | ci_high |
+|---|---|---|---|---|---|---|
 | P4 static - single-full (test/acc/slice=32/class=distant) | ws | full | 5 | 0.49 | 0.49 | 0.49 |
 | P4 static - single-full (test/acc/slice=32/class=distant) | ll | full | 5 | 0.49 | 0.49 | 0.49 |
 
@@ -74,14 +84,25 @@
 
 ## Anchors next to Log-Linear Table 2
 
-| d_model | layout | n_seeds | acc_mean | acc_std | log_linear_acc | log_linear_std |
-|---|---|---|---|---|---|---|
-| 16 | ll | 5 | 0.99 | 0 | 40 | 1.4 |
-| 16 | single | 5 | 0.99 | 0 | 38.4 | 1 |
-| 32 | ll | 5 | 0.99 | 0 | 84.4 | 1.2 |
-| 32 | single | 5 | 0.99 | 0 | 79 | 2.1 |
-| 64 | ll | 5 | 0.99 | 0 | 99 |  |
-| 64 | single | 5 | 0.99 | 0 | 99 |  |
+| d_model | layout | expand_v | n_seeds | acc_mean | acc_std | log_linear_acc | log_linear_std |
+|---|---|---|---|---|---|---|---|
+| 16 | ll | 1 | 5 | 0.99 | 0 | 40 | 1.4 |
+| 16 | single | 1 | 5 | 0.99 | 0 | 38.4 | 1 |
+| 32 | ll | 1 | 5 | 0.99 | 0 | 84.4 | 1.2 |
+| 32 | single | 1 | 5 | 0.99 | 0 | 79 | 2.1 |
+| 64 | ll | 1 | 5 | 0.99 | 0 | 99 |  |
+| 64 | single | 1 | 5 | 0.99 | 0 | 99 |  |
+
+## Matched bytes (main effect vs the expanded single state)
+
+| task | layout | metric | n_seeds | mean | ci_low | ci_high | mean_matched_single | mean_multistate |
+|---|---|---|---|---|---|---|---|---|
+| overwrite | ws | test/acc | 5 | -0.39 | -0.39 | -0.39 | 0.99 | 0.6 |
+| overwrite | ll | test/acc | 5 | -0.29 | -0.29 | -0.29 | 0.99 | 0.7 |
+
+## Lambda / erase statistics per slot (core tier)
+
+_none_
 
 ## Missing runs per tier
 

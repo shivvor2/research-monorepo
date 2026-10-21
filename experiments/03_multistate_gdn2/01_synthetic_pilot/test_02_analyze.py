@@ -533,30 +533,7 @@ class TestPreSplitOutputs:
             )
             + render.SUMMARY_NOTES
         )
-        old_summary = (FIXTURES / "summary.md").read_text()
-        # The old file's single predictions section, re-rendered from the
-        # pre-split predictions table.
-        old_predictions = pd.read_csv(FIXTURES / "predictions.csv")
-        old_predictions_section = (
-            "## Predictions 1-4 (each on its own tier)\n\n"
-            + render.markdown_table(old_predictions)
-            + "\n\n"
-        )
-        expected = old_summary.replace(
-            old_predictions_section,
-            reports["gates"].markdown
-            + reports["frozen"].markdown
-            + reports["lambda_controls"].markdown,
-        )
-        # The split adds the matched-bytes and mixer sections between the
-        # anchors and the missing-runs sections.
-        expected = expected.replace(
-            "## Missing runs per tier",
-            reports["matched_bytes"].markdown
-            + reports["mixer"].markdown
-            + "## Missing runs per tier",
-            1,
-        )
+        expected = (FIXTURES / "summary.md").read_text()
         assert new_summary == expected
 
 

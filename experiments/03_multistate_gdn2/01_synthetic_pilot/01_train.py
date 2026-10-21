@@ -683,6 +683,11 @@ def create_callbacks(
             provenance_files=("uv.lock",),
             collectors=(
                 Collector(
+                    "metrics",
+                    lambda _trainer, _pl: {"acc": "per_sequence_mean"},
+                    Stage.FIT_START,
+                ),
+                Collector(
                     "params",
                     param_counts({"lambda": ["lambda_mixer"]}),
                     Stage.FIT_START,

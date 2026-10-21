@@ -314,31 +314,47 @@ def run(table: pd.DataFrame) -> dict:
 
     harness_rows = _selection_rows(table, TIER_CALIB_HARNESS)
     harness = _per_seed_mean(harness_rows, "layer_pattern")
-    # The published reference is read at the chosen width: the width
-    # reading when it exists, else the width the harness rows ran at
-    # (when they all share one).
-    chosen_d = d_choice
-    if chosen_d is None and not harness_rows.empty:
-        widths = harness_rows["d_model"].dropna().unique()
-        if len(widths) == 1:
-            chosen_d = int(widths[0])
+    # C30 fix: the harness table must label each row with the width the
+    # harness actually ran at, not a width chosen later by calib_dmodel.
+    if not harness_rows.empty:
+        harness["d_model"] = (
+            harness_rows.groupby("layer_pattern")["d_model"]
+            .first()
+            .reindex(harness["layer_pattern"])
+            .values
+        )
+        if "expand_v" in harness_rows.columns:
+            harness["expand_v"] = (
+                harness_rows.groupby("layer_pattern")["expand_v"]
+                .first()
+                .reindex(harness["layer_pattern"])
+                .fillna(1.0)
+                .values
+            )
+        else:
+            harness["expand_v"] = 1.0
+
+    # The published reference is read at the actual width of each harness
+    # row, so rows that ran at different widths show the right reference.
+    def _ll_acc(row):
+        d = int(row["d_model"]) if not pd.isna(row["d_model"]) else None
+        return LOG_LINEAR_TABLE_2.get(d, {}).get("single") if d is not None else None
+
+    def _ll_std(row):
+        d = int(row["d_model"]) if not pd.isna(row["d_model"]) else None
+        return LOG_LINEAR_STD_2.get(d, {}).get("single") if d is not None else None
+
     if not harness.empty:
-        harness["d_model"] = chosen_d
-        harness["log_linear_acc"] = (
-            LOG_LINEAR_TABLE_2.get(int(chosen_d), {}).get("single")
-            if chosen_d is not None
-            else None
-        )
-        harness["log_linear_std"] = (
-            LOG_LINEAR_STD_2.get(int(chosen_d), {}).get("single")
-            if chosen_d is not None
-            else None
-        )
+        harness["log_linear_acc"] = harness.apply(_ll_acc, axis=1)
+        harness["log_linear_std"] = harness.apply(_ll_std, axis=1)
 
     lr_rows = _selection_rows(table, TIER_CALIB_LR)
     lr = _lr_reading(lr_rows, ["d_model", "task", "layout", "gate_mode"])
     anchor_rows = _selection_rows(table, TIER_CALIB_LR_ANCHORS)
-    lr_anchors = _lr_reading(anchor_rows, ["d_model", "layout"])
+    if "expand_v" not in anchor_rows.columns:
+        anchor_rows = anchor_rows.copy()
+        anchor_rows["expand_v"] = 1.0
+    lr_anchors = _lr_reading(anchor_rows, ["d_model", "layout", "expand_v"])
     missing = calibration_missing(table)
     # The snippet's lr_table uses one width: the width reading when it
     # exists; otherwise the single width the records ran at. Several
