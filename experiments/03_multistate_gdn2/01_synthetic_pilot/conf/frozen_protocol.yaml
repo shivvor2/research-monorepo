@@ -8,13 +8,13 @@
 frozen: false
 
 # d_model chosen in calibration from {32, 64}.
-d_model: null
+d_model: 32
 
 # Harness switches chosen in calibration (rule 3): layer_pattern in
 # {zoology, mixer_x2} and state_mixer in {none, mlp}.
 harness:
-  layer_pattern: null
-  state_mixer: null
+  layer_pattern: zoology
+  state_mixer: none
 
 # Peak LR per (task, layout, gate_mode), selected on seeds 100-101
 # from {1e-3, 3e-3, 1e-2}.
