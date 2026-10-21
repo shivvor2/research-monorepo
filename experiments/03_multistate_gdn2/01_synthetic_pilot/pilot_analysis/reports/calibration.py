@@ -35,6 +35,7 @@ import numpy as np
 import pandas as pd
 from pilot_analysis.base import Report, ReportOptions
 from pilot_analysis.protocol import (
+    ANCHOR_EXPAND_V,
     CALIBRATION_TIERS,
     DMODEL_ACC_RANGE,
     DMODEL_FALLBACK,
@@ -74,18 +75,33 @@ def _selection_rows(table: pd.DataFrame, tier: str) -> pd.DataFrame:
     return rows
 
 
-def _per_seed_mean(rows: pd.DataFrame, by: str) -> pd.DataFrame:
+def _per_seed_mean(rows: pd.DataFrame, by: str | list[str]) -> pd.DataFrame:
     """One row per ``by`` value: per-seed best values, then the mean.
+
+    ``by`` may be a single column name or a list of column names for
+    multi-level grouping.
 
     The empty case (no completed calibration runs) returns the same
     columns with no rows.
     """
-    columns = [by, "n_seeds", *(f"seed={seed}" for seed in SELECTION_SEEDS), "mean"]
-    if rows.empty or by not in rows.columns:
+    by_list = [by] if isinstance(by, str) else by
+    columns = [
+        *by_list,
+        "n_seeds",
+        *(f"seed={seed}" for seed in SELECTION_SEEDS),
+        "mean",
+    ]
+    if rows.empty or any(b not in rows.columns for b in by_list):
         return pd.DataFrame(columns=columns)
     records = []
-    for value, group in rows.groupby(by, dropna=False):
-        record = {by: value, "n_seeds": int(group["best_value"].notna().sum())}
+    for value, group in rows.groupby(by_list, dropna=False):
+        # pandas groupby with a list always returns tuple keys, even
+        # for a single column.
+        if len(by_list) == 1:
+            record = {by_list[0]: value[0]}
+        else:
+            record = dict(zip(by_list, value))
+        record["n_seeds"] = int(group["best_value"].notna().sum())
         for seed in SELECTION_SEEDS:
             cell = group[group["seed"] == seed]["best_value"]
             record[f"seed={seed}"] = float(cell.iloc[0]) if len(cell) == 1 else None
@@ -216,6 +232,7 @@ def frozen_snippet(
     lr_width: int | None,
     lr_cells: pd.DataFrame,
     anchor_cells: pd.DataFrame,
+    excluded_anchors: pd.DataFrame | None = None,
 ) -> str:
     """A ``conf/frozen_protocol.yaml`` snippet filled from the readings.
 
@@ -226,6 +243,9 @@ def frozen_snippet(
     (the width the snippet uses), so learning rates measured at another
     width never fill it.
 
+    The anchor snippet uses only rows at ``expand_v == ANCHOR_EXPAND_V``;
+    rows at other value widths are reported separately as excluded.
+
     Args:
         d_model: The width reading (``None`` = the step has not run).
         lr_width: The width whose ``lr_cells`` rows fill the table —
@@ -234,8 +254,12 @@ def frozen_snippet(
         lr_cells: The ``calib_lr`` reading table (one row per
             (d_model, task, layout, gate, lr), with a ``selected``
             column).
-        anchor_cells: The ``calib_lr_anchors`` reading table (one row
-            per (d_model, layout, lr), with a ``selected`` column).
+        anchor_cells: The ``calib_lr_anchors`` reading table at the
+            target ``expand_v`` (one row per (d_model, layout, lr),
+            with a ``selected`` column).
+        excluded_anchors: Anchor rows at a different ``expand_v``,
+            listed for visibility. May be ``None`` when no excluded
+            rows exist.
 
     Returns:
         str: The YAML text, ready to paste.
@@ -313,32 +337,43 @@ def run(table: pd.DataFrame) -> dict:
     d_choice, d_reading = select_d_model(means)
 
     harness_rows = _selection_rows(table, TIER_CALIB_HARNESS)
-    harness = _per_seed_mean(harness_rows, "layer_pattern")
-    # The published reference is read at the chosen width: the width
-    # reading when it exists, else the width the harness rows ran at
-    # (when they all share one).
-    chosen_d = d_choice
-    if chosen_d is None and not harness_rows.empty:
-        widths = harness_rows["d_model"].dropna().unique()
-        if len(widths) == 1:
-            chosen_d = int(widths[0])
+    # Group by the full configuration of each harness variant so runs
+    # at different widths or value widths are never averaged together.
+    harness = _per_seed_mean(
+        harness_rows,
+        (
+            ["layer_pattern", "d_model", "expand_v"]
+            if "expand_v" in harness_rows.columns
+            else ["layer_pattern", "d_model"]
+        ),
+    )
+    # The harness table labels each row with the width it actually ran
+    # at, not a width chosen later by the width-reading step.
+    if not harness_rows.empty:
+        if "expand_v" not in harness.columns:
+            harness["expand_v"] = 1.0
+
+    # The published reference is read at the actual width of each harness
+    # row, so rows that ran at different widths show the right reference.
+    def _ll_acc(row):
+        d = int(row["d_model"]) if not pd.isna(row["d_model"]) else None
+        return LOG_LINEAR_TABLE_2.get(d, {}).get("single") if d is not None else None
+
+    def _ll_std(row):
+        d = int(row["d_model"]) if not pd.isna(row["d_model"]) else None
+        return LOG_LINEAR_STD_2.get(d, {}).get("single") if d is not None else None
+
     if not harness.empty:
-        harness["d_model"] = chosen_d
-        harness["log_linear_acc"] = (
-            LOG_LINEAR_TABLE_2.get(int(chosen_d), {}).get("single")
-            if chosen_d is not None
-            else None
-        )
-        harness["log_linear_std"] = (
-            LOG_LINEAR_STD_2.get(int(chosen_d), {}).get("single")
-            if chosen_d is not None
-            else None
-        )
+        harness["log_linear_acc"] = harness.apply(_ll_acc, axis=1)
+        harness["log_linear_std"] = harness.apply(_ll_std, axis=1)
 
     lr_rows = _selection_rows(table, TIER_CALIB_LR)
     lr = _lr_reading(lr_rows, ["d_model", "task", "layout", "gate_mode"])
     anchor_rows = _selection_rows(table, TIER_CALIB_LR_ANCHORS)
-    lr_anchors = _lr_reading(anchor_rows, ["d_model", "layout"])
+    if "expand_v" not in anchor_rows.columns:
+        anchor_rows = anchor_rows.copy()
+        anchor_rows["expand_v"] = 1.0
+    lr_anchors = _lr_reading(anchor_rows, ["d_model", "layout", "expand_v"])
     missing = calibration_missing(table)
     # The snippet's lr_table uses one width: the width reading when it
     # exists; otherwise the single width the records ran at. Several
@@ -355,7 +390,18 @@ def run(table: pd.DataFrame) -> dict:
             "step (calib_dmodel) must be recorded before the "
             "learning-rate table can be filled"
         )
-    snippet = frozen_snippet(d_choice, snippet_width, lr, lr_anchors)
+    # Separate anchor rows at the target expand_v from excluded ones.
+    if "expand_v" in lr_anchors.columns:
+        at_target = lr_anchors[
+            np.isclose(lr_anchors["expand_v"], ANCHOR_EXPAND_V, rtol=0.0, atol=1e-12)
+        ]
+        excluded = lr_anchors[
+            ~np.isclose(lr_anchors["expand_v"], ANCHOR_EXPAND_V, rtol=0.0, atol=1e-12)
+        ]
+    else:
+        at_target = lr_anchors
+        excluded = pd.DataFrame()
+    snippet = frozen_snippet(d_choice, snippet_width, lr, at_target, excluded)
     return {
         "dmodel": dmodel,
         "dmodel_choice": (d_choice, d_reading),
@@ -365,6 +411,7 @@ def run(table: pd.DataFrame) -> dict:
         "missing": missing,
         "snippet": snippet,
         "lr_width_note": lr_width_note,
+        "excluded_anchors": excluded,
     }
 
 
@@ -422,6 +469,12 @@ def render(readings: dict) -> str:
     lines.append("")
     lines.append(markdown_table(readings["lr_anchors"]))
     lines.append("")
+    excluded = readings.get("excluded_anchors")
+    if excluded is not None and not excluded.empty:
+        lines.append("### Excluded anchor rows (other value widths)")
+        lines.append("")
+        lines.append(markdown_table(excluded))
+        lines.append("")
     lines.append("### Missing runs (calibration tiers)")
     lines.append("")
     lines.append(markdown_table(readings["missing"]))
@@ -437,14 +490,18 @@ def render(readings: dict) -> str:
 
 def report(table: pd.DataFrame, options: ReportOptions) -> Report:
     readings = run(table)
+    tables = {
+        "calibration_dmodel": readings["dmodel"],
+        "calibration_harness": readings["harness"],
+        "calibration_lr": readings["lr"],
+        "calibration_lr_anchors": readings["lr_anchors"],
+    }
+    excluded = readings.get("excluded_anchors")
+    if excluded is not None and not excluded.empty:
+        tables["calibration_excluded_anchors"] = excluded
     return Report(
         name="calibration",
         title=TITLE,
-        tables={
-            "calibration_dmodel": readings["dmodel"],
-            "calibration_harness": readings["harness"],
-            "calibration_lr": readings["lr"],
-            "calibration_lr_anchors": readings["lr_anchors"],
-        },
+        tables=tables,
         markdown=render(readings),
     )

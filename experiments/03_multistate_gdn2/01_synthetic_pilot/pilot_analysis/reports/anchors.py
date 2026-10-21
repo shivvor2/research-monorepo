@@ -21,12 +21,20 @@ def run(table: pd.DataFrame) -> pd.DataFrame:
     anchors = tier_rows(table, TIER_ANCHORS)
     if anchors.empty:
         return pd.DataFrame()
+    # Ensure expand_v column exists (records that predate it get the
+    # default value of 1).
+    if "expand_v" not in anchors.columns:
+        anchors = anchors.copy()
+        anchors["expand_v"] = 1.0
     records = []
-    for (d_model, layout), group in anchors.groupby(["d_model", "layout"]):
+    for (d_model, layout, expand_v), group in anchors.groupby(
+        ["d_model", "layout", "expand_v"], dropna=False
+    ):
         acc = group["test/acc"].dropna()
         record = {
             "d_model": d_model,
             "layout": layout,
+            "expand_v": expand_v,
             "n_seeds": int(acc.size),
             "acc_mean": float(acc.mean()) if acc.size else None,
             "acc_std": float(acc.std()) if acc.size > 1 else None,
@@ -34,7 +42,7 @@ def run(table: pd.DataFrame) -> pd.DataFrame:
             "log_linear_std": LOG_LINEAR_STD_2.get(int(d_model), {}).get(layout),
         }
         records.append(record)
-    return pd.DataFrame(records).sort_values(["d_model", "layout"])
+    return pd.DataFrame(records).sort_values(["d_model", "layout", "expand_v"])
 
 
 def report(table: pd.DataFrame, options: ReportOptions) -> Report:

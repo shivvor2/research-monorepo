@@ -9,8 +9,10 @@ either task).
 
 ``RecallMetrics`` accumulates over evaluation batches:
 
-- ``'acc'``: overall answer accuracy (over answers, not averaged per
-  sequence);
+- ``'acc'``: overall answer accuracy, the mean over sequences of each
+  sequence's accuracy (the convention of Arora et al., 2023); with equal
+  numbers of sequences per slice this equals the unweighted mean of the
+  per-slice accuracies;
 - ``'acc/slice={n}'``: accuracy per slice value (``D`` for MQAR, ``K`` for
   overwrite);
 - overwrite only: ``'acc/class={c}'``, ``'acc/slice={n}/class={c}'``,
@@ -198,6 +200,13 @@ class RecallMetrics:
         # of the first update; the unknown-slice counter is a scalar.
         self._counts: torch.Tensor | None = None
         self._unknown: torch.Tensor | None = None
+        # Per-sequence accuracy accumulator: sum of per-sequence accuracies
+        # (float64 to avoid any rounding question in tie-breaks), count of
+        # sequences with at least one answer, and count of sequences with no
+        # answers (reported by compute).
+        self._seq_acc_sum: torch.Tensor | None = None
+        self._seq_count: torch.Tensor | None = None
+        self._seq_zero_count: torch.Tensor | None = None
         # Write-distance counts, one more axis: (num_slices, num_bins, 3)
         # for (answers, correct, leaked) per (slice, distance bin). Only
         # accumulated for batches that carry ``write_distance``.
@@ -295,6 +304,31 @@ class RecallMetrics:
         flat.index_add_(0, idx * 3 + 1, (correct & known).reshape(-1).long())
         flat.index_add_(0, idx * 3 + 2, (leak & known).reshape(-1).long())
 
+        # Per-sequence accuracy accumulator (float64 sum, long count).
+        seq_correct = (correct & known).sum(dim=1).long()
+        seq_total = (mask & known).sum(dim=1).long()
+        seq_valid = seq_total > 0
+        seq_zero = ~seq_valid
+        seq_acc = torch.where(
+            seq_valid,
+            seq_correct.double() / seq_total.double(),
+            torch.zeros_like(seq_correct, dtype=torch.double),
+        )
+        seq_rows = row_pos[:, 0]
+        if self._seq_acc_sum is None or self._seq_count is None:
+            self._seq_acc_sum = torch.zeros(
+                self._num_slices, dtype=torch.double, device=device
+            )
+            self._seq_count = torch.zeros(
+                self._num_slices, dtype=torch.long, device=device
+            )
+            self._seq_zero_count = torch.zeros(
+                self._num_slices, dtype=torch.long, device=device
+            )
+        self._seq_acc_sum.index_add_(0, seq_rows, seq_acc)
+        self._seq_count.index_add_(0, seq_rows, seq_valid.long())
+        self._seq_zero_count.index_add_(0, seq_rows, seq_zero.long())
+
         # Write-distance bins, one more axis: (num_slices, num_bins, 3),
         # the same index_add_ mechanism over a combined flat index. Only
         # batches that carry ``write_distance`` (overwrite) and only
@@ -365,10 +399,19 @@ class RecallMetrics:
     # Compute
     # ------------------------------------------------------------------ #
 
-    def _global_counts(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """(counts, unknown, distance_counts) with a SUM all-reduce across
-        ranks when a distributed process group with world size > 1 is
-        initialized.
+    def _global_counts(
+        self,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """(counts, unknown, distance_counts, seq_acc_sum, seq_count,
+        seq_zero_count) with a SUM all-reduce across ranks when a distributed
+        process group with world size > 1 is initialized.
 
         Reduces clones, so the accumulator itself is unchanged and further
         updates / repeated compute() calls stay correct.
@@ -376,6 +419,9 @@ class RecallMetrics:
         assert self._counts is not None and self._unknown is not None
         counts, unknown = self._counts, self._unknown
         distance_counts = self._distance_counts
+        seq_acc_sum = self._seq_acc_sum
+        seq_count = self._seq_count
+        seq_zero_count = self._seq_zero_count
         if (
             torch.distributed.is_available()
             and torch.distributed.is_initialized()
@@ -390,7 +436,20 @@ class RecallMetrics:
                 torch.distributed.all_reduce(
                     distance_counts, op=torch.distributed.ReduceOp.SUM
                 )
-        return counts, unknown, distance_counts
+            if seq_acc_sum is not None:
+                seq_acc_sum = seq_acc_sum.clone()
+                seq_count = seq_count.clone()
+                seq_zero_count = seq_zero_count.clone()
+                torch.distributed.all_reduce(
+                    seq_acc_sum, op=torch.distributed.ReduceOp.SUM
+                )
+                torch.distributed.all_reduce(
+                    seq_count, op=torch.distributed.ReduceOp.SUM
+                )
+                torch.distributed.all_reduce(
+                    seq_zero_count, op=torch.distributed.ReduceOp.SUM
+                )
+        return counts, unknown, distance_counts, seq_acc_sum, seq_count, seq_zero_count
 
     def compute(self) -> dict[str, float]:
         """Return the accumulated metrics as Python floats.
@@ -399,15 +458,17 @@ class RecallMetrics:
         (and the unknown-slice counter) are SUM-all-reduced across ranks
         first, so the metrics are global.
 
-        Keys: ``'acc'``; ``'acc/slice={n}'`` per observed slice. If class
-        metrics were accumulated: ``'acc/class={c}'``, ``'leak/class={c}'``,
-        ``'other/class={c}'`` per observed class and
-        ``'acc/slice={n}/class={c}'``, ``'leak/slice={n}/class={c}'``,
-        ``'other/slice={n}/class={c}'`` per observed (slice, class) cell.
-        If write-distance batches were accumulated: ``'acc/dist={lo}-{hi}'``
-        and ``'leak/dist={lo}-{hi}'`` per observed distance bin (the token
-        distance between the two writes, binned ``[lo, hi)``, the last bin
-        to infinity), and ``'acc/slice={n}/dist={lo}-{hi}'``,
+        Keys: ``'acc'`` (the mean over sequences of each sequence's accuracy,
+        i.e. the convention of Arora et al., 2023); ``'acc/slice={n}'`` per
+        observed slice. If class metrics were accumulated:
+        ``'acc/class={c}'``, ``'leak/class={c}'``, ``'other/class={c}'`` per
+        observed class and ``'acc/slice={n}/class={c}'``,
+        ``'leak/slice={n}/class={c}'``, ``'other/slice={n}/class={c}'`` per
+        observed (slice, class) cell. If write-distance batches were
+        accumulated: ``'acc/dist={lo}-{hi}'`` and ``'leak/dist={lo}-{hi}'``
+        per observed distance bin (the token distance between the two
+        writes, binned ``[lo, hi)``, the last bin to infinity), and
+        ``'acc/slice={n}/dist={lo}-{hi}'``,
         ``'leak/slice={n}/dist={lo}-{hi}'`` per observed (slice, bin) cell.
 
         Cells with no answers are OMITTED (never emitted as 0.0, which
@@ -424,13 +485,22 @@ class RecallMetrics:
             counts = torch.zeros((self._num_slices, 5, 3), dtype=torch.long)
             unknown = torch.zeros((), dtype=torch.long)
             distance_counts = self._distance_counts
+            seq_acc_sum = self._seq_acc_sum
+            seq_count = self._seq_count
+            seq_zero_count = self._seq_zero_count
         else:
-            counts, unknown, distance_counts = self._global_counts()
+            counts, unknown, distance_counts, seq_acc_sum, seq_count, seq_zero_count = (
+                self._global_counts()
+            )
         num_unknown = int(unknown)
         if num_unknown != 0:
             raise ValueError(
                 f"{num_unknown} answers carried slice values outside "
                 f"slice_values={self._slice_values}"
+            )
+        if seq_zero_count is not None and int(seq_zero_count.sum()) != 0:
+            raise ValueError(
+                f"{int(seq_zero_count.sum())} sequences had zero answer positions"
             )
 
         out: dict[str, float] = {}
@@ -445,8 +515,10 @@ class RecallMetrics:
 
         # Empty slice cell: omit (cannot occur for valid batches).
         # Class never observed: omit. Empty (slice, class) cell: omit.
-        acc, _, _ = _ratio(counts.sum(dim=(0, 1)))
-        out["acc"] = acc
+        if seq_count is not None and seq_count.sum() > 0:
+            out["acc"] = float(seq_acc_sum.sum() / seq_count.sum().double())
+        else:
+            out["acc"] = 0.0
         for row, value in enumerate(self._slice_values):
             stats = counts[row].sum(dim=0)
             if int(stats[0]) == 0:

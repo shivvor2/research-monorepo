@@ -41,6 +41,10 @@ DMODEL_FALLBACK = 32
 PRIMARY_SLICE_MULTIPLIER = 2
 PRIMARY_CLASS = "distant"
 
+# The published Gated DeltaNet configuration (Log-Linear Table 2,
+# through Zoology and fla) uses a value width of twice the key width.
+ANCHOR_EXPAND_V = 2.0
+
 # --------------------------------------------------------------------------- #
 # Published anchor numbers (Log-Linear Table 2, Gated DeltaNet), for the
 # anchor report and the harness reading.

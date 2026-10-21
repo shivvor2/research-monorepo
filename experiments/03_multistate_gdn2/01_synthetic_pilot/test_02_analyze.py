@@ -40,7 +40,7 @@ from pilot_analysis import (
     render,
 )
 from pilot_analysis.protocol import PROTOCOL_TIERS
-from pilot_analysis.records import load_runs
+from pilot_analysis.records import _slice_key_value, load_runs
 from pilot_analysis.reports import (
     all_cells,
     anchors,
@@ -533,30 +533,7 @@ class TestPreSplitOutputs:
             )
             + render.SUMMARY_NOTES
         )
-        old_summary = (FIXTURES / "summary.md").read_text()
-        # The old file's single predictions section, re-rendered from the
-        # pre-split predictions table.
-        old_predictions = pd.read_csv(FIXTURES / "predictions.csv")
-        old_predictions_section = (
-            "## Predictions 1-4 (each on its own tier)\n\n"
-            + render.markdown_table(old_predictions)
-            + "\n\n"
-        )
-        expected = old_summary.replace(
-            old_predictions_section,
-            reports["gates"].markdown
-            + reports["frozen"].markdown
-            + reports["lambda_controls"].markdown,
-        )
-        # The split adds the matched-bytes and mixer sections between the
-        # anchors and the missing-runs sections.
-        expected = expected.replace(
-            "## Missing runs per tier",
-            reports["matched_bytes"].markdown
-            + reports["mixer"].markdown
-            + "## Missing runs per tier",
-            1,
-        )
+        expected = (FIXTURES / "summary.md").read_text()
         assert new_summary == expected
 
 
@@ -713,6 +690,166 @@ class TestLoadRuns:
         with pytest.raises(SystemExit):
             load_runs(tmp_path)
         assert any("bad.json" in str(r.message) for r in caplog.records)
+
+
+class TestSliceKeyParsing:
+    """The slice-key helper reads plain slice keys and rejects compound
+    keys (``acc/slice=32/class=distant`` used to crash ``int()``)."""
+
+    def test_plain_slice_key_accepted(self):
+        assert _slice_key_value("acc/slice=32", "acc/slice=") == 32
+
+    def test_compound_keys_rejected(self):
+        assert _slice_key_value("acc/slice=32/class=distant", "acc/slice=") is None
+        assert _slice_key_value("acc/slice=32/dist=0-16", "acc/slice=") is None
+
+    def test_non_numeric_slice_rejected(self):
+        assert _slice_key_value("acc/slice=abc", "acc/slice=") is None
+
+    def test_other_prefix_rejected(self):
+        assert _slice_key_value("leak/slice=32", "acc/slice=") is None
+
+
+class TestLoadRunsAccuracyDefinition:
+    """``load_runs`` tells the accuracy definitions apart: new-style
+    records carry ``metrics.acc == "per_sequence_mean"`` and are read as
+    stored; old records are recomputed without being touched."""
+
+    @staticmethod
+    def _record(
+        run_id,
+        *,
+        metrics_acc=None,
+        num_test_per_slice=1000,
+        num_val_per_slice=1000,
+        test_acc=0.9,
+        best_value=0.55,
+        best_step=90,
+        json_path="",
+    ):
+        return {
+            "run_id": run_id,
+            "json_path": json_path,
+            "config": {
+                "model": {
+                    "layout": "ws",
+                    "gate_mode": "full",
+                    "lambda_mode": "mlp",
+                    "d_model": 32,
+                    "num_heads": 2,
+                    "head_dim": None,
+                    "layer_pattern": "zoology",
+                    "state_mixer": "none",
+                },
+                "task": {"name": "overwrite"},
+                "experiment": {"tier": "bench", "phase": 1},
+                "optimizer": {"lr": 0.003},
+                "data": {
+                    "num_test_per_slice": num_test_per_slice,
+                    "num_val_per_slice": num_val_per_slice,
+                },
+                "logging": {"csv": {"enabled": True, "save_dir": ""}},
+            },
+            # The old pooled-definition record carries no metrics section;
+            # the new per-sequence one does.
+            **({"metrics": {"acc": metrics_acc}} if metrics_acc is not None else {}),
+            "seed": 0,
+            "stopping": {
+                "early_stopped": False,
+                "best_value": best_value,
+                "best_step": best_step,
+            },
+            "status": "test_done",
+            "test": {
+                "acc": test_acc,
+                # Class and distance keys are compound: the slice reading
+                # must not mistake them for plain slice values.
+                "acc/slice=16": 0.5,
+                "acc/slice=32": 0.7,
+                "acc/slice=16/class=distant": 0.95,
+                "acc/slice=32/class=distant": 0.05,
+                "acc/slice=16/dist=0-16": 0.33,
+                "acc/slice=32/dist=0-16": 0.66,
+            },
+        }
+
+    def test_new_style_record_uses_the_stored_values(self, tmp_path):
+        # metrics.acc == "per_sequence_mean": test/acc and best_value are
+        # already the right definition and pass through untouched. The
+        # stored test/acc (0.9) must NOT be replaced by the slice mean
+        # (0.6), and the source is the stopping field.
+        run = self._record(
+            "new-overwrite-ws-full-d32-s0",
+            metrics_acc="per_sequence_mean",
+            test_acc=0.9,
+            best_value=0.77,
+            best_step=140,
+        )
+        (tmp_path / "new.json").write_text(json.dumps(run))
+        table = load_runs(tmp_path)
+        row = table.iloc[0]
+        assert row["test/acc"] == pytest.approx(0.9)
+        assert row["best_value"] == pytest.approx(0.77)
+        assert row["best_step"] == 140
+        assert row["best_value_source"] == "stopping"
+
+    def test_old_overwrite_record_recomputed_from_slices_and_curves(self, tmp_path):
+        # The old pooled definition: stored test/acc is 0.9, the slice
+        # values give 0.6 as the per-sequence mean, and the best value
+        # comes from the curve CSV.
+        run_id = "bench_overwrite-ws-full-mlp-d32-lr0.003-s0"
+        path = tmp_path / f"{run_id}.json"
+        run = self._record(run_id, json_path=str(path))
+        path.write_text(json.dumps(run))
+        curves = tmp_path / "curves" / run_id / "version_0"
+        curves.mkdir(parents=True)
+        (curves / "metrics.csv").write_text(
+            "step,val/acc/slice=16,val/acc/slice=32,val/acc/slice=16/class=distant,"
+            "val/acc/slice=32/class=distant,val/acc/slice=16/dist=0-16,"
+            "val/acc/slice=32/dist=0-16\n"
+            "100,0.4,0.8,0.95,0.05,0.33,0.66\n"
+            "200,0.5,0.9,0.1,0.9,0.33,0.66\n"
+            "300,0.7,0.7,0.2,0.8,0.33,0.66\n"
+            "400,0.3,0.3,0.9,0.1,0.33,0.66\n"
+        )
+        table = load_runs(tmp_path)
+        row = table.iloc[0]
+        # Unweighted mean of the plain slice values: (0.5 + 0.7) / 2.
+        assert row["test/acc"] == pytest.approx(0.6)
+        # Best per-step mean from the curves, ties to the earlier step
+        # (steps 200 and 300 both give 0.7; 200 wins). Compound val
+        # columns never enter.
+        assert row["best_value"] == pytest.approx(0.7)
+        assert row["best_step"] == 200
+        assert row["best_value_source"] == "curve"
+
+    def test_old_record_without_curves_marks_unavailable(self, tmp_path):
+        # num_val_per_slice is present but no curve file exists: the best
+        # value cannot be recomputed, so the source says so and the
+        # stored stopping values are kept.
+        run_id = "old_no_curves-s0"
+        path = tmp_path / f"{run_id}.json"
+        run = self._record(run_id, json_path=str(path))
+        path.write_text(json.dumps(run))
+        table = load_runs(tmp_path)
+        row = table.iloc[0]
+        assert row["best_value_source"] == "unavailable"
+        assert row["best_value"] == pytest.approx(0.55)
+        assert row["best_step"] == 90
+
+    def test_old_record_without_val_slices_marks_legacy_pooled(self, tmp_path):
+        # No num_val_per_slice in the config: the definition cannot be
+        # reconstructed, so the source is the pooled legacy fallback. The
+        # test-side recompute still works (num_test_per_slice exists).
+        run_id = "old_no_val_slices-s0"
+        run = self._record(run_id, num_val_per_slice=None)
+        (tmp_path / f"{run_id}.json").write_text(json.dumps(run))
+        table = load_runs(tmp_path)
+        row = table.iloc[0]
+        assert row["best_value_source"] == "legacy_pooled"
+        assert row["best_value"] == pytest.approx(0.55)
+        assert row["best_step"] == 90
+        assert row["test/acc"] == pytest.approx(0.6)
 
 
 class TestMixerStatsCoreTier:
