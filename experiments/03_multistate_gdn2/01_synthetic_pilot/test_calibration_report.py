@@ -372,6 +372,56 @@ def _lr_grid_rows(
     ]
 
 
+class TestAnchorRowsAtOtherValueWidths:
+    """Anchor rows at ``expand_v != ANCHOR_EXPAND_V`` never reach the
+    snippet; they are listed separately as excluded."""
+
+    def test_snippet_uses_only_the_target_width_rows(self):
+        # Same (d_model=32, layout=single): at expand_v 2.0 the 0.003
+        # point wins, at 1.0 the 0.001 one does. If the 1.0 rows ever
+        # filled the snippet, the reading would pick the wrong LR.
+        rows = []
+        for expand_v, lr, accs in (
+            (2.0, 0.001, (0.4, 0.42)),
+            (2.0, 0.003, (0.8, 0.82)),
+            (1.0, 0.001, (0.8, 0.82)),
+            (1.0, 0.003, (0.4, 0.42)),
+        ):
+            for seed, value in zip(SELECTION_SEEDS, accs, strict=True):
+                row = _calib_row(
+                    "calib_lr_anchors",
+                    seed,
+                    value,
+                    lr=lr,
+                    d_model=32,
+                    layout="single",
+                    gate_mode="gdn",
+                )
+                row["expand_v"] = expand_v
+                rows.append(row)
+        readings = calibration.run(pd.DataFrame(rows))
+        selected = readings["lr_anchors"][readings["lr_anchors"]["selected"]]
+        # One selection per (d_model, layout, expand_v) cell.
+        assert {(float(r["expand_v"]), r["lr"]) for _, r in selected.iterrows()} == {
+            (1.0, 0.001),
+            (2.0, 0.003),
+        }
+        snippet = OmegaConf.create(readings["snippet"])
+        assert snippet.anchor_lr[32].single == 0.003
+        # The 1.0 rows are reported as excluded, never inserted.
+        excluded = readings["excluded_anchors"]
+        assert not excluded.empty
+        assert set(excluded["expand_v"]) == {1.0}
+        assert len(excluded) == 2
+        markdown = calibration.render(readings)
+        assert "### Excluded anchor rows (other value widths)" in markdown
+        from pilot_analysis import ReportOptions
+        from pilot_analysis.reports import calibration as calib
+
+        report = calib.report(pd.DataFrame(rows), ReportOptions())
+        assert "calibration_excluded_anchors" in report.tables
+
+
 class TestSnippet:
     """The snippet parses as YAML and mirrors the readings."""
 

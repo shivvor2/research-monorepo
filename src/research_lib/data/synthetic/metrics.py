@@ -201,8 +201,6 @@ class RecallMetrics:
         self._counts: torch.Tensor | None = None
         self._unknown: torch.Tensor | None = None
         # Per-sequence accuracy accumulator: sum of per-sequence accuracies
-        # and count of sequences with at least one answer, per slice.
-        # Per-sequence accuracy accumulator: sum of per-sequence accuracies
         # (float64 to avoid any rounding question in tie-breaks), count of
         # sequences with at least one answer, and count of sequences with no
         # answers (reported by compute).
