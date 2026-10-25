@@ -413,31 +413,36 @@ def test_reserved_filler_validation():
 
 
 def test_sampler_bounds_validation():
-    """The without-replacement samplers must not stall: configs just below
-    the key or value bound raise ValueError, and configs exactly at the
-    bounds generate.
+    """The without-replacement samplers must not stall: exactly at the
+    1% probability floor they are accepted and generate; one id below they
+    raise.
 
-    A row of ``d`` distinct ids drawn from an ``n``-id pool by redrawing
-    succeeds per round with probability about ``exp(-d(d-1)/(2n))``;
-    requiring ``n >= d(d-1)/(2 ln 100)`` keeps that at >= 1% (expected
-    redraws per row at most ~100). For K = 16 the draws are d = 16 keys
-    (from n_key = V/2 - 1 - F; breach via a large F: 26 key ids < 26.06
-    at V = 216, F = 81) and d = 32 values (from V/2; 107 < 107.72 at
-    V = 214). V = 216 sits at the bound in both directions: 108 value
-    ids and 27 key ids (F = 80).
+    A row of ``d`` distinct ids drawn from an ``n``-id pool succeeds per
+    round with the exact probability ``n! / ((n - d)! n^d)``. For K = 16
+    the key draw (d = 16) needs at least 32 key ids — reached at V = 240
+    with F = 87 (n_key = 32 => P = 1.04%); F = 88 leaves 31 ids
+    (P = 0.86%). The value draw (d = 32) needs at least 119 value ids:
+    V/2 = 119 (V = 238) => P = 1.01% accepted, V/2 = 118 (V = 236)
+    => P = 0.97% raises.
     """
+    # A near-full key pool drives the approximation far too optimistic:
+    # 11 distinct ids from 12 has exact probability 12!/12^11 = 0.06%.
     with pytest.raises(ValueError, match="stall the key sampler"):
-        OverwriteConfig(vocab_size=216, seq_len=128, num_keys=(16,), reserved_filler=81)
-    with pytest.raises(ValueError, match="stall the value sampler"):
-        OverwriteConfig(vocab_size=214, seq_len=128, num_keys=(16,))
-    for config in (
         OverwriteConfig(
-            vocab_size=216, seq_len=128, num_keys=(16,), reserved_filler=80
-        ),
-        OverwriteConfig(vocab_size=216, seq_len=128, num_keys=(16,)),
-    ):
-        batch = generate_overwrite(config, num_examples=4, seed=3)
-        assert batch["input_ids"].shape == (4, 128)
+            vocab_size=512, seq_len=128, num_keys=(11,), reserved_filler=243
+        )
+    with pytest.raises(ValueError, match="stall the key sampler"):
+        OverwriteConfig(vocab_size=240, seq_len=128, num_keys=(16,), reserved_filler=88)
+    config = OverwriteConfig(
+        vocab_size=240, seq_len=128, num_keys=(16,), reserved_filler=87
+    )
+    batch = generate_overwrite(config, num_examples=4, seed=3)
+    assert batch["input_ids"].shape == (4, 128)
+    with pytest.raises(ValueError, match="stall the value sampler"):
+        OverwriteConfig(vocab_size=236, seq_len=128, num_keys=(16,))
+    config = OverwriteConfig(vocab_size=238, seq_len=128, num_keys=(16,))
+    batch = generate_overwrite(config, num_examples=4, seed=3)
+    assert batch["input_ids"].shape == (4, 128)
 
 
 def test_fixed_num_keys_override_is_validated():
@@ -449,8 +454,9 @@ def test_fixed_num_keys_override_is_validated():
     with pytest.raises(ValueError, match="infeasible num_keys entry 24"):
         generate_overwrite(SMALL, num_examples=2, seed=0, num_keys=24)
     # Sampler-infeasible override: K=24 passes placement (6 * 24 = 144)
-    # and the key bound (n_key = 72 >= 552/9.21) but needs 2K = 48 values
-    # from V/2 = 73 ids: 9.21 * 73 = 672 < 48 * 47 = 2256.
+    # and the key check (P(72, 24) = 1.3% > 1%), but drawing 2K = 48
+    # values from V/2 = 73 ids has exact probability 73!/(25! * 73^48)
+    # = 1.0e-9, far below the 1% floor.
     with pytest.raises(ValueError, match="stall the value sampler"):
         generate_overwrite(
             OverwriteConfig(vocab_size=146, seq_len=144, num_keys=(4,)),

@@ -103,6 +103,10 @@ RuntimeError. The configuration-time sampler bounds keep valid configs
 far below this; a hit means a caller bypassed them (e.g. an impossible
 draw)."""
 
+_SAMPLER_LOG_FLOOR = math.log(0.01)
+"""log of the per-round success floor (1%) for the without-replacement
+samplers; the expected number of redraws per row is then at most ~100."""
+
 
 class OverwriteClass(enum.IntEnum):
     """Placement classes, encoded in ``key_class`` at answer positions."""
@@ -147,11 +151,10 @@ class OverwriteConfig:
         ``reserved_filler`` must satisfy ``0 <= F < V/2 - 1``. The
         without-replacement samplers (keys from the key half, values from
         the value half) must not stall: every slice value ``K`` needs at
-        least ``K`` distinct key ids, and the per-round success probability
-        of drawing distinct ids must stay at or above 1% (expected redraws
-        per row at most about 100), which requires
-        ``V/2 - 1 - F >= K (K - 1) / (2 ln 100)`` key ids and
-        ``V/2 >= 2 K (2 K - 1) / (2 ln 100)`` value ids.
+        least ``K`` distinct key ids, and drawing ``d`` ids from an
+        ``n``-id pool must succeed per round with exact probability
+        ``n! / ((n - d)! n^d)`` of at least 1% (expected redraws per row
+        at most about 100).
     """
 
     vocab_size: int = 8192
@@ -223,6 +226,15 @@ class OverwriteConfig:
         return tuple(sorted(self.num_keys))
 
 
+def _sampler_log_prob(n: int, d: int) -> float:
+    """Exact log-probability that ``d`` uniform draws from ``n`` ids (with
+    replacement) come out distinct: ``log(n! / ((n - d)! n^d))``, computed
+    via log-gammas so it never overflows. Requires ``1 <= d <= n`` (the
+    ``n >= d`` feasibility check runs first).
+    """
+    return math.lgamma(n + 1) - math.lgamma(n - d + 1) - d * math.log(n)
+
+
 def _validate_key_count(config: OverwriteConfig, k: int) -> None:
     """Feasibility and sampler-stall checks for a fixed key count ``k``.
 
@@ -231,9 +243,10 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
     without-replacement samplers: ``k`` distinct keys from the ``n_key =
     V/2 - 1 - F``-id key pool, and ``2K`` distinct values from the
     ``n_val = V/2``-id value pool. Drawing by redrawing whole rows succeeds
-    per round with probability about ``exp(-d(d-1)/(2n))``; requiring
-    ``n >= d(d-1)/(2 ln 100)`` keeps that probability at or above 1%, so
-    the expected number of redraws per row is at most about 100.
+    per round with the exact probability ``n! / ((n - d)! n^d)`` of ``d``
+    distinct draws from ``n`` ids (computed in log space); requiring that
+    probability to be at least 1% keeps the expected number of redraws per
+    row at most about 100.
     """
     if k < 1:
         raise ValueError(f"num_keys entries must be >= 1, got {k}")
@@ -261,14 +274,16 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"[1, vocab_size // 2 - reserved_filler) = [1, {n_key + 1}), "
             f"which has only {n_key} ids, fewer than {k} distinct keys"
         )
-    if 2 * math.log(100) * n_key < k * (k - 1):
+    log_key = _sampler_log_prob(n_key, k)
+    if log_key < _SAMPLER_LOG_FLOOR:
+        prob = math.exp(log_key)
         raise ValueError(
             f"num_keys entry {k} would stall the key sampler: drawing "
-            f"{k} distinct ids from the {n_key}-id key pool succeeds per "
-            f"round with probability ~exp(-K(K-1)/(2n)); keep n >= "
-            f"K(K-1)/(2 ln 100) = {k * (k - 1) / (2 * math.log(100)):.2f} "
-            f"key ids (success >= 1%, expected redraws <= ~100) by "
-            f"increasing vocab_size or reducing reserved_filler"
+            f"{k} distinct ids from the {n_key}-id key pool succeeds with "
+            f"exact probability {n_key}! / (({n_key} - {k})! * "
+            f"{n_key}^{k}) = {prob:.3%}, below the 1% floor (expected "
+            f"redraws ~{1.0 / prob:.0f} per row); increase vocab_size or "
+            f"reduce reserved_filler"
         )
     n_val = config.vocab_size // 2
     if n_val < 2 * k:
@@ -277,15 +292,17 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"are needed but the value pool [vocab_size // 2, vocab_size) "
             f"has only V/2 = {n_val} ids"
         )
-    if 2 * math.log(100) * n_val < 2 * k * (2 * k - 1):
+    d_val = 2 * k
+    log_value = _sampler_log_prob(n_val, d_val)
+    if log_value < _SAMPLER_LOG_FLOOR:
+        prob = math.exp(log_value)
         raise ValueError(
             f"num_keys entry {k} would stall the value sampler: drawing "
-            f"2K = {2 * k} distinct values from the {n_val}-id value pool "
-            f"succeeds per round with probability "
-            f"~exp(-2K(2K-1)/V); keep V/2 >= 2K(2K-1)/(2 ln 100) = "
-            f"{2 * k * (2 * k - 1) / (2 * math.log(100)):.2f} value ids "
-            f"(success >= 1%, expected redraws <= ~100) by increasing "
-            f"vocab_size"
+            f"2K = {d_val} distinct values from the {n_val}-id value pool "
+            f"succeeds with exact probability {n_val}! / (({n_val} - "
+            f"{d_val})! * {n_val}^{d_val}) = {prob:.3%}, below the 1% "
+            f"floor (expected redraws ~{1.0 / prob:.0f} per row); "
+            f"increase vocab_size"
         )
 
 
