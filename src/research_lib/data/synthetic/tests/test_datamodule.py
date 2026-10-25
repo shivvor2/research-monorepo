@@ -514,8 +514,11 @@ def test_val_test_slices_seeded_by_slice_value():
     slice value (and base seed) share that slice's rows bit-exactly, so
     e.g. re-evaluations under a different slice grid stay comparable."""
     # Overwrite: K in {16, 32} shared between (8, 16, 32) and (16, 32, 64).
-    ow_a = OverwriteConfig(vocab_size=4096, seq_len=512, num_keys=(8, 16, 32))
-    ow_b = OverwriteConfig(vocab_size=4096, seq_len=512, num_keys=(16, 32, 64))
+    # V/2 = 8128 is the smallest value pool at which K=64 passes the
+    # sampler bound V/2 >= K(2K-1) = 8128; both configs share the vocab so
+    # the shared slices draw from the same ranges.
+    ow_a = OverwriteConfig(vocab_size=16256, seq_len=512, num_keys=(8, 16, 32))
+    ow_b = OverwriteConfig(vocab_size=16256, seq_len=512, num_keys=(16, 32, 64))
     seed = 777
     set_a = _generate_fixed_set("overwrite", ow_a, 3, seed)
     set_b = _generate_fixed_set("overwrite", ow_b, 3, seed)

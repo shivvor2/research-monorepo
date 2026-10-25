@@ -19,17 +19,24 @@ import numpy as np
 import pytest
 import torch
 
-from ..overwrite import OverwriteClass, OverwriteConfig, generate_overwrite
+from ..overwrite import (
+    OverwriteClass,
+    OverwriteConfig,
+    _distinct_ints,
+    generate_overwrite,
+)
 from ._reference import generate_overwrite_reference
 
 IGNORE = -100
 NO_CLASS = -1
 NO_DISTANCE = -1
 
-# Small but feasible config: 6 * K <= T for the largest K and the write
-# region spans >= distant_min_blocks + 1 blocks.
+# Small but feasible config: 6 * K <= T for the largest K, the write
+# region spans >= distant_min_blocks + 1 blocks, and the without-
+# replacement samplers stay bounded (V/2 = 512 >= K(2K-1) = 496 for
+# K = 16; V/2 - 1 = 511 >= K(K-1)/2 = 120).
 SMALL = OverwriteConfig(
-    vocab_size=512,
+    vocab_size=1024,
     seq_len=128,
     num_keys=(4, 8, 16),
     class_probs=(0.25, 0.25, 0.25, 0.25),
@@ -288,9 +295,11 @@ def test_overwrite_determinism():
 # =============================================================================
 
 # Digest of the fixed-seed batch ``(config=SMALL, num_examples=64, seed=3)``
-# from the generator before ``reserved_filler`` existed.
+# from the generator before ``reserved_filler`` existed (the pre-change
+# digest used vocab_size=512, which the sampler-stall bounds now reject;
+# SMALL thus lives at vocab_size=1024, constructible before and after).
 _SNAPSHOT_DEFAULT_MODE = (
-    "399cf21407ab24c6d244ec798946509720a5ce464b285c89e75e87e2877d6696"
+    "8c4586b56f6d3e8e4c5d10b97cf2ceb56a18c4717529798dc5e945a7a603c1ad"
 )
 
 
@@ -304,8 +313,7 @@ def test_default_filler_mode_matches_snapshot():
     ``numpy.random.default_rng`` streams are stable across numpy
     releases, which keeps the fixed seed well-defined.
     """
-    config = OverwriteConfig(vocab_size=512, seq_len=128, num_keys=(4, 8, 16))
-    batch = generate_overwrite(config, num_examples=64, seed=3)
+    batch = generate_overwrite(SMALL, num_examples=64, seed=3)
     digest = hashlib.sha256()
     for name in sorted(batch):
         digest.update(name.encode())
@@ -366,7 +374,7 @@ def test_reserved_filler_structure():
     keys, values and filler to their three disjoint ranges.
     """
     config = OverwriteConfig(
-        vocab_size=1024, seq_len=256, num_keys=(16, 32), reserved_filler=256
+        vocab_size=4096, seq_len=256, num_keys=(16, 32), reserved_filler=256
     )
     batch = generate_overwrite(config, num_examples=12, seed=5)
     for e in range(12):
@@ -386,23 +394,64 @@ def test_reserved_filler_structure():
 
 
 def test_reserved_filler_validation():
-    """Construction-time validation: F must be >= 0, must leave at least
-    one key id, and must leave enough key ids for the largest K.
+    """Construction-time validation: F must be >= 0 and must leave at
+    least one key id.
     """
     with pytest.raises(ValueError, match="reserved_filler must be >= 0"):
         OverwriteConfig(vocab_size=512, seq_len=128, num_keys=(8,), reserved_filler=-4)
     with pytest.raises(ValueError, match="at least one key id"):
         OverwriteConfig(vocab_size=512, seq_len=128, num_keys=(8,), reserved_filler=255)
-    with pytest.raises(ValueError, match="key ids"):
+    # Too few key ids even for feasibility: V/2 - 1 - F = 15 < K = 16.
+    with pytest.raises(ValueError, match="only 15 ids, fewer than 16"):
         OverwriteConfig(
-            vocab_size=512, seq_len=128, num_keys=(8, 16), reserved_filler=240
+            vocab_size=512, seq_len=128, num_keys=(16,), reserved_filler=240
         )
-    # Exact-boundary config: V/2 - 1 - F == max(num_keys) is accepted.
-    config = OverwriteConfig(
-        vocab_size=512, seq_len=128, num_keys=(16,), reserved_filler=239
-    )
+
+
+def test_sampler_bounds_validation():
+    """The without-replacement samplers must not stall: configs just below
+    the key or value bound raise ValueError, and a config exactly at the
+    (binding) value bound is accepted and generates quickly.
+
+    Key bound: n_key = V/2 - 1 - F >= K(K-1)/2 keeps the per-round success
+    probability of drawing K distinct keys above ~1/e. Value bound:
+    V/2 >= K(2K-1) for the 2K distinct values. For K = 16 the value bound
+    (496) is the binding one: V = 240 leaves 119 key ids (< 120, key bound
+    violated), V = 990 leaves V/2 = 495 (< 496, value bound violated),
+    and V = 992 sits exactly at it.
+    """
+    with pytest.raises(ValueError, match="stall the key sampler"):
+        OverwriteConfig(vocab_size=240, seq_len=128, num_keys=(16,))
+    with pytest.raises(ValueError, match="stall the value sampler"):
+        OverwriteConfig(vocab_size=990, seq_len=128, num_keys=(16,))
+    config = OverwriteConfig(vocab_size=992, seq_len=128, num_keys=(16,))
     batch = generate_overwrite(config, num_examples=4, seed=3)
     assert batch["input_ids"].shape == (4, 128)
+
+
+def test_fixed_num_keys_override_is_validated():
+    """generate_overwrite with a fixed num_keys validates the override
+    against the same feasibility and sampler bounds as the config's own
+    entries, raising ValueError before any sampling.
+    """
+    # Placement-infeasible override: 6 * 24 = 144 > 128 tokens.
+    with pytest.raises(ValueError, match="infeasible num_keys entry 24"):
+        generate_overwrite(SMALL, num_examples=2, seed=0, num_keys=24)
+    # Sampler-infeasible override: K=21 passes placement (6 * 21 = 126)
+    # and the key bound (K(K-1)/2 = 210 <= 511) but needs 2K = 42 values
+    # from V/2 = 512 ids: K(2K-1) = 21 * 41 = 861 > 512.
+    with pytest.raises(ValueError, match="stall the value sampler"):
+        generate_overwrite(SMALL, num_examples=2, seed=0, num_keys=21)
+
+
+def test_distinct_ints_round_cap_raises():
+    """_distinct_ints gives up after a fixed number of redraw rounds,
+    raising RuntimeError that names the range and the draw count, instead
+    of looping forever on an impossible request.
+    """
+    rng = np.random.default_rng(0)
+    with pytest.raises(RuntimeError, match=r"3 distinct values.*\[0, 2\)"):
+        _distinct_ints(rng, 0, 2, (1, 3))
 
 
 # =============================================================================

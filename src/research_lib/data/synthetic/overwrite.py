@@ -96,6 +96,12 @@ pilot grid settings; tight configs that pass the construction-time check
 can still need restarts (e.g. all-distant K=42 at T=256 restarts ~79% of
 examples))."""
 
+_MAX_SAMPLING_ROUNDS = 10_000
+"""Hard cap on redraw rounds of :func:`_distinct_ints` before a
+RuntimeError. The configuration-time sampler bounds keep valid configs
+far below this; a hit means a caller bypassed them (e.g. an impossible
+draw)."""
+
 
 class OverwriteClass(enum.IntEnum):
     """Placement classes, encoded in ``key_class`` at answer positions."""
@@ -137,8 +143,13 @@ class OverwriteConfig:
             can ever equal a key or value and no draw needs rejection.
 
     Note:
-        ``reserved_filler`` must satisfy ``0 <= F < V/2 - 1`` and leave at
-        least ``max(num_keys)`` key ids: ``V/2 - 1 - F >= max(num_keys)``.
+        ``reserved_filler`` must satisfy ``0 <= F < V/2 - 1``. The
+        without-replacement samplers (keys from the key half, values from
+        the value half) must not stall: every slice value ``K`` needs at
+        least ``K`` distinct key ids, and the expected number of redraws
+        per row must stay bounded, which requires
+        ``V/2 - 1 - F >= K (K - 1) / 2`` key ids and ``V/2 >= K (2 K - 1)``
+        value ids (per-row success probability at least about ``1/e``).
     """
 
     vocab_size: int = 8192
@@ -168,19 +179,13 @@ class OverwriteConfig:
                 f"reserved_filler must be >= 0, got {self.reserved_filler}"
             )
         # Keys are drawn from [1, V/2 - F): at least one id must remain
-        # (F < V/2 - 1), and enough for the largest K (V/2 - 1 - F >= K_max).
+        # (F < V/2 - 1); the per-slice feasibility and sampler-stall checks
+        # live in _validate_key_count, which runs next for every entry.
         if self.reserved_filler > self.vocab_size // 2 - 2:
             raise ValueError(
                 f"reserved_filler ({self.reserved_filler}) must be < "
                 f"vocab_size // 2 - 1 = {self.vocab_size // 2 - 1} so at "
                 f"least one key id remains"
-            )
-        if self.vocab_size // 2 - 1 - self.reserved_filler < max(self.num_keys):
-            raise ValueError(
-                f"reserved_filler ({self.reserved_filler}) leaves "
-                f"{self.vocab_size // 2 - 1 - self.reserved_filler} key ids "
-                f"(keys come from [1, vocab_size // 2 - reserved_filler)), "
-                f"fewer than the largest num_keys entry {max(self.num_keys)}"
             )
         # Feasibility for EVERY entry (an all-distant assignment must fit:
         # 4K write tokens + 2K query tokens <= T, and the write region must
@@ -217,7 +222,17 @@ class OverwriteConfig:
 
 
 def _validate_key_count(config: OverwriteConfig, k: int) -> None:
-    """Feasibility checks for a fixed key count ``k``."""
+    """Feasibility and sampler-stall checks for a fixed key count ``k``.
+
+    Placement first (the all-distant worst case needs ``4K + 2K`` tokens;
+    the write region must span ``distant_min_blocks + 1`` blocks), then the
+    without-replacement samplers: ``k`` distinct keys from the ``n_key =
+    V/2 - 1 - F``-id key pool, and ``2K`` distinct values from the
+    ``n_val = V/2``-id value pool. Drawing by redrawing whole rows succeeds
+    per round with probability about ``exp(-K(K-1)/(2n))`` (keys) and
+    ``exp(-2K(2K-1)/V)`` (values); requiring ``n >= d(d-1)/2`` keeps the
+    expected redraws per row below about ``e``.
+    """
     if k < 1:
         raise ValueError(f"num_keys entries must be >= 1, got {k}")
     # All-distant worst case: 2K pair slots = 4K write tokens, plus the 2K
@@ -236,6 +251,37 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"region spans fewer than distant_min_blocks + 1 = "
             f"{config.distant_min_blocks + 1} blocks of "
             f"{config.block_size} tokens"
+        )
+    n_key = config.vocab_size // 2 - 1 - config.reserved_filler
+    if n_key < k:
+        raise ValueError(
+            f"infeasible num_keys entry {k}: keys come from "
+            f"[1, vocab_size // 2 - reserved_filler) = [1, {n_key + 1}), "
+            f"which has only {n_key} ids, fewer than {k} distinct keys"
+        )
+    if n_key < k * (k - 1) // 2:
+        raise ValueError(
+            f"num_keys entry {k} would stall the key sampler: drawing "
+            f"{k} distinct ids from the {n_key}-id key pool succeeds per "
+            f"round with probability ~exp(-K(K-1)/(2n)); keep n >= "
+            f"K(K-1)/2 = {k * (k - 1) // 2} key ids (success >= ~1/e) by "
+            f"increasing vocab_size or reducing reserved_filler"
+        )
+    n_val = config.vocab_size // 2
+    if n_val < 2 * k:
+        raise ValueError(
+            f"infeasible num_keys entry {k}: 2K = {2 * k} distinct values "
+            f"are needed but the value pool [vocab_size // 2, vocab_size) "
+            f"has only V/2 = {n_val} ids"
+        )
+    if n_val < k * (2 * k - 1):
+        raise ValueError(
+            f"num_keys entry {k} would stall the value sampler: drawing "
+            f"2K = {2 * k} distinct values from the {n_val}-id value pool "
+            f"succeeds per round with probability "
+            f"~exp(-2K(2K-1)/V); keep V/2 >= K(2K-1) = "
+            f"{k * (2 * k - 1)} value ids (success >= ~1/e) by increasing "
+            f"vocab_size"
         )
 
 
@@ -262,7 +308,15 @@ def _distinct_ints(
     """
     out = np.empty(shape, dtype=np.int64)
     pending = np.arange(shape[0])
+    rounds = 0
     while pending.size:
+        rounds += 1
+        if rounds > _MAX_SAMPLING_ROUNDS:
+            raise RuntimeError(
+                f"_distinct_ints: could not draw {shape[1]} distinct values "
+                f"from the range [{low}, {high}) in {_MAX_SAMPLING_ROUNDS} "
+                f"rounds"
+            )
         out[pending] = rng.integers(low, high, size=(pending.size, shape[1]))
         ordered = np.sort(out[pending], axis=1)
         duplicate = np.any(ordered[:, 1:] == ordered[:, :-1], axis=1)
