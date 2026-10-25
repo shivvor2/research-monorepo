@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -146,10 +147,11 @@ class OverwriteConfig:
         ``reserved_filler`` must satisfy ``0 <= F < V/2 - 1``. The
         without-replacement samplers (keys from the key half, values from
         the value half) must not stall: every slice value ``K`` needs at
-        least ``K`` distinct key ids, and the expected number of redraws
-        per row must stay bounded, which requires
-        ``V/2 - 1 - F >= K (K - 1) / 2`` key ids and ``V/2 >= K (2 K - 1)``
-        value ids (per-row success probability at least about ``1/e``).
+        least ``K`` distinct key ids, and the per-round success probability
+        of drawing distinct ids must stay at or above 1% (expected redraws
+        per row at most about 100), which requires
+        ``V/2 - 1 - F >= K (K - 1) / (2 ln 100)`` key ids and
+        ``V/2 >= 2 K (2 K - 1) / (2 ln 100)`` value ids.
     """
 
     vocab_size: int = 8192
@@ -229,9 +231,9 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
     without-replacement samplers: ``k`` distinct keys from the ``n_key =
     V/2 - 1 - F``-id key pool, and ``2K`` distinct values from the
     ``n_val = V/2``-id value pool. Drawing by redrawing whole rows succeeds
-    per round with probability about ``exp(-K(K-1)/(2n))`` (keys) and
-    ``exp(-2K(2K-1)/V)`` (values); requiring ``n >= d(d-1)/2`` keeps the
-    expected redraws per row below about ``e``.
+    per round with probability about ``exp(-d(d-1)/(2n))``; requiring
+    ``n >= d(d-1)/(2 ln 100)`` keeps that probability at or above 1%, so
+    the expected number of redraws per row is at most about 100.
     """
     if k < 1:
         raise ValueError(f"num_keys entries must be >= 1, got {k}")
@@ -259,12 +261,13 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"[1, vocab_size // 2 - reserved_filler) = [1, {n_key + 1}), "
             f"which has only {n_key} ids, fewer than {k} distinct keys"
         )
-    if n_key < k * (k - 1) // 2:
+    if 2 * math.log(100) * n_key < k * (k - 1):
         raise ValueError(
             f"num_keys entry {k} would stall the key sampler: drawing "
             f"{k} distinct ids from the {n_key}-id key pool succeeds per "
             f"round with probability ~exp(-K(K-1)/(2n)); keep n >= "
-            f"K(K-1)/2 = {k * (k - 1) // 2} key ids (success >= ~1/e) by "
+            f"K(K-1)/(2 ln 100) = {k * (k - 1) / (2 * math.log(100)):.2f} "
+            f"key ids (success >= 1%, expected redraws <= ~100) by "
             f"increasing vocab_size or reducing reserved_filler"
         )
     n_val = config.vocab_size // 2
@@ -274,13 +277,14 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"are needed but the value pool [vocab_size // 2, vocab_size) "
             f"has only V/2 = {n_val} ids"
         )
-    if n_val < k * (2 * k - 1):
+    if 2 * math.log(100) * n_val < 2 * k * (2 * k - 1):
         raise ValueError(
             f"num_keys entry {k} would stall the value sampler: drawing "
             f"2K = {2 * k} distinct values from the {n_val}-id value pool "
             f"succeeds per round with probability "
-            f"~exp(-2K(2K-1)/V); keep V/2 >= K(2K-1) = "
-            f"{k * (2 * k - 1)} value ids (success >= ~1/e) by increasing "
+            f"~exp(-2K(2K-1)/V); keep V/2 >= 2K(2K-1)/(2 ln 100) = "
+            f"{2 * k * (2 * k - 1) / (2 * math.log(100)):.2f} value ids "
+            f"(success >= 1%, expected redraws <= ~100) by increasing "
             f"vocab_size"
         )
 
