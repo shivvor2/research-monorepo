@@ -1,8 +1,8 @@
 """Repeated-key overwrite generator with placement classes.
 
-Procedural generator for the second pilot task (protocol ``06`` §4): ``K``
-distinct keys, each belonging to one **placement class** controlling the
-geometry of its writes:
+Procedural generator for the repeated-key overwrite task: ``K`` distinct
+keys, each belonging to one **placement class** controlling the geometry
+of its writes:
 
 - ``same``: ``(k, v_old)`` then ``(k, v_new)`` in the same ``block_size``
   token block;
@@ -15,7 +15,8 @@ Per example: the write region occupies positions ``[0, R)`` with
 ``R = T - 2K``, divided into ``R / 2`` two-token pair slots (slot ``i`` =
 positions ``2i``, ``2i + 1``); the query block occupies the last ``2K``
 positions as ``[key, answer_slot]`` pairs, each key once. Keys are drawn
-distinct from ``[1, V/2)``, values distinct from ``[V/2, V)`` (two per
+distinct from ``[1, V/2 - F)`` (``F = reserved_filler``), values distinct
+from ``[V/2, V)`` (two per
 double-write key with ``v_old != v_new`` since they are distinct draws,
 one per single key). The label at the answer slot of key ``k`` is the
 **latest** value; ``old_labels`` carries ``v_old`` at the answer slots of
@@ -24,23 +25,29 @@ token distance ``2 (s_2 - s_1)`` between the two writes (``-1`` for single
 keys); both ``-100`` / ``-1`` elsewhere. Labels follow the repo's unshifted
 convention (``labels[p]`` is predicted from ``p - 1``).
 
-Unlike MQAR, filler is drawn from ``[1, V)`` **excluding this example's keys
-and values** (rejection sampling), so a filler token can never act as an
-extra write to a queried key.
+Unlike MQAR, filler is drawn from ``[1, V)`` **excluding this example's
+keys and values** (rejection sampling), so a filler token can never act as
+an extra write to a queried key. Roughly a quarter of filler two-token
+pairs are then indistinguishable from a real write (a key-range token
+followed by a value-range token). With ``reserved_filler=F > 0`` the key
+half is split further: keys come from ``[1, V/2 - F)``, values from
+``[V/2, V)`` as usual, and filler is drawn uniformly from the *reserved*
+range ``[V/2 - F, V/2)`` only. A filler token can then never equal any key
+or value, so no filler pair can mimic a write.
 
 Implementation: BATCH-VECTORIZED (throughput). ``generate_overwrite``
 generates all examples of a call — and of each restart round — in
 vectorized numpy passes; per-example placement state lives in a boolean
-mask over the pair slots. The per-example random procedure is the spec's:
+mask over the pair slots. The per-example random procedure is:
 
 - ``K``: uniform over ``config.num_keys`` (or fixed via ``num_keys``);
 - classes: iid categorical draws from ``class_probs``;
 - keys / values: uniform draws without replacement (rejection on
   duplicates within a row);
-- placement: keys processed in index order ``t = 0, 1, ...`` — the spec's
-  "process keys in random order" is distributionally equivalent because
-  the classes are iid (the class sequence in processing order has the same
-  law in any order) and the (key, value) pairs are exchangeable.
+- placement: keys processed in index order ``t = 0, 1, ...`` — the
+  intended "process keys in random order" is distributionally equivalent
+  because the classes are iid (the class sequence in processing order has
+  the same law in any order) and the (key, value) pairs are exchangeable.
   ``s_1`` is uniform over the free pair slots, ``s_2`` uniform over the
   free slots satisfying the class block rule given ``s_1`` (the slots of a
   block are contiguous, so the valid slots form a slice ``[a, b)``);
@@ -51,7 +58,10 @@ mask over the pair slots. The per-example random procedure is the spec's:
   ``_MAX_EXAMPLE_RESTARTS`` restarts per example);
 - query block: each key once, in uniform random order (a uniform
   permutation per example);
-- filler: uniform over ``[1, V)`` excluding the example's keys and values.
+- filler: uniform over ``[1, V)`` excluding the example's keys and
+  values (default), or uniform over the reserved range
+  ``[V/2 - F, V/2)`` with ``reserved_filler=F > 0``, which is disjoint
+  from every key and value.
 
 Because the batch implementation draws its randomness in a different
 order than a per-example loop, its random streams are its own: generator
@@ -65,6 +75,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -82,9 +93,19 @@ NO_DISTANCE = -1
 
 _MAX_EXAMPLE_RESTARTS = 100
 """Hard cap on example restarts (safety net; never observed at the
-protocol settings; tight configs that pass the construction-time check
+pilot grid settings; tight configs that pass the construction-time check
 can still need restarts (e.g. all-distant K=42 at T=256 restarts ~79% of
 examples))."""
+
+_MAX_SAMPLING_ROUNDS = 10_000
+"""Hard cap on redraw rounds of :func:`_distinct_ints` before a
+RuntimeError. The configuration-time sampler bounds keep valid configs
+far below this; a hit means a caller bypassed them (e.g. an impossible
+draw)."""
+
+_SAMPLER_LOG_FLOOR = math.log(0.01)
+"""log of the per-round success floor (1%) for the without-replacement
+samplers; the expected number of redraws per row is then at most ~100."""
 
 
 class OverwriteClass(enum.IntEnum):
@@ -101,20 +122,39 @@ class OverwriteConfig:
     """Configuration for the repeated-key overwrite generator.
 
     Args:
-        vocab_size: vocabulary size ``V``. Keys come from ``[1, V/2)``,
-            values from ``[V/2, V)``.
+        vocab_size: vocabulary size ``V``. Keys come from ``[1, V/2)``
+            (or ``[1, V/2 - F)`` with ``reserved_filler=F > 0``), values
+            from ``[V/2, V)``.
         seq_len: sequence length ``T`` (must be even).
         num_keys: the slice values: number of keys ``K`` drawn uniformly per
-            example. Protocol: ``K in {d_k / 2, d_k, 2 d_k}``.
+            example. Typical grids: ``K in {d_k / 2, d_k, 2 d_k}``.
         class_probs: class assignment probabilities per key, in
             ``(same, adjacent, distant, single)`` order. Must sum to 1.
-        block_size: placement block size ``B`` in tokens. The protocol uses
-            ``B = C = 16``.
+        block_size: placement block size ``B`` in tokens (``B = C = 16`` in
+            the pilot).
         distant_min_blocks: minimum block distance for the ``distant``
             class.
         max_placement_attempts: per-key retry budget when drawing the first
             write slot ``s_1``; an example is restarted when a key exhausts
             it.
+        reserved_filler: number ``F`` of token ids at the top of the key
+            half, ``[V/2 - F, V/2)``, reserved exclusively for filler.
+            ``0`` (default): current behaviour, unchanged bit for bit —
+            filler is drawn from ``[1, V)`` excluding each example's own
+            keys and values (rejection sampling), and existing seeds
+            reproduce existing data. ``F > 0``: keys come from
+            ``[1, V/2 - F)`` (values unchanged from ``[V/2, V)``) and
+            filler comes from the reserved range only, so no filler token
+            can ever equal a key or value and no draw needs rejection.
+
+    Note:
+        ``reserved_filler`` must satisfy ``0 <= F < V/2 - 1``. The
+        without-replacement samplers (keys from the key half, values from
+        the value half) must not stall: every slice value ``K`` needs at
+        least ``K`` distinct key ids, and drawing ``d`` ids from an
+        ``n``-id pool must succeed per round with exact probability
+        ``n! / ((n - d)! n^d)`` of at least 1% (expected redraws per row
+        at most about 100).
     """
 
     vocab_size: int = 8192
@@ -124,6 +164,7 @@ class OverwriteConfig:
     block_size: int = 16
     distant_min_blocks: int = 4
     max_placement_attempts: int = 100
+    reserved_filler: int = 0
 
     def __post_init__(self) -> None:
         if self.seq_len % 2 != 0:
@@ -138,6 +179,19 @@ class OverwriteConfig:
         duplicates = sorted({k for k in self.num_keys if self.num_keys.count(k) > 1})
         if duplicates:
             raise ValueError(f"duplicate num_keys entries: {duplicates}")
+        if self.reserved_filler < 0:
+            raise ValueError(
+                f"reserved_filler must be >= 0, got {self.reserved_filler}"
+            )
+        # Keys are drawn from [1, V/2 - F): at least one id must remain
+        # (F < V/2 - 1); the per-slice feasibility and sampler-stall checks
+        # live in _validate_key_count, which runs next for every entry.
+        if self.reserved_filler > self.vocab_size // 2 - 2:
+            raise ValueError(
+                f"reserved_filler ({self.reserved_filler}) must be < "
+                f"vocab_size // 2 - 1 = {self.vocab_size // 2 - 1} so at "
+                f"least one key id remains"
+            )
         # Feasibility for EVERY entry (an all-distant assignment must fit:
         # 4K write tokens + 2K query tokens <= T, and the write region must
         # span at least distant_min_blocks + 1 blocks).
@@ -172,8 +226,28 @@ class OverwriteConfig:
         return tuple(sorted(self.num_keys))
 
 
+def _sampler_log_prob(n: int, d: int) -> float:
+    """Exact log-probability that ``d`` uniform draws from ``n`` ids (with
+    replacement) come out distinct: ``log(n! / ((n - d)! n^d))``, computed
+    via log-gammas so it never overflows. Requires ``1 <= d <= n`` (the
+    ``n >= d`` feasibility check runs first).
+    """
+    return math.lgamma(n + 1) - math.lgamma(n - d + 1) - d * math.log(n)
+
+
 def _validate_key_count(config: OverwriteConfig, k: int) -> None:
-    """Feasibility checks for a fixed key count ``k``."""
+    """Feasibility and sampler-stall checks for a fixed key count ``k``.
+
+    Placement first (the all-distant worst case needs ``4K + 2K`` tokens;
+    the write region must span ``distant_min_blocks + 1`` blocks), then the
+    without-replacement samplers: ``k`` distinct keys from the ``n_key =
+    V/2 - 1 - F``-id key pool, and ``2K`` distinct values from the
+    ``n_val = V/2``-id value pool. Drawing by redrawing whole rows succeeds
+    per round with the exact probability ``n! / ((n - d)! n^d)`` of ``d``
+    distinct draws from ``n`` ids (computed in log space); requiring that
+    probability to be at least 1% keeps the expected number of redraws per
+    row at most about 100.
+    """
     if k < 1:
         raise ValueError(f"num_keys entries must be >= 1, got {k}")
     # All-distant worst case: 2K pair slots = 4K write tokens, plus the 2K
@@ -192,6 +266,43 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"region spans fewer than distant_min_blocks + 1 = "
             f"{config.distant_min_blocks + 1} blocks of "
             f"{config.block_size} tokens"
+        )
+    n_key = config.vocab_size // 2 - 1 - config.reserved_filler
+    if n_key < k:
+        raise ValueError(
+            f"infeasible num_keys entry {k}: keys come from "
+            f"[1, vocab_size // 2 - reserved_filler) = [1, {n_key + 1}), "
+            f"which has only {n_key} ids, fewer than {k} distinct keys"
+        )
+    log_key = _sampler_log_prob(n_key, k)
+    if log_key < _SAMPLER_LOG_FLOOR:
+        prob = math.exp(log_key)
+        raise ValueError(
+            f"num_keys entry {k} would stall the key sampler: drawing "
+            f"{k} distinct ids from the {n_key}-id key pool succeeds with "
+            f"exact probability {n_key}! / (({n_key} - {k})! * "
+            f"{n_key}^{k}) = {prob:.3%}, below the 1% floor (expected "
+            f"redraws ~{1.0 / prob:.0f} per row); increase vocab_size or "
+            f"reduce reserved_filler"
+        )
+    n_val = config.vocab_size // 2
+    if n_val < 2 * k:
+        raise ValueError(
+            f"infeasible num_keys entry {k}: 2K = {2 * k} distinct values "
+            f"are needed but the value pool [vocab_size // 2, vocab_size) "
+            f"has only V/2 = {n_val} ids"
+        )
+    d_val = 2 * k
+    log_value = _sampler_log_prob(n_val, d_val)
+    if log_value < _SAMPLER_LOG_FLOOR:
+        prob = math.exp(log_value)
+        raise ValueError(
+            f"num_keys entry {k} would stall the value sampler: drawing "
+            f"2K = {d_val} distinct values from the {n_val}-id value pool "
+            f"succeeds with exact probability {n_val}! / (({n_val} - "
+            f"{d_val})! * {n_val}^{d_val}) = {prob:.3%}, below the 1% "
+            f"floor (expected redraws ~{1.0 / prob:.0f} per row); "
+            f"increase vocab_size"
         )
 
 
@@ -218,7 +329,15 @@ def _distinct_ints(
     """
     out = np.empty(shape, dtype=np.int64)
     pending = np.arange(shape[0])
+    rounds = 0
     while pending.size:
+        rounds += 1
+        if rounds > _MAX_SAMPLING_ROUNDS:
+            raise RuntimeError(
+                f"_distinct_ints: could not draw {shape[1]} distinct values "
+                f"from the range [{low}, {high}) in {_MAX_SAMPLING_ROUNDS} "
+                f"rounds"
+            )
         out[pending] = rng.integers(low, high, size=(pending.size, shape[1]))
         ordered = np.sort(out[pending], axis=1)
         duplicate = np.any(ordered[:, 1:] == ordered[:, :-1], axis=1)
@@ -232,7 +351,8 @@ def _generate_example_batch(
     """Generate a batch of examples in vectorized numpy passes.
 
     Args:
-        config: task configuration.
+        config: task configuration, including the filler mode
+            (``reserved_filler``; see :class:`OverwriteConfig`).
         rng: numpy Generator (shared across the whole batch).
         k_arr: ``(n,)`` int64 key counts per row (already drawn or fixed).
 
@@ -270,10 +390,10 @@ def _generate_example_batch(
 
     valid_keys = np.arange(k_max, dtype=np.int64)[None, :] < k_arr[:, None]
     classes = rng.choice(4, size=(n, k_max), p=probs)
-    keys = _distinct_ints(rng, 1, vocab // 2, (n, k_max))
+    keys = _distinct_ints(rng, 1, vocab // 2 - config.reserved_filler, (n, k_max))
     values = _distinct_ints(rng, vocab // 2, vocab, (n, 2 * k_max))
-    # Query order (spec: "each key once, in random order"): a uniform
-    # permutation per row. Argsort of the row's uniforms with invalid keys
+    # Query order (each key once, in random order): a uniform permutation
+    # per row. Argsort of the row's uniforms with invalid keys
     # masked to +inf: the first K_r entries are then exactly the valid key
     # indices in uniform random order.
     uniforms = rng.random((n, k_max))
@@ -425,20 +545,29 @@ def _generate_example_batch(
             s2_arr[rows_dq, ts_dq] - s1_arr[rows_dq, ts_dq]
         )
 
-    # ---- Filler: uniform over [1, V) excluding this example's keys and
-    #      values (rejection; a (rows, vocab) lookup table is O(K) per row
-    #      and cheap at the pilot sizes). ----
-    forbidden = np.zeros((n, vocab), dtype=bool)
-    forbidden[rows_q, keys[rows_q, ts_q]] = True
-    forbidden[rows_q, values[rows_q, 2 * ts_q]] = True
-    forbidden[rows_q, values[rows_q, 2 * ts_q + 1]] = True
+    # ---- Filler ----
     fill_rows, fill_cols = np.nonzero(~occupied)
-    tokens = np.empty(fill_rows.size, dtype=np.int64)
-    pending_fill = np.arange(fill_rows.size)
-    while pending_fill.size:
-        tokens[pending_fill] = rng.integers(1, vocab, size=pending_fill.size)
-        rejected = forbidden[fill_rows[pending_fill], tokens[pending_fill]]
-        pending_fill = pending_fill[rejected]
+    if config.reserved_filler > 0:
+        # Reserved mode: uniform over the reserved range [V/2 - F, V/2)
+        # only, which is disjoint from every key and value, so a single
+        # draw needs no rejection.
+        tokens = rng.integers(
+            vocab // 2 - config.reserved_filler, vocab // 2, size=fill_rows.size
+        )
+    else:
+        # Default mode: uniform over [1, V) excluding this example's keys
+        # and values (rejection; a (rows, vocab) lookup table is O(K) per
+        # row and cheap at the pilot sizes).
+        forbidden = np.zeros((n, vocab), dtype=bool)
+        forbidden[rows_q, keys[rows_q, ts_q]] = True
+        forbidden[rows_q, values[rows_q, 2 * ts_q]] = True
+        forbidden[rows_q, values[rows_q, 2 * ts_q + 1]] = True
+        tokens = np.empty(fill_rows.size, dtype=np.int64)
+        pending_fill = np.arange(fill_rows.size)
+        while pending_fill.size:
+            tokens[pending_fill] = rng.integers(1, vocab, size=pending_fill.size)
+            rejected = forbidden[fill_rows[pending_fill], tokens[pending_fill]]
+            pending_fill = pending_fill[rejected]
 
     input_ids[fill_rows, fill_cols] = tokens
 
@@ -489,7 +618,7 @@ def generate_overwrite(
             ``config.seq_len``.
         RuntimeError: if placement fails for an example after
             ``_MAX_EXAMPLE_RESTARTS`` restarts (never observed at the
-            protocol settings; tight configs that pass the
+            pilot grid settings; tight configs that pass the
             construction-time check can still need restarts, e.g.
             all-distant K=42 at T=256 restarts ~79% of examples).
 

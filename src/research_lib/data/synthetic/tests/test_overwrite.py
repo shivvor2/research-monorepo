@@ -13,19 +13,31 @@ Covers:
 Run with: pytest src/research_lib/data/synthetic/tests/test_overwrite.py -v
 """
 
+import dataclasses
+import hashlib
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
+import yaml
 
-from ..overwrite import OverwriteClass, OverwriteConfig, generate_overwrite
+from ..overwrite import (
+    OverwriteClass,
+    OverwriteConfig,
+    _distinct_ints,
+    generate_overwrite,
+)
 from ._reference import generate_overwrite_reference
 
 IGNORE = -100
 NO_CLASS = -1
 NO_DISTANCE = -1
 
-# Small but feasible config: 6 * K <= T for the largest K and the write
-# region spans >= distant_min_blocks + 1 blocks.
+# Small but feasible config: 6 * K <= T for the largest K, the write
+# region spans >= distant_min_blocks + 1 blocks, and the without-
+# replacement samplers stay within the 1%-per-round success bound
+# (values: 2K = 32 distinct ids from V/2 = 256; keys: 16 from 255).
 SMALL = OverwriteConfig(
     vocab_size=512,
     seq_len=128,
@@ -279,6 +291,226 @@ def test_overwrite_determinism():
         assert torch.equal(batch[key], again[key]), f"{key} differs"
     other = generate_overwrite(SMALL, num_examples=16, seed=43)
     assert not torch.equal(batch["input_ids"], other["input_ids"])
+
+
+# =============================================================================
+# Tests: reserved filler (reserved_filler option)
+# =============================================================================
+
+# Digest of the fixed-seed batch ``(config=SMALL, num_examples=64, seed=3)``
+# from the generator before ``reserved_filler`` existed. It is also the
+# digest of the F = 0 batch now, so the option provably leaves default-
+# mode output byte-for-byte unchanged (existing seeds reproduce existing
+# data).
+_SNAPSHOT_DEFAULT_MODE = (
+    "399cf21407ab24c6d244ec798946509720a5ce464b285c89e75e87e2877d6696"
+)
+
+
+def test_default_filler_mode_matches_snapshot():
+    """The default mode (``reserved_filler=0``) reproduces the fixed-seed
+    batch byte for byte, untouched by the reserved-filler option.
+
+    The digest pins the generator's default-mode output at the state
+    before the option existed; it guards the promise that ``F = 0``
+    changes nothing (existing seeds reproduce existing data).
+    ``numpy.random.default_rng`` streams are stable across numpy
+    releases, which keeps the fixed seed well-defined.
+    """
+    batch = generate_overwrite(SMALL, num_examples=64, seed=3)
+    digest = hashlib.sha256()
+    for name in sorted(batch):
+        digest.update(name.encode())
+        digest.update(batch[name].numpy().tobytes())
+    assert digest.hexdigest() == _SNAPSHOT_DEFAULT_MODE
+
+
+def test_explicit_zero_reserved_filler_matches_default():
+    """``reserved_filler=0`` is the default: the explicit config is equal
+    to the bare one and generates an identical batch from the same seed.
+    """
+    config = OverwriteConfig(vocab_size=512, seq_len=128, num_keys=(8,))
+    explicit = OverwriteConfig(
+        vocab_size=512, seq_len=128, num_keys=(8,), reserved_filler=0
+    )
+    assert explicit == config
+    batch = generate_overwrite(config, num_examples=16, seed=3)
+    batch_explicit = generate_overwrite(explicit, num_examples=16, seed=3)
+    for name in batch:
+        assert torch.equal(batch[name], batch_explicit[name]), name
+
+
+def _check_reserved_filler_ranges(config, input_ids, labels, expected_k):
+    """Range guarantees of the reserved mode for one example.
+
+    Keys come from ``[1, V/2 - F)``, values from ``[V/2, V)``, and every
+    filler token — including the tokens at the label answer slots — lies
+    in the reserved range ``[V/2 - F, V/2)``, which is disjoint from both
+    key and value ranges.
+    """
+    seq_len, vocab = config.seq_len, config.vocab_size
+    f_lo = vocab // 2 - config.reserved_filler
+    x = input_ids.tolist()
+    lab = labels.tolist()
+    write_region = seq_len - 2 * expected_k
+    answers = [p for p, t in enumerate(lab) if t != IGNORE]
+    keys = {x[a - 1] for a in answers}
+    assert all(1 <= key < f_lo for key in keys), "keys must come from [1, V/2-F)"
+    # Key occurrences in the write region are exactly the writes (filler
+    # can never equal a key in this mode).
+    write_key_positions = [p for p in range(write_region) if x[p] in keys]
+    occupied = (
+        set(write_key_positions)
+        | {p + 1 for p in write_key_positions}
+        | {a - 1 for a in answers}
+    )
+    values = [x[p + 1] for p in write_key_positions]
+    assert all(vocab // 2 <= v < vocab for v in values), "values outside [V/2, V)"
+    filler_tokens = [x[p] for p in range(seq_len) if p not in occupied]
+    assert all(
+        f_lo <= t < vocab // 2 for t in filler_tokens
+    ), f"filler outside the reserved range [{f_lo}, {vocab // 2})"
+
+
+def test_reserved_filler_structure():
+    """With ``reserved_filler=F`` examples keep the task's geometry
+    (placement classes, latest-value labels, query block) and restrict
+    keys, values and filler to their three disjoint ranges.
+    """
+    config = OverwriteConfig(
+        vocab_size=4096, seq_len=256, num_keys=(16, 32), reserved_filler=256
+    )
+    batch = generate_overwrite(config, num_examples=12, seed=5)
+    for e in range(12):
+        k = int(batch["slice_id"][e])
+        check_overwrite_example(
+            config,
+            batch["input_ids"][e],
+            batch["labels"][e],
+            batch["old_labels"][e],
+            batch["key_class"][e],
+            batch["write_distance"][e],
+            k,
+        )
+        _check_reserved_filler_ranges(
+            config, batch["input_ids"][e], batch["labels"][e], k
+        )
+
+
+def test_reserved_filler_validation():
+    """Construction-time validation: F must be >= 0 and must leave at
+    least one key id.
+    """
+    with pytest.raises(ValueError, match="reserved_filler must be >= 0"):
+        OverwriteConfig(vocab_size=512, seq_len=128, num_keys=(8,), reserved_filler=-4)
+    with pytest.raises(ValueError, match="at least one key id"):
+        OverwriteConfig(vocab_size=512, seq_len=128, num_keys=(8,), reserved_filler=255)
+    # Too few key ids even for feasibility: V/2 - 1 - F = 15 < K = 16.
+    with pytest.raises(ValueError, match="only 15 ids, fewer than 16"):
+        OverwriteConfig(
+            vocab_size=512, seq_len=128, num_keys=(16,), reserved_filler=240
+        )
+
+
+def test_sampler_bounds_validation():
+    """The without-replacement samplers must not stall: exactly at the
+    1% probability floor they are accepted and generate; one id below they
+    raise.
+
+    A row of ``d`` distinct ids drawn from an ``n``-id pool succeeds per
+    round with the exact probability ``n! / ((n - d)! n^d)``. For K = 16
+    the key draw (d = 16) needs at least 32 key ids — reached at V = 240
+    with F = 87 (n_key = 32 => P = 1.04%); F = 88 leaves 31 ids
+    (P = 0.86%). The value draw (d = 32) needs at least 119 value ids:
+    V/2 = 119 (V = 238) => P = 1.01% accepted, V/2 = 118 (V = 236)
+    => P = 0.97% raises.
+    """
+    # A near-full key pool drives the approximation far too optimistic:
+    # 11 distinct ids from 12 has exact probability 12!/12^11 = 0.06%.
+    with pytest.raises(ValueError, match="stall the key sampler"):
+        OverwriteConfig(
+            vocab_size=512, seq_len=128, num_keys=(11,), reserved_filler=243
+        )
+    with pytest.raises(ValueError, match="stall the key sampler"):
+        OverwriteConfig(vocab_size=240, seq_len=128, num_keys=(16,), reserved_filler=88)
+    config = OverwriteConfig(
+        vocab_size=240, seq_len=128, num_keys=(16,), reserved_filler=87
+    )
+    batch = generate_overwrite(config, num_examples=4, seed=3)
+    assert batch["input_ids"].shape == (4, 128)
+    with pytest.raises(ValueError, match="stall the value sampler"):
+        OverwriteConfig(vocab_size=236, seq_len=128, num_keys=(16,))
+    config = OverwriteConfig(vocab_size=238, seq_len=128, num_keys=(16,))
+    batch = generate_overwrite(config, num_examples=4, seed=3)
+    assert batch["input_ids"].shape == (4, 128)
+
+
+def test_fixed_num_keys_override_is_validated():
+    """generate_overwrite with a fixed num_keys validates the override
+    against the same feasibility and sampler bounds as the config's own
+    entries, raising ValueError before any sampling.
+    """
+    # Placement-infeasible override: 6 * 24 = 144 > 128 tokens.
+    with pytest.raises(ValueError, match="infeasible num_keys entry 24"):
+        generate_overwrite(SMALL, num_examples=2, seed=0, num_keys=24)
+    # Sampler-infeasible override: K=24 passes placement (6 * 24 = 144)
+    # and the key check (P(72, 24) = 1.3% > 1%), but drawing 2K = 48
+    # values from V/2 = 73 ids has exact probability 73!/(25! * 73^48)
+    # = 1.0e-9, far below the 1% floor.
+    with pytest.raises(ValueError, match="stall the value sampler"):
+        generate_overwrite(
+            OverwriteConfig(vocab_size=146, seq_len=144, num_keys=(4,)),
+            num_examples=2,
+            seed=0,
+            num_keys=24,
+        )
+
+
+def test_pilot_task_configs_construct_and_generate():
+    """The pilot's overwrite task YAMLs stay valid under the sampler
+    bounds: build OverwriteConfig from each (at the configured
+    ``reserved_filler`` and at ``F = 512``) and generate a few examples
+    without error.
+    """
+    root = Path(__file__).resolve().parents[5]
+    tasks = (
+        root
+        / "experiments"
+        / "03_multistate_gdn2"
+        / "01_synthetic_pilot"
+        / "conf"
+        / "task"
+    )
+    for name in ("overwrite.yaml", "overwrite_dk32.yaml"):
+        with (tasks / name).open() as handle:
+            task = yaml.safe_load(handle)
+        config = OverwriteConfig(
+            vocab_size=task["vocab_size"],
+            seq_len=task["seq_len"],
+            num_keys=tuple(task["num_keys"]),
+            class_probs=tuple(task["class_probs"]),
+            block_size=task["block_size"],
+            distant_min_blocks=task["distant_min_blocks"],
+            max_placement_attempts=task["max_placement_attempts"],
+            reserved_filler=task["reserved_filler"],
+        )
+        for reserved_filler in (0, 512):
+            batch = generate_overwrite(
+                dataclasses.replace(config, reserved_filler=reserved_filler),
+                num_examples=2,
+                seed=3,
+            )
+            assert batch["input_ids"].shape == (2, task["seq_len"])
+
+
+def test_distinct_ints_round_cap_raises():
+    """_distinct_ints gives up after a fixed number of redraw rounds,
+    raising RuntimeError that names the range and the draw count, instead
+    of looping forever on an impossible request.
+    """
+    rng = np.random.default_rng(0)
+    with pytest.raises(RuntimeError, match=r"3 distinct values.*\[0, 2\)"):
+        _distinct_ints(rng, 0, 2, (1, 3))
 
 
 # =============================================================================

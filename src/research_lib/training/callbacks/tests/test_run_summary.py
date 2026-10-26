@@ -117,10 +117,15 @@ def make_loader():
             return 64
 
         def __getitem__(self, index):
+            # One answer per sequence (a valid token id for the tiny
+            # model) and a valid slice id: RecallMetrics raises on
+            # sequences with no answer positions.
+            labels = torch.full((8, 16), -100, dtype=torch.long)
+            labels[:, -1] = 1
             return {
                 "input_ids": torch.zeros(8, 16, dtype=torch.long),
-                "labels": torch.full((8, 16), -100, dtype=torch.long),
-                "slice_id": torch.zeros(8, dtype=torch.long),
+                "labels": labels,
+                "slice_id": torch.full((8,), 4, dtype=torch.long),
             }
 
     return torch.utils.data.DataLoader(_DictDataset(), batch_size=None)

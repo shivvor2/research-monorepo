@@ -520,6 +520,7 @@ def build_task_config(cfg: DictConfig):
             block_size=cfg.task.block_size,
             distant_min_blocks=cfg.task.distant_min_blocks,
             max_placement_attempts=cfg.task.max_placement_attempts,
+            reserved_filler=cfg.task.reserved_filler,
         )
     raise ValueError(f"unknown task {name!r}")
 

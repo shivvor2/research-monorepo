@@ -16,6 +16,9 @@ class_probs: [0.25, 0.25, 0.25, 0.25]
 block_size: 16                      # B = C
 distant_min_blocks: 4
 max_placement_attempts: 100
+reserved_filler: 0                  # F = 0: fill from the full vocab minus
+                                    #   keys/values; F > 0: fill only from
+                                    #   [V/2 - F, V/2), reserved for filler
 
 # Longest sequence the model will see on this task.
 max_seq_len: 512
