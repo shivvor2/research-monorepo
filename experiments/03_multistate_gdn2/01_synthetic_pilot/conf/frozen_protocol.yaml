@@ -5,7 +5,7 @@
 # with experiment.phase >= 2 until frozen is true, and resolves
 # optimizer.lr (when null) from lr_table[task][layout][gate_mode].
 
-frozen: false
+frozen: true
 
 # d_model chosen in calibration from {32, 64}.
 d_model: 32
@@ -20,24 +20,24 @@ harness:
 # from {1e-3, 3e-3, 1e-2}.
 lr_table:
   mqar:
-    single: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
-    ws: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    single: {full: 0.001, b_only: null, w_only: null, kda: 0.01, gdn: null}
+    ws: {full: 0.01, b_only: null, w_only: null, kda: 0.003, gdn: null}
     fs: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
-    ll: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    ll: {full: 0.003, b_only: null, w_only: null, kda: 0.01, gdn: null}
   overwrite:
-    single: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
-    ws: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    single: {full: 0.01, b_only: null, w_only: null, kda: 0.001, gdn: null}
+    ws: {full: 0.01, b_only: null, w_only: null, kda: 0.001, gdn: null}
     fs: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
-    ll: {full: null, b_only: null, w_only: null, kda: null, gdn: null}
+    ll: {full: 0.01, b_only: null, w_only: null, kda: 0.001, gdn: null}
 
 # Anchor LRs (tier 6), keyed by d_model, then layout. The anchors use gate
 # gdn (never calibrated in lr_table) and get their own sweep,
 # conf/sweep/calib_lr_anchors.yaml (36 short runs: layouts {single, ll} x
 # d_model {16, 32, 64} x 3 LRs x seeds 100-101).
 anchor_lr:
-  16: {single: null, ll: null}
-  32: {single: null, ll: null}
-  64: {single: null, ll: null}
+  16: {single: 0.01, ll: 0.01}
+  32: {single: 0.01, ll: 0.01}
+  64: {single: 0.01, ll: 0.003}
 
 # The overwrite task file that goes with the chosen d_model: the largest K
 # must equal 2 * d_k (d_k = d_model / num_heads when head_dim is unset),
