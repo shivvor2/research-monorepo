@@ -23,21 +23,29 @@ ARTIFACT_TYPE = "run_record"
 def artifact_name(run_id: str) -> str:
     """The artifact collection name of a run record: ``run-<run_id>``.
 
-    W&B artifact names allow only ``[A-Za-z0-9._-]``; a run ID can carry
-    other characters (a learning rate rendered by ``%g`` can contain a
-    ``+``, e.g. ``1e+06``), so every other character is replaced by
-    ``-``. The keystore sees artifacts named by run ID: the collection
-    name is the run's, so a re-upload of the same run (a relaunch)
-    creates the next version of the same collection.
+    W&B artifact names allow only ``[A-Za-z0-9._-]``, exactly the
+    characters a generated run ID carries. The collection name is the
+    run's, so a re-upload of the same run (a relaunch) creates the next
+    version of the same collection.
 
     Args:
         run_id: The run ID (also the run record's file stem).
 
     Returns:
-        ``run-<run_id>`` with all characters outside ``[A-Za-z0-9._-]``
-        replaced by ``-``.
+        ``run-<run_id>``.
+
+    Raises:
+        ValueError: The run ID contains a character outside
+            ``[A-Za-z0-9._-]``. Run IDs are generated, so this signals a
+            bug; mapping such a character to ``-`` would silently put two
+            distinct runs in the same collection (e.g. ``1e+06`` and
+            ``1e-06``).
     """
-    return "run-" + re.sub(r"[^A-Za-z0-9._-]", "-", run_id)
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
+        raise ValueError(
+            f"run ID {run_id!r} contains a character outside [A-Za-z0-9._-]"
+        )
+    return "run-" + run_id
 
 
 def run_record_metadata(record: dict[str, Any]) -> dict[str, Any]:

@@ -21,7 +21,14 @@ The decision per artifact, against the local record at
   never overwritten;
 - any other status -> replaced by the artifact's record.
 
-Every downloaded record is checked: it must parse and be ``test_done``.
+A download is installed only after its staged record is validated
+against the artifact's metadata (status ``test_done`` and a matching
+identity), and the record JSON is the last file moved into place, so a
+crash mid-install leaves no new ``test_done`` record and the next pull
+retries. A real install takes the run's lock (``runs/<task>/<run_id>.lock``,
+the same file training holds); ``--check`` takes no lock and writes
+nothing.
+
 The per-tier report counts the local ``test_done`` records against the
 protocol's expected counts and lists the run IDs that are still missing
 locally. The exit code is non-zero on any conflict (1) or check
@@ -40,6 +47,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -50,6 +58,8 @@ from typing import Any
 from omegaconf import OmegaConf
 from pilot_analysis.protocol import EXPECTED_RUNS
 from wandb_artifacts import ARTIFACT_TYPE
+
+from research_lib.utils.run_lock import exclusive_lock
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +91,24 @@ def artifact_tier(metadata: dict[str, Any]) -> str:
     return str(tier) if tier else "none"
 
 
+def version_index(version: str | int | None) -> int:
+    """The integer N of a W&B artifact version ``"vN"``; -1 when absent
+    or malformed.
+
+    Accepts ``int`` too (harmless, keeps the helper robust) and returns
+    ``-1`` for ``None`` or anything that does not match ``^v(\\d+)$``, so
+    the newest-version pick in :func:`list_run_record_artifacts` never
+    compares the raw strings (a lexicographic ``max`` would pick
+    ``"v9"`` over ``"v10"``).
+    """
+    if version is None:
+        return -1
+    if isinstance(version, int):
+        return version
+    match = re.fullmatch(r"v(\d+)", str(version))
+    return int(match.group(1)) if match else -1
+
+
 def list_run_record_artifacts(
     api: Any, project: str, entity: str | None, tier: str | None = None
 ) -> list[Any]:
@@ -95,16 +123,19 @@ def list_run_record_artifacts(
 
     Returns:
         One artifact per collection: the newest version by version
-        number (order-independent). Collections whose metadata carries
-        no run ID are not run records of this pilot and are skipped.
+        number (order-independent), found by paging through every
+        version of each collection (``collection.artifacts()`` is a
+        paginator the public API fully drains in a for/list).
+        Collections whose metadata carries no run ID are not run
+        records of this pilot and are skipped.
     """
     project_path = f"{entity}/{project}" if entity else project
     artifacts = []
     for collection in api.artifact_collections(project_path, ARTIFACT_TYPE):
-        versions = list(collection.artifacts)
+        versions = list(collection.artifacts())
         if not versions:
             continue
-        artifact = max(versions, key=lambda a: a.version or 0)
+        artifact = max(versions, key=lambda a: version_index(a.version))
         metadata = dict(artifact.metadata or {})
         if not metadata.get("run_id"):
             continue
@@ -161,6 +192,51 @@ def pull_decision(local: dict[str, Any] | None, metadata: dict[str, Any]) -> str
         metadata.get("seed"),
     )
     return "skip" if same else "conflict"
+
+
+def staged_record_problem(record: dict | None, metadata: dict) -> str | None:
+    """Why a downloaded record must not be installed, or None if it may.
+
+    A downloaded record may be installed only when it is the completed
+    run the artifact's metadata claims the collection to be: it must
+    parse, be ``test_done``, and its identity (``run_id``, ``task``,
+    tier, ``config_hash``, ``seed``) must match the metadata that names
+    where it is installed. A mismatch writes the wrong record under a
+    run's name, so it is a reason not to install.
+
+    Args:
+        record: The staged ``<task>/<run_id>.json`` parsed, or ``None``
+            when missing/unparseable.
+        metadata: The artifact's metadata (see
+            ``wandb_artifacts.run_record_metadata``).
+
+    Returns:
+        A human-readable reason, or ``None`` when the record may be
+        installed.
+    """
+    if record is None:
+        return "record is missing or unparseable"
+    if not isinstance(record, dict):
+        return f"record is a {type(record).__name__}, not a JSON object"
+    if record.get("status") != "test_done":
+        return f"status is {record.get('status')!r}, not test_done"
+    config = record.get("config", {}) or {}
+    expected = {
+        "run_id": record.get("run_id"),
+        "task": (config.get("task") or {}).get("name"),
+        "config_hash": record.get("config_hash"),
+        "seed": record.get("seed"),
+    }
+    for field in ("run_id", "task", "config_hash", "seed"):
+        if str(expected[field]) != str(metadata.get(field)):
+            return (
+                f"{field} in the record ({expected[field]!r}) does not match "
+                f"the artifact metadata ({metadata.get(field)!r})"
+            )
+    record_tier = (config.get("experiment") or {}).get("tier")
+    if artifact_tier({"tier": record_tier}) != artifact_tier(metadata):
+        return "tier in the record does not match the artifact metadata"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -222,7 +298,17 @@ def install_artifact(
     """Download one artifact and move its files to their local targets.
 
     The download goes to a temporary directory first, so an interrupted
-    download never leaves partial files in the canonical store.
+    download never leaves partial files in the canonical store. Each
+    kind is fetched under its own ``path_prefix``, so a checkpoint is
+    never downloaded when ``include_checkpoints`` is off. The staged
+    record is validated against the artifact's metadata before anything
+    touches ``runs/`` (see :func:`staged_record_problem`): a record
+    that is missing, not ``test_done``, or not the run the metadata
+    claims makes the install raise without writing anything, leaving an
+    existing local file untouched. The record JSON is moved into place
+    last (after the curves and, when requested, the checkpoint), so a
+    crash before that final move leaves no new ``test_done`` record and
+    the next pull retries the run instead of skipping it.
 
     Args:
         artifact: A ``wandb`` public artifact (``metadata``,
@@ -240,19 +326,34 @@ def install_artifact(
     run_id = str(metadata["run_id"])
     task = str(metadata["task"])
     written: list[Path] = []
-    skipped: list[str] = []
     with tempfile.TemporaryDirectory(prefix="run-record-") as tmp:
-        root = Path(artifact.download(root=tmp))
-        for rel in sorted(p for p in root.rglob("*") if p.is_file()):
-            kind, target = classify_local_target(
-                rel.relative_to(root), task, run_id, runs_dir, include_checkpoints
+        tmp = Path(tmp)
+        prefixes = [f"{task}/{run_id}.json", f"{task}/curves/{run_id}/"]
+        if include_checkpoints:
+            prefixes.append(f"{task}/{run_id}.pt")
+        for prefix in prefixes:
+            artifact.download(root=str(tmp), path_prefix=prefix)
+        record = read_record(tmp / task / f"{run_id}.json")
+        problem = staged_record_problem(record, metadata)
+        if problem is not None:
+            raise ValueError(f"cannot install {run_id}: {problem}")
+        # Companions first, the record JSON last.
+        order: list[Path] = [Path(task) / "curves" / run_id / "metrics.csv"]
+        if include_checkpoints:
+            order.insert(0, Path(task) / f"{run_id}.pt")
+        order.append(Path(task) / f"{run_id}.json")
+        for rel in order:
+            src = tmp / rel
+            if not src.exists():
+                continue
+            _, target = classify_local_target(
+                rel, task, run_id, runs_dir, include_checkpoints
             )
             if target is None:
-                skipped.append(str(rel.relative_to(root)))
                 continue
-            atomic_copy(rel, target)
+            atomic_copy(src, target)
             written.append(target)
-    return written, skipped
+    return written, []
 
 
 # --------------------------------------------------------------------------- #
@@ -310,13 +411,22 @@ def pull(
 ) -> dict[str, TierSummary]:
     """Apply the pull decision to every artifact; one summary per tier.
 
+    A real (non-``--check``) install takes the run's lock -- the same
+    ``runs/<task>/<run_id>.lock`` training holds -- for the whole
+    read-and-install, so a pull on a live machine can neither overwrite
+    a running job's record nor race the skip / conflict / install
+    decision, which is computed under the lock. A lock that is not
+    acquired records a failure and writes nothing. ``--check``
+    (``dry_run``) takes no lock and writes nothing; it is a read-only
+    report.
+
     Args:
         artifacts: The latest version of each ``run_record`` artifact
             (from :func:`list_run_record_artifacts`).
         runs_dir: The canonical runs directory.
         include_checkpoints: Also install the artifacts' checkpoints.
         dry_run: Report only (``--check``): decisions are computed and
-            counted, nothing is downloaded.
+            counted, nothing is downloaded and no lock is taken.
         tier_filter: Restrict the report to one tier (that tier is
             still reported when it has no artifacts and no local
             records, so an empty tier shows as ``0 / N``).
@@ -347,35 +457,52 @@ def pull(
             continue
         summary = summaries[tier]
         record_path = runs_dir / task / f"{run_id}.json"
-        local = read_record(record_path)
-        decision = pull_decision(local, metadata)
-        if decision == "skip":
-            summary.skipped.append(run_id)
-        elif decision == "conflict":
-            summary.conflicts.append(
-                (
-                    run_id,
-                    identity_of(metadata),
-                    identity_of(local) if local else "<unreadable>",
+
+        if dry_run:
+            local = read_record(record_path)
+            decision = pull_decision(local, metadata)
+            if decision == "skip":
+                summary.skipped.append(run_id)
+            elif decision == "conflict":
+                summary.conflicts.append(
+                    (
+                        run_id,
+                        identity_of(metadata),
+                        identity_of(local) if local else "<unreadable>",
+                    )
                 )
-            )
-        elif dry_run:
-            summary.would_pull.append(run_id)
-        else:
-            try:
-                install_artifact(artifact, runs_dir, include_checkpoints)
-                summary.pulled.append(run_id)
-                downloaded = read_record(record_path)
-                if downloaded is None:
-                    summary.failures.append(
-                        (run_id, "record missing or unparseable after download")
+            else:
+                summary.would_pull.append(run_id)
+            continue
+
+        # Training holds this same file (inside claim_run) while a run
+        # is alive: taking it here keeps a pull on the machine that is
+        # training from overwriting the running job's record.
+        lock_path = runs_dir / task / f"{run_id}.lock"
+        with exclusive_lock(lock_path) as acquired:
+            if not acquired:
+                summary.failures.append((run_id, "run lock held by another process"))
+                continue
+            local = read_record(record_path)
+            decision = pull_decision(local, metadata)
+            if decision == "skip":
+                summary.skipped.append(run_id)
+            elif decision == "conflict":
+                summary.conflicts.append(
+                    (
+                        run_id,
+                        identity_of(metadata),
+                        identity_of(local) if local else "<unreadable>",
                     )
-                elif downloaded.get("status") != "test_done":
-                    summary.failures.append(
-                        (run_id, f"status is {downloaded.get('status')!r}")
-                    )
-            except Exception as exc:  # one bad artifact must not stop the pull
-                summary.failures.append((run_id, str(exc)))
+                )
+            else:
+                try:
+                    # install_artifact validates the staged record before
+                    # writing and moves the record JSON in last.
+                    install_artifact(artifact, runs_dir, include_checkpoints)
+                    summary.pulled.append(run_id)
+                except Exception as exc:  # one bad artifact must not stop the pull
+                    summary.failures.append((run_id, str(exc)))
     # The report counts the store as it is after the pull: a record
     # installed just now is locally ``test_done``. A dry run installs
     # nothing, so its local counts are the pre-pull ones (the same scan
