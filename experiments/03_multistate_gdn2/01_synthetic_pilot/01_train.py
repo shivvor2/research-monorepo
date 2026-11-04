@@ -858,12 +858,14 @@ def wandb_logger_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
     }
 
 
-def upload_run_record_artifact(cfg: DictConfig, run_id: str) -> None:
+def upload_run_record_artifact(cfg: DictConfig, run_id: str, trainer) -> None:
     """Upload a completed run to W&B as a ``run_record`` artifact.
 
     Runs only when W&B is enabled and ``logging.wandb.upload_record`` is
-    set. The artifact's paths are the 03_pull.py contract: the run JSON
-    as ``<task>/<run_id>.json``, the curves CSV as
+    set, and only on the global-zero process (with ``devices="auto"`` a
+    non-zero rank has no live W&B run and would only log noise). The
+    artifact's paths are the 03_pull.py contract: the run JSON as
+    ``<task>/<run_id>.json``, the curves CSV as
     ``<task>/curves/<run_id>/metrics.csv`` and, when
     ``logging.wandb.upload_checkpoint`` is set and the final checkpoint
     was saved, ``<task>/<run_id>.pt``. The metadata carries the run's
@@ -875,8 +877,17 @@ def upload_run_record_artifact(cfg: DictConfig, run_id: str) -> None:
     ``03_pull.py --check`` reports what the canonical store still
     misses. The job waits for the upload (``artifact.wait()``) so it
     does not end before the artifact is complete.
+
+    Args:
+        cfg: The resolved configuration (``logging.wandb.*``,
+            ``output.runs_dir``, ``task.name``, ``logging.csv.save_dir``).
+        run_id: The run ID (also the run record's file stem).
+        trainer: The Lightning ``Trainer``; only ``is_global_zero``
+            uploads.
     """
     if not bool(cfg.logging.wandb.enabled) or not bool(cfg.logging.wandb.upload_record):
+        return
+    if not trainer.is_global_zero:
         return
     try:
         import wandb
@@ -951,7 +962,12 @@ def create_loggers(cfg: DictConfig, run_id: str) -> list | None:
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")
 def main(cfg: DictConfig) -> None:
-    """Run one pilot training run (fit + test) and write the run JSON.
+    """Run one pilot training run; see :func:`_run_and_close`."""
+    _run_and_close(cfg)
+
+
+def _run_and_close(cfg: DictConfig) -> None:
+    """Check the W&B credentials, run one job, and close the W&B run.
 
     W&B credentials are required before anything is built when W&B is
     enabled, so a misconfigured rented machine fails fast. The W&B run
@@ -1158,7 +1174,7 @@ def run_job(cfg: DictConfig) -> None:
         # 03_pull.py picks them up for the canonical store. The upload
         # waits for completion but never fails the run (the local
         # record is already test_done).
-        upload_run_record_artifact(cfg, run_id)
+        upload_run_record_artifact(cfg, run_id, trainer)
 
         logger.info("Run complete (run_id=%s).", run_id)
 

@@ -14,7 +14,9 @@ the anchors -> their own entries keyed by d_model.
 import importlib.util
 import itertools
 import json
+import logging
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +27,7 @@ import torch
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.trainer.states import TrainerFn, TrainerStatus
 from omegaconf import OmegaConf
+from wandb_artifacts import artifact_name, run_record_metadata
 
 from research_lib.training.callbacks import RunSummaryCallback
 from research_lib.utils.run_lock import exclusive_lock
@@ -1160,3 +1163,200 @@ class TestCallbacksBeforeCurvesReset:
         # The relaunch is a fresh run: the stale curves directory is gone.
         assert not curves.exists()
         assert any(isinstance(cb, RunSummaryCallback) for cb in callbacks)
+
+
+_TASK = "overwrite"
+_TIER = "tier2_gates"
+_RUN_ID = "tier2_gates_overwrite-ws-full-mlp-d32-lr0.003-s7"
+
+
+def _fake_wandb():
+    """A fake ``wandb`` module: an ``Artifact`` plus ``run``,
+    ``log_artifact`` and ``finish`` that record their calls."""
+    fake = types.ModuleType("wandb")
+    fake.run = None
+    fake.logged = []
+    fake.finished = []
+
+    class Artifact:
+        def __init__(self, name, type=None, metadata=None):
+            self.name = name
+            self.type = type
+            self.metadata = metadata
+            self.files = []
+            self.wait_called = False
+
+        def add_file(self, path, name=None):
+            self.files.append(name)
+
+        def wait(self):
+            self.wait_called = True
+
+    fake.Artifact = Artifact
+    fake.log_artifact = lambda artifact: fake.logged.append(artifact)
+    fake.finish = lambda exit_code=0: fake.finished.append(exit_code)
+    return fake
+
+
+class TestUploadRunRecordArtifact:
+    """The completed run is uploaded as a run_record artifact, on the
+    global-zero process only, and an upload failure never fails the run."""
+
+    def _record(self, runs_dir, *, status="test_done", checkpoint=False):
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        (runs_dir / f"{_RUN_ID}.json").write_text(
+            json.dumps(
+                {
+                    "run_id": _RUN_ID,
+                    "status": status,
+                    "config_hash": "abc123",
+                    "seed": 0,
+                    "config": {"task": {"name": _TASK}, "experiment": {"tier": _TIER}},
+                    "git": {"commit": "beef"},
+                    "provenance": {"uv.lock": "deadbeef"},
+                }
+            )
+        )
+        if checkpoint:
+            (runs_dir / f"{_RUN_ID}.pt").write_text("weights")
+
+    def _cfg(self, tmp_path, run_id=_RUN_ID, **override):
+        runs_dir = tmp_path / "runs"
+        curves_dir = tmp_path / "curves"
+        self._record(runs_dir)
+        (curves_dir / run_id / "version_0").mkdir(parents=True)
+        (curves_dir / run_id / "version_0" / "metrics.csv").write_text(
+            "step,val/acc\n0,0.5\n"
+        )
+        wandb_cfg = {
+            "enabled": True,
+            "upload_record": True,
+            "upload_checkpoint": False,
+        }
+        wandb_cfg.update(override)
+        cfg = OmegaConf.create(
+            {
+                "output": {"runs_dir": str(runs_dir)},
+                "task": {"name": _TASK},
+                "logging": {
+                    "csv": {"save_dir": str(curves_dir)},
+                    "wandb": wandb_cfg,
+                },
+            }
+        )
+        return cfg, runs_dir
+
+    def _install_fake(self, monkeypatch, **attrs):
+        fake = _fake_wandb()
+        for key, value in attrs.items():
+            setattr(fake, key, value)
+        monkeypatch.setitem(sys.modules, "wandb", fake)
+        return fake
+
+    def test_disabled_uploads_nothing(self, tmp_path, monkeypatch):
+        fake = self._install_fake(monkeypatch)
+        cfg, _ = self._cfg(tmp_path, enabled=False)
+        train.upload_run_record_artifact(
+            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
+        )
+        assert fake.logged == []
+
+    def test_upload_record_false_uploads_nothing(self, tmp_path, monkeypatch):
+        fake = self._install_fake(monkeypatch)
+        cfg, _ = self._cfg(tmp_path, upload_record=False)
+        train.upload_run_record_artifact(
+            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
+        )
+        assert fake.logged == []
+
+    def test_non_rank_zero_uploads_nothing(self, tmp_path, monkeypatch):
+        fake = self._install_fake(monkeypatch)
+        cfg, _ = self._cfg(tmp_path)
+        train.upload_run_record_artifact(
+            cfg, _RUN_ID, SimpleNamespace(is_global_zero=False)
+        )
+        assert fake.logged == []
+
+    def test_record_not_done_logs_a_error_and_uploads_nothing(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        fake = self._install_fake(monkeypatch, run=SimpleNamespace())
+        cfg, runs_dir = self._cfg(tmp_path)
+        self._record(runs_dir, status="interrupted")
+        train.upload_run_record_artifact(
+            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
+        )
+        assert fake.logged == []
+        assert "not test_done" in caplog.text
+
+    def test_happy_path_uploads_the_three_contract_files(self, tmp_path, monkeypatch):
+        fake = self._install_fake(monkeypatch, run=SimpleNamespace())
+        cfg, runs_dir = self._cfg(tmp_path, upload_checkpoint=True)
+        self._record(runs_dir, checkpoint=True)
+        train.upload_run_record_artifact(
+            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
+        )
+        assert len(fake.logged) == 1
+        artifact = fake.logged[0]
+        assert artifact.name == artifact_name(_RUN_ID)
+        assert artifact.type == "run_record"
+        assert artifact.metadata == run_record_metadata(
+            json.loads((runs_dir / f"{_RUN_ID}.json").read_text())
+        )
+        assert artifact.files == [
+            f"{_TASK}/{_RUN_ID}.json",
+            f"{_TASK}/curves/{_RUN_ID}/metrics.csv",
+            f"{_TASK}/{_RUN_ID}.pt",
+        ]
+        assert artifact.wait_called
+
+    def test_checkpoint_uploaded_only_with_the_flag(self, tmp_path, monkeypatch):
+        fake = self._install_fake(monkeypatch, run=SimpleNamespace())
+        cfg, runs_dir = self._cfg(tmp_path)
+        self._record(runs_dir, checkpoint=True)
+        train.upload_run_record_artifact(
+            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
+        )
+        assert f"{_TASK}/{_RUN_ID}.pt" not in fake.logged[0].files
+
+    def test_log_artifact_error_is_logged_and_not_raised(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        fake = self._install_fake(monkeypatch, run=SimpleNamespace())
+
+        def boom(artifact):
+            raise RuntimeError("upload exploded")
+
+        fake.log_artifact = boom
+        cfg, _ = self._cfg(tmp_path)
+        train.upload_run_record_artifact(
+            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
+        )
+        assert "upload exploded" in caplog.text
+
+
+class TestMainClosesWandbRun:
+    """The W&B run is closed after the job, with the outcome's exit code."""
+
+    def _call(self, monkeypatch, run_job):
+        fake = _fake_wandb()
+        fake.run = SimpleNamespace()
+        monkeypatch.setitem(sys.modules, "wandb", fake)
+        monkeypatch.setenv("WANDB_API_KEY", "test-key")
+        monkeypatch.setattr(train, "run_job", run_job)
+        cfg = OmegaConf.create({"logging": {"wandb": {"enabled": True}}})
+        return fake, cfg
+
+    def test_exit_code_1_when_the_job_raises(self, monkeypatch):
+        def boom(cfg):
+            raise RuntimeError("boom")
+
+        fake, cfg = self._call(monkeypatch, boom)
+        with pytest.raises(RuntimeError):
+            train._run_and_close(cfg)
+        assert fake.finished == [1]
+
+    def test_exit_code_0_when_the_job_returns(self, monkeypatch):
+        fake, cfg = self._call(monkeypatch, lambda cfg: None)
+        train._run_and_close(cfg)
+        assert fake.finished == [0]
