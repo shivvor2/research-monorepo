@@ -258,6 +258,20 @@ class TestStagedRecordProblem:
         problem = pull.staged_record_problem(record, metadata)
         assert problem is not None and field in problem
 
+    @pytest.mark.parametrize(
+        "field,kwargs",
+        [
+            ("config_hash", {"hash_": None}),
+            ("seed", {"seed": None}),
+        ],
+    )
+    def test_record_missing_identity_field_rejected(self, field, kwargs):
+        # An identity field missing from both record and metadata must
+        # not match as str(None) != str(None): it is rejected outright.
+        record = _record(**kwargs)
+        problem = pull.staged_record_problem(record, run_record_metadata(_record()))
+        assert problem is not None and field in problem
+
     def test_record_task_differs(self):
         metadata = run_record_metadata(_record())
         record = _record(task="mqar")
@@ -327,14 +341,13 @@ class TestInstall:
     def test_record_and_curve_land_at_the_local_shapes(self, tmp_path):
         artifact = make_artifact(tmp_path, _record())
         runs_dir = tmp_path / "runs"
-        written, skipped = pull.install_artifact(artifact, runs_dir, False)
+        written = pull.install_artifact(artifact, runs_dir, False)
         assert sorted(written) == sorted(
             [
                 runs_dir / TASK / f"{RUN_ID}.json",
                 runs_dir / TASK / "curves" / RUN_ID / "version_0" / "metrics.csv",
             ]
         )
-        assert skipped == []
         assert artifact.downloaded
         assert (runs_dir / TASK / f"{RUN_ID}.json").read_text() == json.dumps(_record())
 
@@ -360,7 +373,7 @@ class TestInstall:
     def test_no_curve_artifact_writes_no_curve(self, tmp_path):
         artifact = make_artifact(tmp_path, _record(), curves=False)
         runs_dir = tmp_path / "runs"
-        written, skipped = pull.install_artifact(artifact, runs_dir, False)
+        pull.install_artifact(artifact, runs_dir, False)
         assert not (runs_dir / TASK / "curves").exists()
 
 

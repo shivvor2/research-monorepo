@@ -227,6 +227,13 @@ def staged_record_problem(record: dict | None, metadata: dict) -> str | None:
         "config_hash": record.get("config_hash"),
         "seed": record.get("seed"),
     }
+    # An identity field missing from the record cannot be matched-
+    # against the metadata (``str(None) == str(None)`` would pass), so it
+    # is a reason not to install on its own.
+    if expected["config_hash"] is None:
+        return "record has no config_hash"
+    if expected["seed"] is None:
+        return "record has no seed"
     for field in ("run_id", "task", "config_hash", "seed"):
         if str(expected[field]) != str(metadata.get(field)):
             return (
@@ -294,7 +301,7 @@ def atomic_copy(src: Path, target: Path) -> None:
 
 def install_artifact(
     artifact: Any, runs_dir: Path, include_checkpoints: bool
-) -> tuple[list[Path], list[str]]:
+) -> list[Path]:
     """Download one artifact and move its files to their local targets.
 
     The download goes to a temporary directory first, so an interrupted
@@ -318,9 +325,8 @@ def install_artifact(
         include_checkpoints: Install the artifact's checkpoint too.
 
     Returns:
-        ``(written, skipped)``: the local paths written, and the
-        artifact files that were not installed (unknown paths, and the
-        checkpoint when ``include_checkpoints`` is false).
+        The local paths written, in the order they were installed
+        (companions before the record).
     """
     metadata = dict(artifact.metadata or {})
     run_id = str(metadata["run_id"])
@@ -353,7 +359,7 @@ def install_artifact(
                 continue
             atomic_copy(src, target)
             written.append(target)
-    return written, []
+    return written
 
 
 # --------------------------------------------------------------------------- #
