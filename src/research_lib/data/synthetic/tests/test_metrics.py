@@ -808,3 +808,35 @@ class TestUpdateAnswers:
         assert any(key.startswith("acc/dist=") for key in result_full) == (
             task == "overwrite"
         )
+
+
+def test_custom_class_names_key_the_metric_dict():
+    """Custom class names key the class metrics; the default reproduces the
+    overwrite names exactly."""
+    from .. import OVERWRITE_CLASSES
+    from ..metrics import CLASS_NAMES
+
+    assert CLASS_NAMES == OVERWRITE_CLASSES == ("same", "adjacent", "distant", "single")
+    batch = _hand_batch()
+    logits = _hand_logits()
+
+    default = RecallMetrics(slice_values=[8])
+    default.update(logits, batch)
+    out = default.compute()
+
+    custom = RecallMetrics(slice_values=[8], class_names=("A", "B", "C", "D"))
+    custom.update(logits, batch)
+    cout = custom.compute()
+
+    # Same accuracy, but the class keys use the custom names (indexed by
+    # the key_class code: ADJACENT=1 -> B, SINGLE=3 -> D).
+    assert cout["acc"] == pytest.approx(out["acc"])
+    assert cout["acc/class=B"] == pytest.approx(out["acc/class=adjacent"])
+    assert cout["acc/class=D"] == pytest.approx(out["acc/class=single"])
+    assert "acc/class=adjacent" not in cout
+    assert "acc/class=B" not in out
+
+
+def test_recall_metrics_rejects_empty_class_names():
+    with pytest.raises(ValueError):
+        RecallMetrics(slice_values=[8], class_names=())

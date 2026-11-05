@@ -33,12 +33,14 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from enum import Enum
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 
 from research_lib.data.synthetic.metrics import RecallMetrics
+from research_lib.data.synthetic.mqar import IGNORE_INDEX
 from research_lib.training.losses import (
     AnswerLogits,
     answer_cross_entropy,
@@ -47,6 +49,22 @@ from research_lib.training.losses import (
 from research_lib.training.modules.dual_optimizer import DualOptimizerModule
 
 logger = logging.getLogger(__name__)
+
+
+class ExtraMetric(Protocol):
+    """An extra evaluation metric that receives the same answer-position
+    predictions as :class:`RecallMetrics`.
+
+    Implementations accumulate over one evaluation pass (an epoch) and
+    are reset at its start; :meth:`compute` returns the per-pass metrics,
+    which the module logs under ``val/<name>`` / ``test/<name>``.
+    """
+
+    def reset(self) -> None: ...
+
+    def update(self, predictions: Tensor, batch: dict[str, Tensor]) -> None: ...
+
+    def compute(self) -> dict[str, float]: ...
 
 
 class LossOn(str, Enum):
@@ -88,6 +106,16 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             for overwrite; from ``task_config.slices``).
         with_classes: Accumulate class-conditioned metrics;
             ``None`` auto-detects per batch (``True`` for overwrite).
+        class_names: The task's class-name fragments, passed to
+            ``RecallMetrics`` (which defaults to the overwrite names).
+        monitor_key: The metric key that drives early stopping and the
+            best-value track (default ``"val/acc"``, the project's
+            reading; a task module with a different key sets it here so
+            the training script can build its callbacks from it).
+        extra_metrics: Additional evaluation metrics receiving the same
+            answer-position predictions as ``RecallMetrics``; each
+            ``compute()`` mapping is logged under ``val/<name>`` /
+            ``test/<name>``.
         loss_on: :class:`LossOn` member or its string value (Hydra passes
             strings); ``"answers"`` is the default.
         answer_head: Evaluate the LM head only at answer positions under
@@ -113,6 +141,9 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
         *,
         slice_values: Sequence[int],
         with_classes: bool | None = None,
+        class_names: Sequence[str] | None = None,
+        monitor_key: str = "val/acc",
+        extra_metrics: Sequence[ExtraMetric] = (),
         loss_on: LossOn | str = LossOn.ANSWERS,
         answer_head: bool = True,
         **kwargs: Any,
@@ -135,6 +166,9 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
                 )
         self.slice_values = tuple(slice_values)
         self.with_classes = with_classes
+        self.class_names = tuple(class_names) if class_names is not None else None
+        self.monitor_key = str(monitor_key)
+        self.extra_metrics = tuple(extra_metrics)
         self._val_metrics: RecallMetrics | None = None
         self._test_metrics: RecallMetrics | None = None
 
@@ -205,10 +239,38 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
     # Validation / test
     # ------------------------------------------------------------------ #
 
-    def on_validation_epoch_start(self) -> None:
-        self._val_metrics = RecallMetrics(
-            self.slice_values, with_classes=self.with_classes
+    def _new_metrics(self) -> RecallMetrics:
+        """A fresh ``RecallMetrics`` for one evaluation pass."""
+        return RecallMetrics(
+            self.slice_values,
+            with_classes=self.with_classes,
+            class_names=self.class_names,
         )
+
+    def _predictions(
+        self, out: torch.Tensor | AnswerLogits, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """The ``(B, T - 1)`` predicted next tokens, from either output."""
+        labels = batch["labels"]
+        mask = labels[:, 1:] != IGNORE_INDEX
+        if isinstance(out, AnswerLogits):
+            predictions = torch.full(
+                (labels.shape[0], labels.shape[1] - 1),
+                -1,
+                dtype=torch.long,
+                device=out.logits.device,
+            )
+            predictions.masked_scatter_(
+                mask.to(out.logits.device), out.logits.argmax(-1)
+            )
+        else:
+            predictions = out[:, :-1, :].argmax(-1)
+        return predictions
+
+    def on_validation_epoch_start(self) -> None:
+        self._val_metrics = self._new_metrics()
+        for extra in self.extra_metrics:
+            extra.reset()
 
     def validation_step(
         self, batch: dict[str, torch.Tensor], batch_idx: int
@@ -239,17 +301,22 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             self._val_metrics.update_answers(out.logits, batch)
         else:
             self._val_metrics.update(out, batch)
+        for extra in self.extra_metrics:
+            extra.update(self._predictions(out, batch), batch)
         return loss
 
     def on_validation_epoch_end(self) -> None:
         assert self._val_metrics is not None
         for key, value in self._val_metrics.compute().items():
             self.log(f"val/{key}", value)
+        for extra in self.extra_metrics:
+            for key, value in extra.compute().items():
+                self.log(f"val/{key}", value)
 
     def on_test_epoch_start(self) -> None:
-        self._test_metrics = RecallMetrics(
-            self.slice_values, with_classes=self.with_classes
-        )
+        self._test_metrics = self._new_metrics()
+        for extra in self.extra_metrics:
+            extra.reset()
 
     def test_step(self, batch: dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
         """One test batch: loss + RecallMetrics update.
@@ -277,9 +344,14 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             self._test_metrics.update_answers(out.logits, batch)
         else:
             self._test_metrics.update(out, batch)
+        for extra in self.extra_metrics:
+            extra.update(self._predictions(out, batch), batch)
         return loss
 
     def on_test_epoch_end(self) -> None:
         assert self._test_metrics is not None
         for key, value in self._test_metrics.compute().items():
             self.log(f"test/{key}", value)
+        for extra in self.extra_metrics:
+            for key, value in extra.compute().items():
+                self.log(f"test/{key}", value)

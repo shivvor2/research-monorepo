@@ -117,6 +117,13 @@ class OverwriteClass(enum.IntEnum):
     SINGLE = 3
 
 
+OVERWRITE_CLASSES: tuple[str, ...] = tuple(c.name.lower() for c in OverwriteClass)
+"""Metric key fragments per overwrite class code, in class order:
+``('same', 'adjacent', 'distant', 'single')``. Exported next to the
+overwrite generator; :class:`~research_lib.data.synthetic.RecallMetrics`
+uses these as its default ``class_names``."""
+
+
 @dataclass(frozen=True)
 class OverwriteConfig:
     """Configuration for the repeated-key overwrite generator.
