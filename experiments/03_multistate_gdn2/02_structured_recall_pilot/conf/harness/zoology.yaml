@@ -1,0 +1,37 @@
+# =============================================================================
+# Zoology harness: the positive-control mixer set shared by the pilots.
+# =============================================================================
+# Uses ZoologyLM with the Zoology layer pattern, a state mixer of none,
+# and the remaining architecture as frozen in the first pilot. The mixer
+# under test is chosen by model.mixer (gated_delta | attention), not by
+# the harness: the harness is architecture, the mixer is the mechanism.
+
+model:
+  layer_pattern: zoology
+  state_mixer: none
+  n_layer: 2
+  vocab_size: ${task.vocab_size}
+  d_model: ${task.d_model}
+  num_heads: ${task.num_heads}
+  expand_v: 1.0
+  base_conv_kernel: 3
+  ff_mult: 4
+  chunk_size: 16
+  window: 8
+  t_max: ${task.max_seq_len}
+  output_gate_activation: silu
+  mixer_mode: chunk
+
+training:
+  batch_size: 256
+  max_steps: 20000
+  val_check_interval: 500
+  early_stop_threshold: 0.99
+  loss_on: answers
+  answer_head: true
+
+optimizer:
+  lr: null
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  decay_scheme: grouped

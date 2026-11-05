@@ -20,3 +20,11 @@ truth for every experimental setting.
 | folder | experiment |
 |---|---|
 | [`01_synthetic_pilot/`](01_synthetic_pilot/README.md) | MQAR + repeated-key overwrite pilot: calibration, then the Δ_int grid (tiers 1–6) and the long-T tier |
+| [`02_structured_recall_pilot/`](02_structured_recall_pilot/README.md) | new synthetic recall tasks run through the shared machinery; the task PRs add the entity–field and MAD fuzzy tasks |
+
+## Shared project package
+
+[`common/`](common/README.md) holds what this project's pilots share on top
+of `research_lib` — the launch helpers, the run-ID builder, the run layout
+and artifact contract, the thin pull and the shared analysis pieces. Each
+pilot keeps only its own protocol.

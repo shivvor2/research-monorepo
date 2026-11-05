@@ -1,0 +1,15 @@
+# =============================================================================
+# Frozen protocol: filled at the end of calibration, then committed.
+# =============================================================================
+# While ``frozen: false``, the smoke and debug configs run; an experiment
+# phase >= 2 refuses to run. Calibration fills the LR table, then the
+# screening reading picks d_model / harness and sets ``frozen: true``.
+
+frozen: false
+d_model: null
+harness:
+  layer_pattern: null
+  state_mixer: null
+lr_table: {}
+anchor_lr: {}
+overwrite_task_by_d_model: {}

@@ -1,0 +1,60 @@
+# =============================================================================
+# Debug config: one step, every layout once on MQAR, and once with the
+# attention mixer.
+# =============================================================================
+# Usage:
+#   python 01_train.py --config-name=debug --multirun \
+#     model.layout=single,ws,ll model.mixer=gated_delta,attention
+# Each job runs a handful of steps and writes a run JSON.
+
+defaults:
+  - config
+
+experiment:
+  name: multistate_gdn2_structured_recall_pilot_debug
+  phase: 1
+  tier: debug
+
+model:
+  vocab_size: 64
+  d_model: 16
+  num_heads: 1
+  t_max: 32
+  window: 4
+  gate_mode: full
+  layout: ws
+
+task:
+  vocab_size: 64
+  seq_len: 32
+  num_kv_pairs: [2, 4]
+  max_seq_len: 32
+
+data:
+  num_workers: 0
+  num_val_per_slice: 16
+  num_test_per_slice: 16
+
+training:
+  batch_size: 32
+  max_steps: 4
+  val_check_interval: 4
+  log_every_n_steps: 1
+
+optimizer:
+  lr: 0.003
+  decay_scheme: grouped
+
+logging:
+  csv:
+    enabled: true
+    save_dir: logs/debug_csv
+  wandb:
+    enabled: false
+
+launch:
+  skip_completed: false
+
+hydra:
+  run:
+    dir: outputs/debug/${now:%Y-%m-%d}/${now:%H-%M-%S}

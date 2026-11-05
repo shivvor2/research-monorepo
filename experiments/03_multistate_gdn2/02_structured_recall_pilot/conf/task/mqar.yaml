@@ -1,0 +1,20 @@
+# =============================================================================
+# MQAR task config for the structured-recall pilot (smoke and debug only).
+# =============================================================================
+# MQAR's results stay in the first pilot; this config exists so the shared
+# run machinery can be smoke-tested on a known task.
+
+defaults:
+  - /harness: zoology
+
+name: mqar
+vocab_size: ${model.vocab_size}
+seq_len: 256
+num_kv_pairs: [16, 32, 64]
+power_a: 0.01
+random_non_queries: true
+max_seq_len: 256
+d_model: 64
+num_heads: 2
+val_seed: 1000003
+test_seed: 2000003
