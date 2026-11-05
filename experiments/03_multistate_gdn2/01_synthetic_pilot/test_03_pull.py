@@ -546,13 +546,6 @@ class TestPull:
         assert summary.expected == 60  # tier2_gates in the protocol
         assert summary.local_done == 1
 
-    def test_report_lists_what_is_still_missing(self, tmp_path):
-        artifact = make_artifact(tmp_path, _record(hash_="artifact-hash"))
-        runs_dir = tmp_path / "runs"
-        target = runs_dir / TASK / f"{RUN_ID}.json"
-        target.parent.mkdir(parents=True)
-        target.write_text(json.dumps(_record(hash_="local-hash")))
-
     def test_unsafe_artifact_path_is_rejected_before_any_write(self, tmp_path):
         # The metadata names the local target; a task such as ``../`` must
         # not escape runs_dir. The artifact is rejected before a path or
@@ -567,8 +560,8 @@ class TestPull:
         assert summary.failures == [
             (RUN_ID, "unsafe run_id or task in artifact metadata")
         ]
-        assert not (tmp_path / "escape").exists()
-        assert not (runs_dir / TASK / f"{RUN_ID}.lock").exists()
+        assert not (tmp_path.parent / "escape").exists()
+        assert not runs_dir.exists()
 
     def test_report_lists_what_is_still_missing(self, tmp_path):
         artifact = make_artifact(tmp_path, _record(hash_="artifact-hash"))
@@ -579,7 +572,7 @@ class TestPull:
         summaries = pull.pull([artifact], runs_dir)
         report = pull.render_report(summaries, 1)
         assert "1 run_record artifacts on W&B" in report
-        assert f"local test_done: 1 / 60 expected" in report
+        assert "local test_done: 1 / 60 expected" in report
         assert "CONFLICTS (1, never overwritten)" in report
         assert RUN_ID in report
         assert "still missing locally: 1" in report

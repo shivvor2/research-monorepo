@@ -1280,19 +1280,19 @@ class TestUploadRunRecordArtifact:
         return fake
 
     def test_disabled_uploads_nothing(self, tmp_path, monkeypatch):
-        fake = self._install_fake(monkeypatch)
+        fake = self._install_fake(monkeypatch, run=SimpleNamespace())
         cfg, _ = self._cfg(tmp_path, enabled=False)
         train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert fake.logged == []
 
     def test_upload_record_false_uploads_nothing(self, tmp_path, monkeypatch):
-        fake = self._install_fake(monkeypatch)
+        fake = self._install_fake(monkeypatch, run=SimpleNamespace())
         cfg, _ = self._cfg(tmp_path, upload_record=False)
         train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert fake.logged == []
 
     def test_non_rank_zero_uploads_nothing(self, tmp_path, monkeypatch):
-        fake = self._install_fake(monkeypatch)
+        fake = self._install_fake(monkeypatch, run=SimpleNamespace())
         cfg, _ = self._cfg(tmp_path)
         train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=False)
         assert fake.logged == []
@@ -1450,6 +1450,9 @@ class TestEnsureRunRecordUploaded:
         train.ensure_run_record_uploaded(cfg, _RUN_ID)
         assert len(fake.inits) == 1
         assert fake.inits[0]["job_type"] == "upload"
+        assert fake.inits[0]["dir"] == "logs/wandb"
+        assert "save_dir" not in fake.inits[0]
+        assert "log_model" not in fake.inits[0]
         assert len(fake.logged) == 1
         artifact = fake.logged[0]
         assert artifact.files == [

@@ -945,11 +945,13 @@ def upload_init_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
     logger (:func:`wandb_logger_kwargs`), but ``job_type="upload"``: a
     relaunch that skips a finished run opens this short run to upload
     the record that finished run missed. The keyword arguments only
-    ``WandbLogger`` understands (``save_dir``, ``log_model``) are
-    dropped, since ``wandb.init`` takes ``dir`` instead.
+    ``WandbLogger`` understands are mapped or dropped for
+    ``wandb.init``: ``save_dir`` becomes ``dir`` (so the re-upload run
+    writes under ``logs/wandb`` like training does), and ``log_model``
+    is removed.
     """
     kwargs = dict(wandb_logger_kwargs(cfg, run_id))
-    kwargs.pop("save_dir", None)
+    kwargs["dir"] = kwargs.pop("save_dir")
     kwargs.pop("log_model", None)
     kwargs["job_type"] = "upload"
     return kwargs
