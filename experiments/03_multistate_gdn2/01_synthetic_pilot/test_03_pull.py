@@ -552,6 +552,30 @@ class TestPull:
         target = runs_dir / TASK / f"{RUN_ID}.json"
         target.parent.mkdir(parents=True)
         target.write_text(json.dumps(_record(hash_="local-hash")))
+
+    def test_unsafe_artifact_path_is_rejected_before_any_write(self, tmp_path):
+        # The metadata names the local target; a task such as ``../`` must
+        # not escape runs_dir. The artifact is rejected before a path or
+        # lock is built.
+        metadata = run_record_metadata(_record())
+        metadata["task"] = "../../escape"
+        artifact = FakeVersionedArtifact(tmp_path / "src", metadata)
+        runs_dir = tmp_path / "runs"
+        summaries = pull.pull([artifact], runs_dir)
+        summary = summaries[TIER]
+        assert summary.pulled == []
+        assert summary.failures == [
+            (RUN_ID, "unsafe run_id or task in artifact metadata")
+        ]
+        assert not (tmp_path / "escape").exists()
+        assert not (runs_dir / TASK / f"{RUN_ID}.lock").exists()
+
+    def test_report_lists_what_is_still_missing(self, tmp_path):
+        artifact = make_artifact(tmp_path, _record(hash_="artifact-hash"))
+        runs_dir = tmp_path / "runs"
+        target = runs_dir / TASK / f"{RUN_ID}.json"
+        target.parent.mkdir(parents=True)
+        target.write_text(json.dumps(_record(hash_="local-hash")))
         summaries = pull.pull([artifact], runs_dir)
         report = pull.render_report(summaries, 1)
         assert "1 run_record artifacts on W&B" in report

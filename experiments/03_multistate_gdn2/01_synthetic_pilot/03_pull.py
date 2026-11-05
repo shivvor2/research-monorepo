@@ -462,6 +462,18 @@ def pull(
         if tier_filter is not None and tier != tier_filter:
             continue
         summary = summaries[tier]
+        if not (
+            re.fullmatch(r"[A-Za-z0-9._-]+", run_id)
+            and re.fullmatch(r"[A-Za-z0-9_-]+", task)
+        ):
+            # The metadata names the local target; a value such as a
+            # ``../``-bearing task would escape runs_dir. Reject it
+            # before any path or lock is built (the upload side already
+            # constrains run_id to this safe set).
+            summary.failures.append(
+                (run_id, "unsafe run_id or task in artifact metadata")
+            )
+            continue
         record_path = runs_dir / task / f"{run_id}.json"
 
         if dry_run:
@@ -607,6 +619,12 @@ def main() -> int:
             "no W&B project: pass --project, or set logging.wandb.project in "
             "conf/config.yaml"
         )
+
+    # Load the repo-root .env (research_lib.utils.secrets) and fail fast
+    # if the key is missing, before the API client is built.
+    from research_lib.utils.secrets import check_auth
+
+    check_auth(["WANDB_API_KEY"])
 
     import wandb  # lazy: the pure helpers above must not need it
 
