@@ -246,15 +246,44 @@ perfectly while DDP mostly adds communication overhead.
   fit and before the test pass, next to the run JSON
   (`runs/<task>/<run_id>.pt`, git-ignored).
 
-## Disposable-instance rules (rented machines)
+## Rented machines (W&B transport)
 
-1. One JSON per run; results leave the machine from day one.
-2. `rsync -avz` the `runs/` folder off the machine regularly (and
-   wandb if enabled); before destroying an instance, sync one last time
-   and verify checksums locally (`sha256sum runs/**/*.json` on both
-   sides).
-3. Lock the environment: record `pip freeze` plus torch/CUDA versions
-   with the experiment (they are in every run JSON under `versions`).
+Rented machines have no persistent storage, so completed runs leave the
+machine through W&B instead of rsync. The training script uploads a
+completed run — its JSON record, training curve and optionally its final
+checkpoint — as a `run_record` artifact; `03_pull.py` fetches those
+artifacts back into the local `runs/` store the analysis reads.
+
+1. Create the W&B project once (the default project is `MultistateGDN2`
+   in `conf/config.yaml`).
+2. Put `WANDB_API_KEY` in the repo-root `.env` locally, or in the
+   environment on the rented machine. When W&B is on, the training
+   script checks this key before anything is built and fails loudly if
+   it is missing.
+3. Launch with `logging.wandb.enabled=true` (optionally with
+   `logging.wandb.upload_checkpoint=true` together with
+   `output.save_final_checkpoint=true`).
+4. After a tier, on the local machine, from the same directory you
+   launch training from (`--runs-dir` defaults to `./runs`):
+   ```bash
+   uv run python 03_pull.py --check --tier <tier>   # preview
+   uv run python 03_pull.py --tier <tier>           # fetch
+   ```
+5. Exit codes: `0` clean, `1` conflicts, `2` failures. Destroy the
+   instance only when the pull exits `0` **and** the tier shows no
+   shortfall.
+6. A short tier is fixed by relaunching the identical sweep command on
+   the instance: it skips the runs that are already `test_done` without
+   re-running them, but re-uploads any finished run that is missing on
+   W&B, so "relaunch, then pull" fills the gap. As a last resort, for a
+   run the pull still lists as short, `rsync` its records off the
+   instance before destroying it:
+   ```bash
+   # run from the local launch directory; <instance> is the rented host
+   rsync -avz <instance>:<launch-dir>/runs/ runs/
+   sha256sum runs/<task>/*.json   # compare with the same command on the instance
+   ```
+   This is only for the runs `03_pull.py --check` still lists as short.
 
 ## Timing (benchmark)
 

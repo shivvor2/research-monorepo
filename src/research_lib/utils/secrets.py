@@ -1,4 +1,5 @@
 import os
+from collections.abc import Sequence
 from pathlib import Path
 from warnings import warn
 
@@ -41,16 +42,21 @@ def _load_secrets() -> None:
 _load_secrets()
 
 
-def check_auth():
+def check_auth(services: Sequence[str] = ALL_SERVICES) -> None:
     """
-    Public function to verify auth exists.
-    Call this inside your main() if you want to fail fast.
-    """
-    missing = []
+    Public function to verify that every required secret is present.
 
-    for service in ALL_SERVICES:
-        if not os.getenv(service):
-            missing.append(service)
+    Call this inside your main() if you want to fail fast.
+
+    Args:
+        services: The environment variable names to require, e.g.
+            ``["WANDB_API_KEY"]``. Defaults to :data:`ALL_SERVICES`
+            (every service this library can use).
+
+    Raises:
+        PermissionError: Naming the missing variables.
+    """
+    missing = [service for service in services if not os.getenv(service)]
 
     if missing:
         raise PermissionError(
