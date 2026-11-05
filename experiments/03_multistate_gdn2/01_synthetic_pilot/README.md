@@ -272,10 +272,18 @@ artifacts back into the local `runs/` store the analysis reads.
 5. Exit codes: `0` clean, `1` conflicts, `2` failures. Destroy the
    instance only when the pull exits `0` **and** the tier shows no
    shortfall.
-6. Fallback: a run whose upload failed is `test_done` on the instance
-   and is skipped on relaunch, so it is never re-uploaded. Before
-   destroying the instance, `rsync` `runs/` off as before for any run
-   still listed as short.
+6. A short tier is fixed by relaunching the identical sweep command on
+   the instance: it skips the runs that are already `test_done` without
+   re-running them, but re-uploads any finished run that is missing on
+   W&B, so "relaunch, then pull" fills the gap. As a last resort, for a
+   run the pull still lists as short, `rsync` its records off the
+   instance before destroying it:
+   ```bash
+   # run from the local launch directory; <instance> is the rented host
+   rsync -avz <instance>:<launch-dir>/runs/ runs/
+   sha256sum runs/<task>/*.json   # compare with the same command on the instance
+   ```
+   This is only for the runs `03_pull.py --check` still lists as short.
 
 ## Timing (benchmark)
 

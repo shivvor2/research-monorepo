@@ -858,13 +858,15 @@ def wandb_logger_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
     }
 
 
-def upload_run_record_artifact(cfg: DictConfig, run_id: str, trainer) -> None:
+def upload_run_record_artifact(
+    cfg: DictConfig, run_id: str, is_global_zero: bool
+) -> None:
     """Upload a completed run to W&B as a ``run_record`` artifact.
 
     Runs only when W&B is enabled and ``logging.wandb.upload_record`` is
-    set, and only on the global-zero process (with ``devices="auto"`` a
-    non-zero rank has no live W&B run and would only log noise). The
-    artifact's paths are the 03_pull.py contract: the run JSON as
+    set, and only on the global-zero process (a non-zero rank under
+    ``devices="auto"`` has no live W&B run and would only log noise).
+    The artifact's paths are the 03_pull.py contract: the run JSON as
     ``<task>/<run_id>.json``, the curves CSV as
     ``<task>/curves/<run_id>/metrics.csv`` and, when
     ``logging.wandb.upload_checkpoint`` is set and the final checkpoint
@@ -882,12 +884,14 @@ def upload_run_record_artifact(cfg: DictConfig, run_id: str, trainer) -> None:
         cfg: The resolved configuration (``logging.wandb.*``,
             ``output.runs_dir``, ``task.name``, ``logging.csv.save_dir``).
         run_id: The run ID (also the run record's file stem).
-        trainer: The Lightning ``Trainer``; only ``is_global_zero``
-            uploads.
+        is_global_zero: Whether this process is rank zero (the only one
+            with a live W&B run). The training call site passes
+            ``trainer.is_global_zero``; the re-upload path passes
+            ``True`` directly, with no Lightning trainer around.
     """
     if not bool(cfg.logging.wandb.enabled) or not bool(cfg.logging.wandb.upload_record):
         return
-    if not trainer.is_global_zero:
+    if not is_global_zero:
         return
     try:
         import wandb
@@ -932,6 +936,72 @@ def upload_run_record_artifact(cfg: DictConfig, run_id: str, trainer) -> None:
         logger.info("Uploaded run record artifact %s", artifact_name(run_id))
     except Exception as exc:  # an upload failure never fails a completed run
         logger.error("W&B artifact upload failed for %s: %s", run_id, exc)
+
+
+def upload_init_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
+    """The ``wandb.init`` keyword arguments of a short re-upload run.
+
+    The same project / entity / name / group / tags as the training
+    logger (:func:`wandb_logger_kwargs`), but ``job_type="upload"``: a
+    relaunch that skips a finished run opens this short run to upload
+    the record that finished run missed. The keyword arguments only
+    ``WandbLogger`` understands (``save_dir``, ``log_model``) are
+    dropped, since ``wandb.init`` takes ``dir`` instead.
+    """
+    kwargs = dict(wandb_logger_kwargs(cfg, run_id))
+    kwargs.pop("save_dir", None)
+    kwargs.pop("log_model", None)
+    kwargs["job_type"] = "upload"
+    return kwargs
+
+
+def ensure_run_record_uploaded(cfg: DictConfig, run_id: str) -> None:
+    """Make sure a finished run's record reaches W&B as an artifact.
+
+    A relaunched sweep skips a run whose record is already ``test_done``
+    with the same identity, before a fresh job would have uploaded
+    anything, so if that run's upload failed when it finished it would
+    stay off W&B forever. This re-checks the ``run_record`` artifact:
+    when it is absent or carries a different ``(config_hash, seed)``, a
+    short W&B run (``job_type="upload"``) is opened and the record is
+    (re)uploaded. Any problem is logged at ERROR level and never fails
+    the job; a machine without W&B is untouched.
+
+    Args:
+        cfg: The resolved configuration.
+        run_id: The run ID (also the run record's file stem).
+    """
+    if not bool(cfg.logging.wandb.enabled) or not bool(cfg.logging.wandb.upload_record):
+        return
+    try:
+        import wandb
+
+        record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
+        with open(record_path, encoding="utf-8") as f:
+            record = json.load(f)
+        entity = cfg.logging.wandb.get("entity", None)
+        entity = str(entity) if entity else None
+        project = str(cfg.logging.wandb.project)
+        location = f"{entity}/{project}" if entity else project
+        target = f"{location}/{artifact_name(run_id)}:latest"
+        api = wandb.Api()
+        if api.artifact_exists(target):
+            artifact = api.artifact(target)
+            metadata = dict(artifact.metadata or {})
+            already = (metadata.get("config_hash"), metadata.get("seed")) == (
+                record.get("config_hash"),
+                record.get("seed"),
+            )
+            if already:
+                logger.info(
+                    "run record %s already on W&B; nothing to (re)upload", run_id
+                )
+                return
+        wandb.init(**upload_init_kwargs(cfg, run_id))
+        upload_run_record_artifact(cfg, run_id, is_global_zero=True)
+        wandb.finish()
+    except Exception as exc:  # a failed check/upload never fails a skipped job
+        logger.error("could not ensure run record %s is on W&B: %s", run_id, exc)
 
 
 def create_loggers(cfg: DictConfig, run_id: str) -> list | None:
@@ -1101,6 +1171,11 @@ def run_job(cfg: DictConfig) -> None:
     ) as reason:
         if reason is not None:
             logger.info("skip %s: %s", run_id, reason)
+            if reason == "already test_done":
+                # A finished run must still reach W&B even if its upload
+                # failed when it finished: the relaunch skips before any
+                # upload would have run, so re-check the artifact now.
+                ensure_run_record_uploaded(cfg, run_id)
             return
 
         # 6. Callbacks first, then the curves reset, then the loggers.
@@ -1174,7 +1249,7 @@ def run_job(cfg: DictConfig) -> None:
         # 03_pull.py picks them up for the canonical store. The upload
         # waits for completion but never fails the run (the local
         # record is already test_done).
-        upload_run_record_artifact(cfg, run_id, trainer)
+        upload_run_record_artifact(cfg, run_id, trainer.is_global_zero)
 
         logger.info("Run complete (run_id=%s).", run_id)
 

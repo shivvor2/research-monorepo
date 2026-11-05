@@ -1171,12 +1171,21 @@ _RUN_ID = "tier2_gates_overwrite-ws-full-mlp-d32-lr0.003-s7"
 
 
 def _fake_wandb():
-    """A fake ``wandb`` module: an ``Artifact`` plus ``run``,
-    ``log_artifact`` and ``finish`` that record their calls."""
+    """A fake ``wandb`` module: an ``Artifact`` plus ``run``, ``init``,
+    ``Api``, ``log_artifact`` and ``finish`` that record their calls.
+
+    The ``Api`` behavior is read from the module's own attributes, so a
+    test configures it by setting ``fake.api_exists``,
+    ``fake.api_metadata`` and ``fake.api_exists_error``."""
     fake = types.ModuleType("wandb")
     fake.run = None
     fake.logged = []
     fake.finished = []
+    fake.inits = []
+    fake.api_targets = []
+    fake.api_exists = True
+    fake.api_metadata = None
+    fake.api_exists_error = None
 
     class Artifact:
         def __init__(self, name, type=None, metadata=None):
@@ -1192,7 +1201,24 @@ def _fake_wandb():
         def wait(self):
             self.wait_called = True
 
+    class FakeApi:
+        def artifact_exists(self, target):
+            fake.api_targets.append(target)
+            if fake.api_exists_error is not None:
+                raise fake.api_exists_error
+            return fake.api_exists
+
+        def artifact(self, target):
+            fake.api_targets.append(target)
+            return SimpleNamespace(metadata=fake.api_metadata)
+
+    def _init(**kwargs):
+        fake.inits.append(kwargs)
+        fake.run = SimpleNamespace()
+
     fake.Artifact = Artifact
+    fake.Api = FakeApi
+    fake.init = _init
     fake.log_artifact = lambda artifact: fake.logged.append(artifact)
     fake.finish = lambda exit_code=0: fake.finished.append(exit_code)
     return fake
@@ -1256,25 +1282,19 @@ class TestUploadRunRecordArtifact:
     def test_disabled_uploads_nothing(self, tmp_path, monkeypatch):
         fake = self._install_fake(monkeypatch)
         cfg, _ = self._cfg(tmp_path, enabled=False)
-        train.upload_run_record_artifact(
-            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
-        )
+        train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert fake.logged == []
 
     def test_upload_record_false_uploads_nothing(self, tmp_path, monkeypatch):
         fake = self._install_fake(monkeypatch)
         cfg, _ = self._cfg(tmp_path, upload_record=False)
-        train.upload_run_record_artifact(
-            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
-        )
+        train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert fake.logged == []
 
     def test_non_rank_zero_uploads_nothing(self, tmp_path, monkeypatch):
         fake = self._install_fake(monkeypatch)
         cfg, _ = self._cfg(tmp_path)
-        train.upload_run_record_artifact(
-            cfg, _RUN_ID, SimpleNamespace(is_global_zero=False)
-        )
+        train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=False)
         assert fake.logged == []
 
     def test_record_not_done_logs_a_error_and_uploads_nothing(
@@ -1283,9 +1303,7 @@ class TestUploadRunRecordArtifact:
         fake = self._install_fake(monkeypatch, run=SimpleNamespace())
         cfg, runs_dir = self._cfg(tmp_path)
         self._record(runs_dir, status="interrupted")
-        train.upload_run_record_artifact(
-            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
-        )
+        train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert fake.logged == []
         assert "not test_done" in caplog.text
 
@@ -1293,9 +1311,7 @@ class TestUploadRunRecordArtifact:
         fake = self._install_fake(monkeypatch, run=SimpleNamespace())
         cfg, runs_dir = self._cfg(tmp_path, upload_checkpoint=True)
         self._record(runs_dir, checkpoint=True)
-        train.upload_run_record_artifact(
-            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
-        )
+        train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert len(fake.logged) == 1
         artifact = fake.logged[0]
         assert artifact.name == artifact_name(_RUN_ID)
@@ -1314,9 +1330,7 @@ class TestUploadRunRecordArtifact:
         fake = self._install_fake(monkeypatch, run=SimpleNamespace())
         cfg, runs_dir = self._cfg(tmp_path)
         self._record(runs_dir, checkpoint=True)
-        train.upload_run_record_artifact(
-            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
-        )
+        train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert f"{_TASK}/{_RUN_ID}.pt" not in fake.logged[0].files
 
     def test_log_artifact_error_is_logged_and_not_raised(
@@ -1329,9 +1343,7 @@ class TestUploadRunRecordArtifact:
 
         fake.log_artifact = boom
         cfg, _ = self._cfg(tmp_path)
-        train.upload_run_record_artifact(
-            cfg, _RUN_ID, SimpleNamespace(is_global_zero=True)
-        )
+        train.upload_run_record_artifact(cfg, _RUN_ID, is_global_zero=True)
         assert "upload exploded" in caplog.text
 
 
@@ -1360,3 +1372,122 @@ class TestMainClosesWandbRun:
         fake, cfg = self._call(monkeypatch, lambda cfg: None)
         train._run_and_close(cfg)
         assert fake.finished == [0]
+
+
+class TestEnsureRunRecordUploaded:
+    """A skipped finished run is (re)uploaded to W&B when its artifact
+    is missing or stale; a failed check never fails the job."""
+
+    def _setup(self, tmp_path, *, enabled=True, upload_record=True):
+        runs_dir = tmp_path / "runs"
+        curves_dir = tmp_path / "curves"
+        runs_dir.mkdir(parents=True)
+        (runs_dir / f"{_RUN_ID}.json").write_text(
+            json.dumps(
+                {
+                    "run_id": _RUN_ID,
+                    "status": "test_done",
+                    "config_hash": "abc123",
+                    "seed": 0,
+                    "config": {"task": {"name": _TASK}, "experiment": {"tier": _TIER}},
+                    "git": {"commit": "beef"},
+                    "provenance": {"uv.lock": "deadbeef"},
+                }
+            )
+        )
+        (curves_dir / _RUN_ID / "version_0").mkdir(parents=True)
+        (curves_dir / _RUN_ID / "version_0" / "metrics.csv").write_text(
+            "step,val/acc\n0,0.5\n"
+        )
+        cfg = OmegaConf.create(
+            {
+                "output": {"runs_dir": str(runs_dir)},
+                "task": {"name": _TASK},
+                "experiment": {
+                    "name": "multistate_gdn2_synthetic_pilot",
+                    "phase": 1,
+                    "tier": _TIER,
+                },
+                "model": {
+                    "layout": "ws",
+                    "gate_mode": "full",
+                    "lambda_mode": "mlp",
+                    "d_model": 32,
+                },
+                "logging": {
+                    "csv": {"save_dir": str(curves_dir)},
+                    "wandb": {
+                        "enabled": enabled,
+                        "upload_record": upload_record,
+                        "upload_checkpoint": False,
+                        "project": "MultistateGDN2",
+                        "entity": None,
+                    },
+                },
+            }
+        )
+        return cfg
+
+    def _install(self, monkeypatch, **attrs):
+        fake = _fake_wandb()
+        for key, value in attrs.items():
+            setattr(fake, key, value)
+        monkeypatch.setitem(sys.modules, "wandb", fake)
+        return fake
+
+    def test_present_with_equal_identity_does_nothing(self, tmp_path, monkeypatch):
+        cfg = self._setup(tmp_path)
+        fake = self._install(
+            monkeypatch, api_metadata={"config_hash": "abc123", "seed": 0}
+        )
+        train.ensure_run_record_uploaded(cfg, _RUN_ID)
+        assert fake.inits == []
+        assert fake.logged == []
+
+    def test_absent_reuploads_in_a_short_run(self, tmp_path, monkeypatch):
+        cfg = self._setup(tmp_path)
+        fake = self._install(monkeypatch, api_exists=False)
+        train.ensure_run_record_uploaded(cfg, _RUN_ID)
+        assert len(fake.inits) == 1
+        assert fake.inits[0]["job_type"] == "upload"
+        assert len(fake.logged) == 1
+        artifact = fake.logged[0]
+        assert artifact.files == [
+            f"{_TASK}/{_RUN_ID}.json",
+            f"{_TASK}/curves/{_RUN_ID}/metrics.csv",
+        ]
+        assert fake.finished == [0]
+
+    def test_present_with_different_identity_is_reuploaded(self, tmp_path, monkeypatch):
+        cfg = self._setup(tmp_path)
+        fake = self._install(
+            monkeypatch, api_metadata={"config_hash": "other", "seed": 1}
+        )
+        train.ensure_run_record_uploaded(cfg, _RUN_ID)
+        assert len(fake.inits) == 1
+        assert len(fake.logged) == 1
+
+    def test_disabled_makes_no_api_call(self, tmp_path, monkeypatch):
+        cfg = self._setup(tmp_path, enabled=False)
+        fake = self._install(monkeypatch)
+        train.ensure_run_record_uploaded(cfg, _RUN_ID)
+        assert fake.api_targets == []
+        assert fake.inits == []
+        assert fake.logged == []
+
+    def test_upload_record_false_makes_no_api_call(self, tmp_path, monkeypatch):
+        cfg = self._setup(tmp_path, upload_record=False)
+        fake = self._install(monkeypatch)
+        train.ensure_run_record_uploaded(cfg, _RUN_ID)
+        assert fake.api_targets == []
+        assert fake.inits == []
+
+    def test_artifact_exists_error_is_logged_and_not_raised(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        cfg = self._setup(tmp_path)
+        fake = self._install(monkeypatch, api_exists_error=RuntimeError("api boom"))
+        train.ensure_run_record_uploaded(cfg, _RUN_ID)
+        assert "api boom" in caplog.text
+        assert fake.inits == []
+        assert fake.logged == []
