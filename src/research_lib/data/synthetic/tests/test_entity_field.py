@@ -405,6 +405,19 @@ def test_sibling_vs_late_and_untouched():
                 assert c == SIBLING and slot < s2 or c == SIBLING_LATE and slot > s2
 
 
+def test_shortest_slice_has_no_untouched_pairs():
+    """At the default config the shortest slice (N = 8) updates every
+    entity, so it has no untouched pairs; the longer slices do."""
+    config = EntityFieldConfig()
+    for e, expected in ((2, 0), (4, 4), (8, 8)):
+        batch = generate_entity_field(
+            config, num_examples=8, seed=61, num_entities=e
+        )
+        for ex in range(8):
+            n_untouched = int((batch["key_class"][ex] == UNTOUCHED).sum())
+            assert n_untouched == expected
+
+
 # =============================================================================
 # Class proportions
 # =============================================================================

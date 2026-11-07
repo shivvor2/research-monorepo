@@ -11,6 +11,7 @@ sweep tiers' counts here when it is added.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from common.protocol import (  # noqa: F401  (re-exported for convenience)
@@ -95,26 +96,72 @@ SCREENING_CELLS: dict[str, str] = {
 column). A task with a screening cell but no :data:`TASK_TIERS` entry is
 skipped by the reports with a log line, not an error."""
 
-# Single-step fallback for the entity-field screening cell: if both gates
-# read the sibling accuracy below this floor at the longest slice, the
-# reports read the next-shorter slice instead.
-SIBLING_FLOOR = 0.15
-"""Below this, both gates at the longest slice fall back to the shorter
-slice's sibling cell."""
-
-SCREENING_FALLBACK_CELL = "test/acc/slice=16/class=sibling"
-"""The fallback screening cell when both gates read below
-:data:`SIBLING_FLOOR` at the longest slice."""
-
-# A task's damage reading: the erase's unwanted spread. For entity-field:
-# the sibling (written before an update) accuracy subtracted from the
-# untouched accuracy, at a gate's selected point.
-TASK_DAMAGE_PAIRS: dict[str, tuple[str, str]] = {
-    "entity_field": (
-        "test/acc/class=untouched",
-        "test/acc/class=sibling",
-    ),
+SCREENING_FALLBACKS: dict[str, tuple[str, float]] = {
+    # Both gates below 0.15 at the longest slice: read the next-shorter slice.
+    "entity_field": ("test/acc/slice=16/class=sibling", 0.15),
 }
-"""The high-minus-low metric pair defining a task's damage reading, per
-registered task. The reports print the reading (``high - low``) per gate
-when both columns are present."""
+"""Per task, the fallback screening cell and the floor below which both
+gates at the primary cell trigger it."""
+
+
+def screening_cell(task: str, readings: Mapping[str, float | None]) -> str:
+    """The screening cell to read for ``task``.
+
+    Returns the task's fallback cell only when it has one, both gates'
+    readings are present, and both are below the floor; otherwise the
+    primary cell from :data:`SCREENING_CELLS`.
+
+    Args:
+        task: The task name.
+        readings: The per-gate readings at the primary cell (``full`` and
+            ``kda``), ``None`` where unmeasured.
+
+    Returns:
+        The metric key to read.
+    """
+    primary = SCREENING_CELLS[task]
+    fallback = SCREENING_FALLBACKS.get(task)
+    if fallback is None:
+        return primary
+    cell, floor = fallback
+    full = readings.get("full")
+    kda = readings.get("kda")
+    if full is None or kda is None:
+        return primary
+    if full < floor and kda < floor:
+        return cell
+    return primary
+
+
+@dataclass(frozen=True)
+class DamageReading:
+    """A task's damage reading: the high-class accuracy minus the
+    low-class accuracy, per slice.
+
+    Attributes:
+        high_class: The class name whose accuracy is the minuend.
+        low_class: The class name whose accuracy is the subtrahend.
+        slices: The slice values to read (the shortest slice is omitted
+            when it has no high-class answers).
+    """
+
+    high_class: str
+    low_class: str
+    slices: tuple[int, ...]
+
+    def columns(self, n: int) -> tuple[str, str]:
+        """The two ``test/acc/slice={n}/class={c}`` column names for
+        slice ``n``."""
+        return (
+            f"test/acc/slice={n}/class={self.high_class}",
+            f"test/acc/slice={n}/class={self.low_class}",
+        )
+
+
+TASK_DAMAGE: dict[str, DamageReading] = {
+    # The shortest slice (N = 8) has no untouched pairs: every entity is
+    # updated, so it is omitted.
+    "entity_field": DamageReading("untouched", "sibling", slices=(16, 32)),
+}
+"""The damage reading per registered task. The reports print the reading
+(``high - low``) per slice and gate when both columns are present."""

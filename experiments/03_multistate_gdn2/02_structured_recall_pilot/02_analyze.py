@@ -23,14 +23,16 @@ Reports
     duplicated (task, seed) row after filtering raises naming the run
     IDs. A task with a screening cell but no tiers entry is skipped with
     a log line.
-
-Tasks that declare a damage pair in the protocol get a ``damage`` column
-(``calibration``, at each gate's selected point) and per-gate
-``damage_full`` / ``damage_kda`` columns (``positive_control``): the
-mean of the high metric minus the low metric over the cell's runs.
 ``completeness``
     Per tier, expected vs observed done runs, plus tiers with runs but no
     expected count (via ``common.analysis.missing_runs``).
+
+Tasks that declare a damage reading in the protocol get per-slice
+``damage/slice={n}`` columns (``calibration``, at each gate's selected
+point) and per-gate ``damage_full/slice={n}`` / ``damage_kda/slice={n}``
+columns (``positive_control``): the mean of the high-class accuracy minus
+the low-class accuracy over the cell's runs. A task with a screening
+fallback reads the shorter slice when both gates fall below its floor.
 
 Usage:
     python 02_analyze.py calibration positive_control completeness
@@ -119,24 +121,26 @@ def _cell_mean(grp: pd.DataFrame, metric: str, lr: float) -> float | None:
     return float(sub.mean()) if len(sub) else None
 
 
-def _damage_at(grp: pd.DataFrame, task: str, lr: float) -> float | None:
-    """The task's damage reading at ``lr``: the mean of ``high - low``
-    over the runs where both columns are present (per protocol).
+def _damage(rows: pd.DataFrame, task: str, n: int) -> float | None:
+    """The task's damage reading for slice ``n``: the mean per-run
+    ``high - low`` over ``rows`` where both columns are present, or
+    ``None`` when the task has no reading or a column is missing.
 
     Args:
-        grp: The gated-delta runs of one (task, layout, gate) cell.
-        task: The task name (looks up the high/low pair in the protocol).
-        lr: The selected learning rate.
+        rows: The runs to read (already filtered to one gate / LR).
+        task: The task name (looks up the reading in the protocol).
+        n: The slice value.
 
     Returns:
-        The mean per-run ``high - low`` difference, or ``None`` when the
-        task has no damage pair or no run measured both columns.
+        The mean per-run ``high - low`` difference, or ``None``.
     """
-    pair = _protocol.TASK_DAMAGE_PAIRS.get(task)
-    if pair is None:
+    reading = _protocol.TASK_DAMAGE.get(task)
+    if reading is None:
         return None
-    high, low = pair
-    sub = grp[(grp["lr"] == lr) & grp[high].notna() & grp[low].notna()]
+    high, low = reading.columns(n)
+    if high not in rows.columns or low not in rows.columns:
+        return None
+    sub = rows[rows[high].notna() & rows[low].notna()]
     if sub.empty:
         return None
     return float((sub[high] - sub[low]).mean())
@@ -160,7 +164,10 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
     multi = gated_sel[gated_sel["layout"] != "single"]
     for keys, grp in single.groupby(["task", "decay_scheme", "lambda_mode"]):
         task, decay, lam = keys
-        gaps = {}
+        primary = _protocol.SCREENING_CELLS.get(task)
+        gate_rows: dict[str, dict] = {}
+        gate_lr: dict[str, float | None] = {}
+        primary_cells: dict[str, float | None] = {}
         for gate in ("full", "kda"):
             by_gate = grp[grp["gate_mode"] == gate]
             if by_gate.empty:
@@ -169,8 +176,7 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
             if per_lr.empty:
                 continue
             chosen = select_lr(per_lr)
-            metric = _protocol.SCREENING_CELLS.get(task)
-            cell = _cell_mean(by_gate, metric, chosen) if metric else None
+            cell = _cell_mean(by_gate, primary, chosen) if primary else None
             row = {
                 "kind": "single",
                 "task": task,
@@ -194,28 +200,41 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                     else None
                 ),
                 "cell": cell,
+                "cell_metric": primary,
             }
-            gaps[gate] = cell
-            if task in _protocol.TASK_DAMAGE_PAIRS:
-                row["damage"] = _damage_at(by_gate, task, chosen)
+            gate_rows[gate] = row
+            gate_lr[gate] = chosen
+            primary_cells[gate] = cell
             rows.append(row)
+        # Apply the screening fallback: if both gates read below the floor
+        # at the primary cell, read the shorter slice instead.
+        metric = _protocol.screening_cell(task, primary_cells) if primary else None
+        if metric is not None and metric != primary:
+            logger.info("screening fallback for %s: reading %s", task, metric)
+            for gate, row in gate_rows.items():
+                by_gate = grp[grp["gate_mode"] == gate]
+                row["cell"] = _cell_mean(by_gate, metric, gate_lr[gate])
+                row["cell_metric"] = metric
+        # Per-slice damage at each gate's selected point.
+        reading = _protocol.TASK_DAMAGE.get(task)
+        if reading is not None:
+            for gate, row in gate_rows.items():
+                at_lr = grp[
+                    (grp["gate_mode"] == gate) & (grp["lr"] == gate_lr[gate])
+                ]
+                for n in reading.slices:
+                    row[f"damage/slice={n}"] = _damage(at_lr, task, n)
         # Attach the full - kda gap to the single-state rows of this cell.
+        cells = {gate: row["cell"] for gate, row in gate_rows.items()}
         if (
-            "full" in gaps
-            and "kda" in gaps
-            and gaps["full"] is not None
-            and gaps["kda"] is not None
+            "full" in cells
+            and "kda" in cells
+            and cells["full"] is not None
+            and cells["kda"] is not None
         ):
-            gap = gaps["full"] - gaps["kda"]
-            for row in rows:
-                if (
-                    row.get("kind") == "single"
-                    and row["task"] == task
-                    and row["decay_scheme"] == decay
-                    and row["lambda_mode"] == lam
-                    and row["gate_mode"] in ("full", "kda")
-                ):
-                    row["gap_full_kda"] = gap
+            gap = cells["full"] - cells["kda"]
+            for row in gate_rows.values():
+                row["gap_full_kda"] = gap
 
     for keys, grp in multi.groupby(
         ["task", "decay_scheme", "layout", "gate_mode", "lambda_mode"]
@@ -348,24 +367,39 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
         & (table["mixer"].fillna("gated_delta") == "gated_delta")
     ]
     rows = []
-    for task, metric in _protocol.SCREENING_CELLS.items():
+    for task, primary in _protocol.SCREENING_CELLS.items():
         tiers = _protocol.TASK_TIERS.get(task)
         if tiers is None:
             logger.info("skipping positive control for %s: no TASK_TIERS entry", task)
             continue
-        if metric not in base.columns:
+        if primary not in base.columns:
             logger.info(
                 "skipping positive control for %s: screening cell %r not "
                 "in the run table",
                 task,
-                metric,
+                primary,
             )
             continue
-        by_task = base[
-            (base["task"] == task)
-            & (base["tier"] == tiers.positive_control)
-            & base[metric].notna()
+        tier_rows = base[
+            (base["task"] == task) & (base["tier"] == tiers.positive_control)
         ]
+        # Per-gate means at the primary cell, then the fallback rule.
+        readings: dict[str, float | None] = {}
+        for gate in ("full", "kda"):
+            sub = tier_rows[tier_rows["gate_mode"] == gate][primary].dropna()
+            readings[gate] = float(sub.mean()) if not sub.empty else None
+        metric = _protocol.screening_cell(task, readings)
+        if metric != primary and metric not in base.columns:
+            logger.info(
+                "screening fallback cell %r missing for %s; keeping %r",
+                metric,
+                task,
+                primary,
+            )
+            metric = primary
+        if metric != primary:
+            logger.info("screening fallback for %s: reading %s", task, metric)
+        by_task = tier_rows[tier_rows[metric].notna()]
         dup = by_task.groupby(["seed", "gate_mode"])["run_id"].nunique()
         dup = dup[dup > 1]
         if not dup.empty:
@@ -380,20 +414,15 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
         report.insert(0, "task", task)
         report.insert(1, "metric", metric)
         report["tier"] = tiers.positive_control
-        # The task's damage reading per gate (the mean ``high - low`` over
-        # the tier's runs, when the task declares a damage pair).
-        pair = _protocol.TASK_DAMAGE_PAIRS.get(task)
-        if pair is not None:
-            high, low = pair
+        # Per-slice damage per gate over the tier's runs.
+        reading = _protocol.TASK_DAMAGE.get(task)
+        if reading is not None:
             for gate in ("full", "kda"):
-                sub = by_task[
-                    (by_task["gate_mode"] == gate)
-                    & by_task[high].notna()
-                    & by_task[low].notna()
-                ]
-                report[f"damage_{gate}"] = (
-                    float((sub[high] - sub[low]).mean()) if not sub.empty else None
-                )
+                gate_rows = by_task[by_task["gate_mode"] == gate]
+                for n in reading.slices:
+                    report[f"damage_{gate}/slice={n}"] = _damage(
+                        gate_rows, task, n
+                    )
         rows.append(report)
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     (out_dir / "positive_control.csv").write_text(
