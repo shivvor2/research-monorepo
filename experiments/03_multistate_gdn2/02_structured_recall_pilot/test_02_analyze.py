@@ -287,3 +287,59 @@ class TestCompleteness:
         calib = df[df["tier"] == "calib_lr"].iloc[0]
         assert calib["expected"] == 0  # present with runs, no expected count
         assert bool(calib["known"]) is False
+
+
+class TestCalibrationDecay:
+    def test_two_decay_schemes_give_two_rows_and_one_snippet_entry(self, tmp_path):
+        # One cell run under two decay schemes: two rows, each with its
+        # own selected LR; the frozen snippet holds a single entry (the
+        # harness's grouped decay only).
+        rows = [
+            _row(
+                "g0", gate="full", lr=0.003, seed=0, best=0.8, step=10, **{METRIC: 0.9}
+            ),
+            _row(
+                "g1", gate="full", lr=0.003, seed=1, best=0.8, step=10, **{METRIC: 0.9}
+            ),
+            _row(
+                "u0", gate="full", lr=0.01, seed=0, best=0.9, step=10, **{METRIC: 0.95}
+            ),
+            _row(
+                "u1", gate="full", lr=0.01, seed=1, best=0.9, step=10, **{METRIC: 0.95}
+            ),
+        ]
+        rows[2]["decay_scheme"] = "uniform"
+        rows[3]["decay_scheme"] = "uniform"
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        gd = df[(df["kind"] == "single") & (df["decay_scheme"] == "grouped")].iloc[0]
+        un = df[(df["kind"] == "single") & (df["decay_scheme"] == "uniform")].iloc[0]
+        assert gd["selected_lr"] == pytest.approx(0.003)
+        assert un["selected_lr"] == pytest.approx(0.01)
+        # The snippet holds one LR for the cell.
+        snippet = (out / "frozen_protocol_snippet.yaml").read_text()
+        assert snippet.count("full: 0.003") == 1
+        assert "full: 0.01" not in snippet
+
+    def test_n_seeds_is_the_selected_lrs_count(self, tmp_path):
+        # The best LR (0.01) is measured on one fewer seed than 0.003.
+        rows = [
+            _row(
+                "g0", gate="full", lr=0.003, seed=0, best=0.8, step=10, **{METRIC: 0.9}
+            ),
+            _row(
+                "g1", gate="full", lr=0.003, seed=1, best=0.8, step=10, **{METRIC: 0.9}
+            ),
+            _row(
+                "u0", gate="full", lr=0.01, seed=0, best=0.9, step=10, **{METRIC: 0.95}
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["selected_lr"] == pytest.approx(0.01)
+        assert full["n_seeds"] == 1

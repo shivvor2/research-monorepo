@@ -78,22 +78,26 @@ def _selection(table: pd.DataFrame) -> pd.DataFrame:
 
 
 def _lr_summary(grp: pd.DataFrame) -> pd.DataFrame:
-    """One row per LR for a config group: per-seed means, then selection."""
-    by = ["lr"]
-    decay = grp["decay_scheme"].fillna("grouped")
-    if decay.nunique() > 1:
-        by.append("decay_scheme")
-    per_lr = per_seed_mean(grp, by=by, selection_seeds=_protocol.SELECTION_SEEDS)
+    """One scalar-LR row per LR for a config group: per-seed means.
+
+    The decay scheme is an *outer* cell attribute (:func:`calibration`
+    groups by it), never part of the LR index, so ``select_lr`` stays a
+    scalar-LR selection even when a cell has runs under two decay
+    schemes.
+    """
+    per_lr = per_seed_mean(grp, by="lr", selection_seeds=_protocol.SELECTION_SEEDS)
     if per_lr.empty:
         return per_lr
-    renamed = per_lr.rename(
+    return per_lr.rename(
         columns={"mean_best_value": "mean_acc", "mean_best_step": "mean_steps"}
-    )
-    if "decay_scheme" in renamed.columns:
-        renamed = renamed.set_index(["lr", "decay_scheme"])
-    else:
-        renamed = renamed.set_index("lr")
-    return renamed
+    ).set_index("lr")
+
+
+def _n_seeds(per_lr: pd.DataFrame, chosen) -> int:
+    """The selected LR's measured-seed count (0 when nothing was picked)."""
+    if chosen is None or chosen not in per_lr.index:
+        return 0
+    return int(per_lr.loc[chosen, "n_seeds"])
 
 
 def _cell_mean(grp: pd.DataFrame, metric: str, lr: float) -> float | None:
@@ -102,15 +106,23 @@ def _cell_mean(grp: pd.DataFrame, metric: str, lr: float) -> float | None:
 
 
 def calibration(table: pd.DataFrame, out_dir: Path) -> None:
-    """The LR reading (and the single-state gap on the screening cell)."""
+    """The LR reading (and the single-state gap on the screening cell).
+
+    The decay scheme is an outer cell attribute (``grouped`` when a run
+    carries none), recorded on every row and never folded into the LR
+    index, so a cell with runs under two decay schemes yields two rows
+    with their own selected LR.
+    """
+    table = table.copy()
+    table["decay_scheme"] = table.get("decay_scheme").fillna("grouped")
     rows: list[dict] = []
     sel = _selection(table)
     gated_sel = _gated(sel)
     # --- gated-delta: single-state (the gap) and multi-state ---
     single = gated_sel[gated_sel["layout"] == "single"]
     multi = gated_sel[gated_sel["layout"] != "single"]
-    for keys, grp in single.groupby(["task", "lambda_mode"]):
-        task, lam = keys
+    for keys, grp in single.groupby(["task", "decay_scheme", "lambda_mode"]):
+        task, decay, lam = keys
         gaps = {}
         for gate in ("full", "kda"):
             by_gate = grp[grp["gate_mode"] == gate]
@@ -128,8 +140,9 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 "layout": "single",
                 "gate_mode": gate,
                 "lambda_mode": lam,
+                "decay_scheme": decay,
                 "mixer": "gated_delta",
-                "n_seeds": int(per_lr["n_seeds"].iloc[0]),
+                "n_seeds": _n_seeds(per_lr, chosen),
                 "d_model": (
                     int(grp["d_model"].dropna().iloc[0])
                     if grp["d_model"].notna().any()
@@ -138,7 +151,9 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 "selected_lr": chosen,
                 "mean_best_value": (
                     float(per_lr.loc[chosen, "mean_acc"])
-                    if chosen in per_lr.index and "mean_acc" in per_lr.columns
+                    if chosen is not None
+                    and chosen in per_lr.index
+                    and "mean_acc" in per_lr.columns
                     else None
                 ),
                 "cell": cell,
@@ -157,13 +172,16 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 if (
                     row.get("kind") == "single"
                     and row["task"] == task
+                    and row["decay_scheme"] == decay
                     and row["lambda_mode"] == lam
                     and row["gate_mode"] in ("full", "kda")
                 ):
                     row["gap_full_kda"] = gap
 
-    for keys, grp in multi.groupby(["task", "layout", "gate_mode", "lambda_mode"]):
-        task, layout, gate, lam = keys
+    for keys, grp in multi.groupby(
+        ["task", "decay_scheme", "layout", "gate_mode", "lambda_mode"]
+    ):
+        task, decay, layout, gate, lam = keys
         per_lr = _lr_summary(grp)
         if per_lr.empty:
             continue
@@ -175,8 +193,9 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 "layout": layout,
                 "gate_mode": gate,
                 "lambda_mode": lam,
+                "decay_scheme": decay,
                 "mixer": "gated_delta",
-                "n_seeds": int(per_lr["n_seeds"].iloc[0]),
+                "n_seeds": _n_seeds(per_lr, chosen),
                 "d_model": (
                     int(grp["d_model"].dropna().iloc[0])
                     if grp["d_model"].notna().any()
@@ -188,10 +207,10 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 ),
             }
         )
-    # --- attention: one row per (task, layout); no gate ---
+    # --- attention: one row per (task, decay, layout); no gate ---
     attn = sel[sel["mixer"].fillna("gated_delta") == "attention"]
-    for keys, grp in attn.groupby(["task", "layout"]):
-        task, layout = keys
+    for keys, grp in attn.groupby(["task", "decay_scheme", "layout"]):
+        task, decay, layout = keys
         per_lr = _lr_summary(grp)
         if per_lr.empty:
             continue
@@ -203,8 +222,9 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 "layout": layout,
                 "gate_mode": None,
                 "lambda_mode": None,
+                "decay_scheme": decay,
                 "mixer": "attention",
-                "n_seeds": int(per_lr["n_seeds"].iloc[0]),
+                "n_seeds": _n_seeds(per_lr, chosen),
                 "d_model": (
                     int(grp["d_model"].dropna().iloc[0])
                     if grp["d_model"].notna().any()
@@ -225,11 +245,14 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
 def _frozen_snippet(rows: list[dict], out_dir: Path) -> None:
     """A frozen-protocol LR-table snippet from the single-state selection.
 
-    The gated-delta LRs come from the single-state rows (per gate); the
-    attention LR is the first attention reading per task. This is a
-    skeleton the calibration step can grow into the full ``lr_table``.
+    The gated-delta LRs come from the single-state gated-delta rows at
+    the harness's configured decay scheme (``grouped``) only, so a cell
+    never holds two LRs; the attention LR is the first attention reading
+    per task. A skeleton the calibration step can grow into the full
+    ``lr_table``.
     """
     single = [r for r in rows if r.get("kind") == "single"]
+    single = [r for r in single if r.get("decay_scheme") == "grouped"]
     attention = [r for r in rows if r.get("kind") == "attention"]
     lines = ["lr_table:"]
     tasks = sorted({r["task"] for r in single} | {r["task"] for r in attention})
@@ -239,7 +262,7 @@ def _frozen_snippet(rows: list[dict], out_dir: Path) -> None:
         if gd:
             lines.append("    gated_delta:")
             by_gate = {r["gate_mode"]: r["selected_lr"] for r in gd}
-            lines.append(f"      single:")
+            lines.append("      single:")
             for gate in ("full", "kda"):
                 if gate in by_gate:
                     lines.append(f"        {gate}: {by_gate[gate]:g}")
