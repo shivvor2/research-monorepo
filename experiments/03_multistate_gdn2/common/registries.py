@@ -17,7 +17,7 @@ from typing import Any
 
 from research_lib.data.synthetic.registry import require_task
 
-from .harnesses import build_zoology
+from .harnesses import build_mad, build_zoology
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,7 @@ HarnessBuilder = Callable[[Any], Any]
 
 HARNESSES: dict[str, HarnessBuilder] = {
     "zoology": build_zoology,
+    "mad": build_mad,
 }
 """The registered harnesses: harness name -> model builder."""
 

@@ -48,17 +48,17 @@ for _path in (_PILOT, _PROJECT, _SRC):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from common.analysis import (  # noqa: E402
+from common.analysis import (
     missing_runs,
     paired_gap_report,
     per_seed_mean,
     select_lr,
 )
-from common.records import flatten  # noqa: E402
-from structured_recall_analysis import protocol as _protocol  # noqa: E402
+from common.records import flatten
+from structured_recall_analysis import protocol as _protocol
 
-from research_lib.training.record_table import load_records  # noqa: E402
-from research_lib.training.run_control import RUN_DONE_STATUS  # noqa: E402
+from research_lib.training.record_table import load_records
+from research_lib.training.run_control import RUN_DONE_STATUS
 
 logger = logging.getLogger(__name__)
 
@@ -323,11 +323,20 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
         if tiers is None:
             logger.info("skipping positive control for %s: no TASK_TIERS entry", task)
             continue
+        # A registered task may have the metric column absent (e.g. before
+        # any of its runs exist): fill so the mask is all-False and the
+        # report stays empty rather than raising on a missing column.
+        if metric not in base.columns:
+            base = base.copy()
+            base[metric] = float("nan")
         by_task = base[
             (base["task"] == task)
             & (base["tier"] == tiers.positive_control)
             & base[metric].notna()
         ]
+        if by_task.empty:
+            # No runs of this task's positive-control tier yet: emit no row.
+            continue
         dup = by_task.groupby(["seed", "gate_mode"])["run_id"].nunique()
         dup = dup[dup > 1]
         if not dup.empty:

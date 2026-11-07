@@ -16,8 +16,9 @@ entries share: the W&B auth check up front, the job body, and
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
@@ -37,8 +38,11 @@ from research_lib.training.configs import ScheduleConfig
 from research_lib.training.modules import MGDN2SyntheticRecallModule
 from research_lib.training.presets import build_weight_decay_configs
 from research_lib.training.run_control import RUN_DONE_STATUS, assert_fit_finished
-from research_lib.training.run_records import read_record, run_record_metadata
-from research_lib.training.scheduling import WarmupStableDecaySchedule
+from research_lib.training.run_records import read_record
+from research_lib.training.scheduling import (
+    EpochCosineSchedule,
+    WarmupStableDecaySchedule,
+)
 from research_lib.utils.io import atomic_torch_save
 
 from .layout import record_files, wandb_kwargs
@@ -72,6 +76,7 @@ def build_module(
     *,
     monitor_key: str = "val/acc",
     class_names: tuple[str, ...] | None = None,
+    extra_metrics: tuple = (),
 ) -> MGDN2SyntheticRecallModule:
     """The training module with the two AdamW weight-decay groups.
 
@@ -84,6 +89,9 @@ def build_module(
             best value (``val/acc`` default).
         class_names: The task's class-name fragments for ``RecallMetrics``
             (``None`` uses the metric's default).
+        extra_metrics: Additional evaluation metrics receiving the same
+            answer-position predictions as ``RecallMetrics`` (the module's
+            extra-metric hook).
 
     Returns:
         An :class:`MGDN2SyntheticRecallModule`, ready to fit.
@@ -93,18 +101,30 @@ def build_module(
         weight_decay=cfg.optimizer.weight_decay,
         betas=tuple(cfg.optimizer.betas),
     )
-    schedule_config = ScheduleConfig(
-        global_schedules=[
-            WarmupStableDecaySchedule(
-                param_name="lr",
-                warmup_frac=0.0,
-                cooldown_frac=1.0,
-                min_value=0.0,
-                max_value=lr,
-                decay_type="cosine",
-            )
-        ]
-    )
+    schedule_kind = str(cfg.optimizer.get("schedule") or "step_cosine")
+    if schedule_kind == "epoch_cosine":
+        # CosineAnnealingLR(T_max=epochs) stepped once per epoch: the rate
+        # is constant within an epoch and follows the cosine over the
+        # epochs, from peak at epoch 0 to near-minimum at the last.
+        import math
+
+        steps_per_epoch = math.ceil(cfg.task.num_train / cfg.training.batch_size)
+        step_schedule = EpochCosineSchedule(
+            steps_per_epoch=steps_per_epoch,
+            epochs=int(cfg.training.epochs),
+            max_value=lr,
+            min_value=float(cfg.optimizer.min_lr),
+        )
+    else:
+        step_schedule = WarmupStableDecaySchedule(
+            param_name="lr",
+            warmup_frac=0.0,
+            cooldown_frac=1.0,
+            min_value=0.0,
+            max_value=lr,
+            decay_type="cosine",
+        )
+    schedule_config = ScheduleConfig(global_schedules=[step_schedule])
     return MGDN2SyntheticRecallModule(
         model=model,
         slice_values=slice_values,
@@ -113,6 +133,7 @@ def build_module(
         monitor_key=monitor_key,
         loss_on=cfg.training.loss_on,
         answer_head=cfg.training.answer_head,
+        extra_metrics=extra_metrics,
         matrix_optimizer_config=matrix_optimizer_config,
         vector_optimizer_config=vector_optimizer_config,
         matrix_schedule_config=schedule_config,
@@ -183,7 +204,7 @@ def create_callbacks(
             run_id,
             OmegaConf.to_container(cfg, resolve=True),
             # Distribution names of the packages the scripts import.
-            packages=("torch", "lightning", "hydra-core", "omegaconf"),
+            packages=("torch", "lightning", "hydra-core", "omegaconf", "torchmetrics"),
             monitor=monitor_key,
             mode="max",
             # The run identity excludes operational keys (see HASH_EXCLUDE).

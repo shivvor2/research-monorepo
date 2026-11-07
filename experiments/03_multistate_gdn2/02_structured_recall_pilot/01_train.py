@@ -32,24 +32,29 @@ for _path in (_PROJECT, _PILOT):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
-from common.launch import begin_run, claimed_run  # noqa: E402
-from common.registries import config_type_of_task, require_harness  # noqa: E402
-from common.run_id import HASH_EXCLUDE, make_run_id  # noqa: E402
-from common.run_lifecycle import build_module  # noqa: E402
-from common.run_lifecycle import (  # noqa: E402
+from common.launch import begin_run, claimed_run
+from common.registries import config_type_of_task, require_harness
+from common.run_id import HASH_EXCLUDE, make_run_id
+from common.run_lifecycle import (
+    build_module,
     create_callbacks_reset_curves,
     create_loggers,
     post_fit,
     run_and_close,
     upload_run_record_artifact,
 )
-from structured_recall_analysis.protocol import PROTOCOL_TIERS  # noqa: E402
+from structured_recall_analysis.protocol import PROTOCOL_TIERS
 
-from research_lib.data.synthetic import (  # noqa: E402
+from research_lib.data.synthetic import (
+    FixedSetRecallDataModule,
+    MacroTokenAccuracy,
     SyntheticRecallDataModule,
+    TokenAccuracy,
+    fuzzy_recall_dataset,
+    mad_batch_row,
     require_task,
 )
-from research_lib.training.callbacks import config_hash  # noqa: E402
+from research_lib.training.callbacks import config_hash
 
 logger = logging.getLogger(__name__)
 
@@ -151,17 +156,43 @@ def run_job(cfg: DictConfig) -> None:
         task = str(cfg.task.name)
         task_config = build_task_config(cfg)
         spec = require_task(task)
-        datamodule = SyntheticRecallDataModule(
-            task=task,
-            task_config=task_config,
-            batch_size=cfg.training.batch_size,
-            num_val_per_slice=cfg.data.num_val_per_slice,
-            num_test_per_slice=cfg.data.num_test_per_slice,
-            train_seed=cfg.seed,
-            val_seed=cfg.task.val_seed,
-            test_seed=cfg.task.test_seed,
-            num_workers=cfg.data.num_workers,
-        )
+        if task == "mad_fuzzy":
+            # Fixed training set, permuted per epoch (MAD's training
+            # regime); validations/test are fixed test-style sets.
+            def to_row(inputs, targets, is_training):
+                return mad_batch_row(
+                    task_config,
+                    inputs,
+                    targets,
+                    pad_to=cfg.task.max_seq_len,
+                    is_training=bool(is_training),
+                )
+
+            datamodule = FixedSetRecallDataModule(
+                dataset_fn=fuzzy_recall_dataset,
+                config=task_config,
+                to_row=to_row,
+                num_train=cfg.task.num_train,
+                num_val=cfg.task.num_val,
+                num_test=cfg.task.num_test,
+                batch_size=cfg.training.batch_size,
+                train_seed=cfg.seed,
+                val_seed=cfg.task.val_seed,
+                test_seed=cfg.task.test_seed,
+                num_workers=cfg.data.num_workers,
+            )
+        else:
+            datamodule = SyntheticRecallDataModule(
+                task=task,
+                task_config=task_config,
+                batch_size=cfg.training.batch_size,
+                num_val_per_slice=cfg.data.num_val_per_slice,
+                num_test_per_slice=cfg.data.num_test_per_slice,
+                train_seed=cfg.seed,
+                val_seed=cfg.task.val_seed,
+                test_seed=cfg.task.test_seed,
+                num_workers=cfg.data.num_workers,
+            )
 
         # 0. Model through the harness registry; the mixer kind comes from
         # model.mixer (the run, not the harness).
@@ -169,6 +200,15 @@ def run_job(cfg: DictConfig) -> None:
         model = harness(cfg)
         if bool(getattr(cfg.training, "compile", False)):
             model = torch.compile(model)
+        extra_metrics = ()
+        if task == "mad_fuzzy":
+            # The task's reported metric (macro accuracy) and the plain
+            # scored-token accuracy; both attach through the module's
+            # extra-metric hook and drive nothing but their own columns.
+            extra_metrics = (
+                MacroTokenAccuracy(num_classes=int(cfg.task.vocab_size)),
+                TokenAccuracy(),
+            )
         module = build_module(
             cfg,
             model,
@@ -176,11 +216,30 @@ def run_job(cfg: DictConfig) -> None:
             spec.slice_values(task_config),
             monitor_key=monitor_key,
             class_names=spec.class_names,
+            extra_metrics=extra_metrics,
         )
 
+        # MAD-style training runs by epochs with a per-epoch cosine LR:
+        # max_steps and the validation interval are derived from the epoch
+        # count and the steps-per-epoch, so the epoch count is the single
+        # source of the run length.
+        if str(
+            cfg.optimizer.get("schedule") or ""
+        ) == "epoch_cosine" and cfg.training.get("epochs"):
+            import math
+
+            steps_per_epoch = math.ceil(
+                int(cfg.task.num_train) / int(cfg.training.batch_size)
+            )
+            max_steps = int(cfg.training.epochs) * steps_per_epoch
+            val_check_interval = steps_per_epoch
+        else:
+            max_steps = cfg.training.max_steps
+            val_check_interval = cfg.training.val_check_interval
+
         trainer = L.Trainer(
-            max_steps=cfg.training.max_steps,
-            val_check_interval=cfg.training.val_check_interval,
+            max_steps=max_steps,
+            val_check_interval=val_check_interval,
             precision=cfg.training.precision,
             callbacks=callbacks,
             logger=loggers,

@@ -1,0 +1,18 @@
+# @package _global_
+# MAD fuzzy tier 1, single-state: gate {kda, full} x seeds 0-9 at the
+# frozen point. 20 runs. Seed-major order (a partial tier still yields
+# complete paired readings).
+# Run: python 01_train.py +sweep=tier1_mad_single --multirun
+
+experiment:
+  phase: 2
+  tier: tier1_mad_single
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mad_fuzzy
+      seed: range(0,10)
+      model.layout: single
+      model.gate_mode: kda,full

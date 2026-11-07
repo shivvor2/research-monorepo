@@ -1,0 +1,20 @@
+# @package _global_
+# MAD fuzzy multi-state LR calibration (after a go).
+# layout {ws, ll} x gate {kda, full} x lr {1e-4, 5e-4, 1e-3} x weight decay
+# {0, 0.1}, selection seed 100 = 24 runs.
+# Run: python 01_train.py +sweep=calib_mad_multi --multirun
+
+experiment:
+  phase: 1
+  tier: calib_mad_multi
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mad_fuzzy
+      model.layout: ws,ll
+      model.gate_mode: kda,full
+      optimizer.lr: 1e-4,5e-4,1e-3
+      optimizer.weight_decay: 0,0.1
+      seed: 100

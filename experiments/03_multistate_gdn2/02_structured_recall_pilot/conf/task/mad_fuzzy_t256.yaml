@@ -1,0 +1,9 @@
+# =============================================================================
+# MAD fuzzy at sequence length 256 (the shorter setting rule alternative).
+# =============================================================================
+
+defaults:
+  - mad_fuzzy
+
+seq_len: 256
+max_seq_len: 272

@@ -20,10 +20,13 @@ experiment:
   tier: debug
 
 task:
-  vocab_size: 64
+  vocab_size: 16
   seq_len: 32
-  max_seq_len: 32
-  num_kv_pairs: [2, 4]
+  max_seq_len: 48
+  num_kv_pairs: [2, 4]        # mqar only
+  num_train: 64               # mad_fuzzy only
+  num_val: 32
+  num_test: 32
 
 model:
   d_model: 16
@@ -39,12 +42,14 @@ data:
 
 training:
   batch_size: 32
+  epochs: 2                   # mad_fuzzy: the run length derives from this
   max_steps: 4
   val_check_interval: 4
   log_every_n_steps: 1
 
 optimizer:
   lr: 0.003
+  weight_decay: 0.0
   decay_scheme: grouped
 
 logging:

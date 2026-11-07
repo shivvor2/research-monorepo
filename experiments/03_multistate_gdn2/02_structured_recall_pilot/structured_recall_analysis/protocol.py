@@ -46,10 +46,20 @@ class TaskTiers:
 # Each task adds one entry (its task config names the same tiers in
 # ``conf/sweep/``). MQAR is smoke and debug only, so it registers
 # nothing here.
-TASK_TIERS: dict[str, TaskTiers] = {}
+TASK_TIERS: dict[str, TaskTiers] = {
+    "mad_fuzzy": TaskTiers(
+        calibration=("calib_mad_single", "calib_mad_multi"),
+        positive_control="tier1_mad_single",
+    ),
+}
 
 # Expected done-count per tier, added alongside a task's tiers.
-EXPECTED_RUNS: dict[str, int] = {}
+EXPECTED_RUNS: dict[str, int] = {
+    "calib_mad_single": 12,
+    "calib_mad_multi": 24,
+    "tier1_mad_single": 20,
+    "tier1_mad_multi": 40,
+}
 
 # --------------------------------------------------------------------------- #
 # Derived tier sets
@@ -75,6 +85,7 @@ positive-control tier."""
 
 SCREENING_CELLS: dict[str, str] = {
     "mqar": "test/acc/slice=64",
+    "mad_fuzzy": "test/acc_mad",
 }
 """The screening metric key per registered task (a ``test/<key>``
 column). A task with a screening cell but no :data:`TASK_TIERS` entry is
