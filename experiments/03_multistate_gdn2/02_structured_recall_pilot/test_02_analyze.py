@@ -579,8 +579,8 @@ class TestEmptyRunsDir:
 class TestSweepTiersRegistered:
     def test_every_sweep_tier_is_a_protocol_tier(self):
         # conf/sweep has no configs now (MQAR is smoke/debug only), so
-        # the loop is empty; this catches a task PR that adds a sweep
-        # config without registering its tiers in PROTOCOL_TIERS.
+        # the loop is empty; this catches a sweep file whose tier isn't
+        # registered in PROTOCOL_TIERS.
         sweep_dir = _PILOT / "conf" / "sweep"
         registered = _analyze._protocol.PROTOCOL_TIERS
         for path in sorted(sweep_dir.glob("*.yaml")):
