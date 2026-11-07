@@ -548,8 +548,10 @@ def test_datamodule_slices_fixed_and_deterministic():
 
 def test_datamodule_train_stream_worker_sharding():
     """Entity-field train batches are per-(seed, global batch index) and
-    independent of num_workers (residue sharding)."""
+    independent of num_workers: the same global index yields identical
+    tensors for 1 and 2 workers."""
     expected_count = 3
+    by_workers = {}
     for num_workers in (1, 2):
         dataset = _SyntheticTrainDataset(
             task="entity_field",
@@ -557,17 +559,24 @@ def test_datamodule_train_stream_worker_sharding():
             batch_size=8,
             train_seed=1,
         )
-        produced = []
+        batches = {}
         for worker_id in range(num_workers):
             with patch(
                 "research_lib.data.synthetic.datamodule.torch.utils.data.get_worker_info",
                 return_value=SimpleNamespace(id=worker_id, num_workers=num_workers),
             ):
-                produced += [
-                    int(b["batch_index"])
-                    for b in itertools.islice(iter(dataset), expected_count)
-                ]
-        assert sorted(produced) == list(range(expected_count * num_workers))
+                for batch in itertools.islice(iter(dataset), expected_count):
+                    batches[int(batch["batch_index"])] = batch
+        by_workers[num_workers] = batches
+    assert sorted(by_workers[1]) == list(range(expected_count))
+    assert sorted(by_workers[2]) == list(range(expected_count * 2))
+    # The batch with a given global index is identical for 1 and 2 workers.
+    for index in by_workers[1]:
+        one = by_workers[1][index]
+        two = by_workers[2][index]
+        assert set(one) == set(two)
+        for key in one:
+            assert torch.equal(one[key], two[key]), f"batch {index} {key} differs"
 
 
 # =============================================================================
@@ -595,6 +604,63 @@ def _metric_preds(batch, mode):
         updated_mask = mask & (kc[:, 1:] >= 0) & (kc[:, 1:] <= DISTANT)
         preds[updated_mask] = old[:, 1:][updated_mask]
     return preds
+
+
+def _handmade_metric_batch():
+    """A hand-made batch with four answers per class: two correct, one
+    ``v_old`` (updated classes only) and one wrong non-old value."""
+    classes = [SAME, ADJACENT, DISTANT, SIBLING, SIBLING_LATE, UNTOUCHED]
+    per_class = 4
+    n = len(classes) * per_class
+    T = n + 1
+    labels = torch.full((1, T), IGNORE, dtype=torch.long)
+    old_labels = torch.full((1, T), IGNORE, dtype=torch.long)
+    key_class = torch.full((1, T), NO_CLASS, dtype=torch.long)
+    preds = torch.zeros((1, T - 1), dtype=torch.long)
+    idx = 0
+    for c in classes:
+        for k in range(per_class):
+            pos = idx + 1
+            target = 100 + idx
+            labels[0, pos] = target
+            key_class[0, pos] = c
+            if c in UPDATED_CLASSES:
+                old_labels[0, pos] = 200 + idx
+            if k < 2:
+                preds[0, pos - 1] = target
+            elif k == 2 and c in UPDATED_CLASSES:
+                preds[0, pos - 1] = 200 + idx
+            else:
+                preds[0, pos - 1] = 300 + idx
+            idx += 1
+    batch = {
+        "labels": labels,
+        "old_labels": old_labels,
+        "key_class": key_class,
+        "slice_id": torch.tensor([16]),
+    }
+    return preds, batch
+
+
+def test_metrics_exact_fractions():
+    """Hand-made predictions give exact non-trivial per-class fractions:
+    updated classes 0.5 correct / 0.25 leaked / 0.25 other, the rest 0.5
+    correct / 0.5 other."""
+    preds, batch = _handmade_metric_batch()
+    metrics = RecallMetrics(slice_values=(16,), class_names=ENTITY_FIELD_CLASSES)
+    metrics.update_predictions(preds, batch)
+    out = metrics.compute()
+    for c in ("same", "adjacent", "distant"):
+        assert out[f"acc/class={c}"] == pytest.approx(0.5)
+        assert out[f"leak/class={c}"] == pytest.approx(0.25)
+        assert out[f"other/class={c}"] == pytest.approx(0.25)
+    for c in ("sibling", "sibling_late", "untouched"):
+        assert out[f"acc/class={c}"] == pytest.approx(0.5)
+        assert out[f"leak/class={c}"] == pytest.approx(0.0)
+        assert out[f"other/class={c}"] == pytest.approx(0.5)
+    for c in ENTITY_FIELD_CLASSES:
+        assert out[f"acc/slice=16/class={c}"] == pytest.approx(0.5)
+    assert out["acc"] == pytest.approx(0.5)
 
 
 def test_metrics_per_class_exact():
