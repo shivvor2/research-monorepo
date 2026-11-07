@@ -79,3 +79,38 @@ class TestOddRotaryRejected:
 
         with pytest.raises(ValueError, match="rotary dimension must be even"):
             CausalSelfAttention(32, 2, rotary_dim=3)
+
+
+class TestValidation:
+    def test_nonpositive_d_model_is_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="d_model must be positive"):
+            CausalSelfAttention(0, 2)
+
+    def test_rotary_dim_above_head_width_is_rejected(self):
+        import pytest
+
+        # Head width is 32 // 2 = 16; a rotary dimension of 24 rotates
+        # beyond the head.
+        with pytest.raises(ValueError, match="cannot exceed the head width"):
+            CausalSelfAttention(32, 2, rotary_dim=24)
+
+    def test_rotary_dim_of_two_is_rejected(self):
+        import pytest
+
+        # rotary-embedding-torch 0.9.1 divides by a zero stride for dim 2.
+        with pytest.raises(ValueError, match="rotary dimension of 2"):
+            CausalSelfAttention(4, 2)
+
+    def test_explicit_rotary_dim_of_two_is_rejected(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="rotary dimension of 2"):
+            CausalSelfAttention(32, 2, rotary_dim=2)
+
+    def test_full_width_rotary_dim_is_accepted(self):
+        # A rotary dimension exactly the head width is fine.
+        attn = CausalSelfAttention(32, 2, rotary_dim=16)
+        x = torch.randn(2, 8, 32)
+        assert attn(x).shape == (2, 8, 32)

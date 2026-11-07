@@ -50,21 +50,38 @@ class CausalSelfAttention(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if d_model <= 0:
+            raise ValueError(f"d_model must be positive, got {d_model}")
         if num_heads <= 0 or d_model % num_heads != 0:
             raise ValueError(
                 f"d_model ({d_model}) must be a positive multiple of num_heads "
                 f"({num_heads})"
             )
+        head_width = d_model // num_heads
+        if rotary_dim is not None and rotary_dim > head_width:
+            raise ValueError(
+                f"rotary_dim ({rotary_dim}) cannot exceed the head width "
+                f"({head_width}); the rotary dimension rotates within a head"
+            )
         self.d_model = d_model
         self.num_heads = num_heads
         self.rotary_dim = rotary_dim
-        resolved = rotary_dim if rotary_dim is not None else d_model // num_heads
+        resolved = rotary_dim if rotary_dim is not None else head_width
         if resolved % 2 != 0:
             raise ValueError(
                 f"the rotary dimension must be even to pair sine/cosine rotary "
                 f"embeddings, got d_model={d_model}, num_heads={num_heads}, "
                 f"rotary_dim={resolved}; pick an even rotary dimension or an "
                 f"even head width"
+            )
+        if resolved == 2:
+            # rotary-embedding-torch 0.9.1 divides by the rotary frequency
+            # stride, which is zero for dim == 2 (ZeroDivisionError).
+            raise ValueError(
+                f"a rotary dimension of 2 (d_model={d_model}, num_heads="
+                f"{num_heads}, rotary_dim={rotary_dim}) fails inside "
+                f"rotary-embedding-torch at the locked version; pick a larger "
+                f"even rotary dimension or width"
             )
         self.attention = RotaryMultiheadAttention(
             embed_dim=d_model,

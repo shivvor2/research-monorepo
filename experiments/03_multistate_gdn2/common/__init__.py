@@ -11,31 +11,8 @@ constants (:mod:`common.protocol`) and the task / harness registries
 general machinery lives in ``research_lib`` and each pilot keeps its own
 protocol.
 
-A pilot's scripts add this folder (or its parent) to ``sys.path``, the
-same way they add the library's ``src``; its ``conftest.py`` does the
-same for pytest.
+This ``__init__`` imports nothing deliberately: importing the package,
+or any submodule, pulls Lightning and the model code through
+``run_lifecycle`` / ``harnesses``. A pilot already imports the specific
+submodules it needs.
 """
-
-from . import (
-    analysis,
-    launch,
-    layout,
-    protocol,
-    pull,
-    records,
-    registries,
-    run_id,
-    run_lifecycle,
-)
-
-__all__ = [
-    "analysis",
-    "layout",
-    "launch",
-    "protocol",
-    "pull",
-    "records",
-    "registries",
-    "run_id",
-    "run_lifecycle",
-]
