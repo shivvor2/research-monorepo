@@ -17,6 +17,7 @@ arbitrary layout list.
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
 from research_lib.utils.stats import (
@@ -189,6 +190,146 @@ def paired_gap_report(
 def _mean_over(table: pd.DataFrame, metric: str, gate_mode: str) -> float | None:
     sub = table[table["gate_mode"] == gate_mode][metric].dropna()
     return float(sub.mean()) if not sub.empty else None
+
+
+def missing_runs(
+    table: pd.DataFrame,
+    expected_counts: dict[str, int],
+    done_status: str = "test_done",
+) -> pd.DataFrame:
+    """Per-tier expected vs observed done runs, plus unexpected tiers.
+
+    Every tier in ``expected_counts`` gets a row (observed ``0`` when no
+    done run is present); every tier that has runs in ``table`` but no
+    expected count is appended as ``expected=0`` (a tier with runs but
+    no declaration, flagged by ``known=False``).
+
+    Args:
+        table: The loaded run table (a ``tier`` column).
+        expected_counts: Expected done-count per tier.
+        done_status: The run status that counts as done.
+
+    Returns:
+        ``DataFrame`` with ``tier``, ``expected``, ``observed``,
+        ``missing``, ``known``.
+    """
+    tiers = list(expected_counts)
+    if "tier" in table.columns:
+        observed = (
+            table[table["status"].fillna("").astype(str) == done_status]
+            .groupby("tier")["run_id"]
+            .nunique()
+        )
+        present = set(table["tier"].dropna().astype(str))
+    else:
+        observed = pd.Series(dtype=int)
+        present = set()
+    # Tiers present in the runs but not declared expected: report them.
+    for tier in sorted(present - set(tiers)):
+        tiers.append(tier)
+    rows = []
+    for tier in tiers:
+        obs = int(observed.get(tier, 0) or 0)
+        exp = int(expected_counts.get(tier, 0))
+        rows.append(
+            {
+                "tier": tier,
+                "expected": exp,
+                "observed": obs,
+                "missing": max(0, exp - obs),
+                "known": tier in expected_counts,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+_TIE_ATOL = 1e-12
+"""Epsilon for "equal means": values come from JSON, so equal means are
+symmetric; the epsilon only guards floating arrival order."""
+
+
+def per_seed_mean(
+    rows: pd.DataFrame,
+    by: str | list[str],
+    selection_seeds: tuple[int, ...],
+    best: str = "best_value",
+    step: str = "best_step",
+) -> pd.DataFrame:
+    """One row per ``by`` value: per-seed best values and steps, then means.
+
+    Each ``by`` group is summarised across the selection seeds: the
+    per-seed ``best``/``step`` values, the number of measured seeds, and
+    the mean ``best`` (and mean ``step`` over the seeds that measured
+    one). The base columns are whatever the caller's table carries
+    (e.g. the learning rate), then the seed columns.
+
+    Args:
+        rows: The completed rows to summarise.
+        by: One column or a list to group by.
+        selection_seeds: The seeds averaged over.
+        best: The best-value column.
+        step: The best-step column.
+
+    Returns:
+        One row per ``by`` value, with ``n_seeds``, the per-seed
+        columns and the means.
+    """
+    by_list = [by] if isinstance(by, str) else by
+    if best == step:
+        raise ValueError("best and step must name different columns")
+    columns = [
+        *by_list,
+        "n_seeds",
+        *(f"seed={seed}" for seed in selection_seeds),
+        f"mean_{best}",
+        f"mean_{step}",
+    ]
+    if rows.empty or any(b not in rows.columns for b in by_list):
+        return pd.DataFrame(columns=columns)
+    if step not in rows.columns:
+        return pd.DataFrame(columns=columns)
+    records = []
+    for value, group in rows.groupby(by_list, dropna=False):
+        if len(by_list) == 1:
+            record = {by_list[0]: value[0]}
+        else:
+            record = dict(zip(by_list, value))
+        record["n_seeds"] = int(group[best].notna().sum())
+        for seed in selection_seeds:
+            cell = group[group["seed"] == seed][best]
+            record[f"seed={seed}"] = float(cell.iloc[0]) if len(cell) == 1 else None
+        values = group[best].dropna()
+        record[f"mean_{best}"] = float(values.mean()) if len(values) else None
+        steps = group[step].dropna()
+        record[f"mean_{step}"] = float(steps.mean()) if len(steps) else None
+        records.append(record)
+    return pd.DataFrame(records)
+
+
+def select_lr(per_lr: pd.DataFrame) -> float | None:
+    """The selected learning rate for one configuration.
+
+    Best mean accuracy first; ties go to the fewer mean steps to the
+    best value, then to the smaller LR.
+
+    Args:
+        per_lr: One row per learning rate (indexed by ``lr``) with the
+            columns ``mean_acc`` and ``mean_steps``.
+
+    Returns:
+        The selected ``lr``, or ``None`` when nothing was measured.
+    """
+    per_lr = per_lr[per_lr["mean_acc"].notna()]
+    if per_lr.empty:
+        return None
+    best_acc = per_lr["mean_acc"].max()
+    tied = per_lr[np.isclose(per_lr["mean_acc"], best_acc, rtol=0.0, atol=_TIE_ATOL)]
+    best_steps = tied["mean_steps"].min()  # skips NaN
+    if not np.isnan(best_steps):
+        tied = tied[
+            np.isclose(tied["mean_steps"], best_steps, rtol=0.0, atol=_TIE_ATOL)
+        ]
+    return float(tied.index.min())
 
 
 def gap_column(
