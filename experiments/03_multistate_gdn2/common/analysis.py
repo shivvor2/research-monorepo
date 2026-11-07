@@ -286,7 +286,7 @@ def per_seed_mean(
     ]
     if rows.empty or any(b not in rows.columns for b in by_list):
         return pd.DataFrame(columns=columns)
-    if step not in rows.columns:
+    if best not in rows.columns or step not in rows.columns:
         return pd.DataFrame(columns=columns)
     records = []
     for value, group in rows.groupby(by_list, dropna=False):

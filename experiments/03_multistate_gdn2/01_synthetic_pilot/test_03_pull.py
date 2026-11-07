@@ -213,11 +213,103 @@ class TestArtifactName:
         with pytest.raises(ValueError, match="outside"):
             artifact_name("x-lr1e+06-s0")
 
-    def test_contract_with_the_training_script(self):
-        # 01_train.py names its uploads through the same helper.
-        import research_lib.training.run_records as run_records
 
-        assert artifact_name is run_records.artifact_name
+class TestUploadAndPullShareTheName:
+    """The name the training path uploads a record under is the name the
+    pull finds: upload through common.run_lifecycle (a fake wandb that
+    materialises the artifact), then pull it with common.pull and assert
+    it is installed."""
+
+    def test_uploaded_record_is_pulled_back(self, tmp_path, monkeypatch):
+        from common.pull import main as pull_main
+        from common.run_lifecycle import upload_run_record_artifact
+        from omegaconf import OmegaConf
+
+        runs = tmp_path / "runs"
+        runs.mkdir()
+        run_id = "tier1_core_overwrite-ws-full-mlp-d32-lr0.003-s0"
+        record = {
+            "run_id": run_id,
+            "status": "test_done",
+            "config_hash": "abc123",
+            "seed": 0,
+            "config": {"task": {"name": TASK}, "experiment": {"tier": "tier1_core"}},
+            "git": {"commit": "beef", "dirty": False},
+            "provenance": {"uv.lock": "deadbeef"},
+        }
+        (runs / f"{run_id}.json").write_text(json.dumps(record))
+        cfg = OmegaConf.create(
+            {
+                "task": {"name": TASK},
+                "output": {"runs_dir": str(runs)},
+                "logging": {
+                    "wandb": {
+                        "enabled": True,
+                        "upload_record": True,
+                        "upload_checkpoint": False,
+                    },
+                    "csv": {"save_dir": str(runs / "curves")},
+                },
+            }
+        )
+
+        holder = {"artifact": None}
+
+        class FakeArtifact:
+            """A minimal wandb Artifact: records its name and metadata,
+            and accepts file additions (which the test can ignore)."""
+
+            def __init__(self, name, type=None, metadata=None):
+                self.name = name
+                self.type = type
+                self.metadata = metadata or {}
+
+            def add_file(self, local_path, name=None):
+                pass
+
+            def wait(self):
+                pass
+
+        class FakeWandb:
+            run = object()  # a live W&B run
+
+            def Artifact(self, name, type=None, metadata=None):
+                return FakeArtifact(name, type, metadata)
+
+            def log_artifact(self, artifact):
+                holder["artifact"] = artifact
+
+            def Api(self):
+                return api
+
+        api = FakeApi([])
+        monkeypatch.setitem(sys.modules, "wandb", FakeWandb())
+        upload_run_record_artifact(cfg, run_id, True)
+
+        # The upload named the artifact with the shared helper (the same
+        # name the pull's listing looks for).
+        from research_lib.training.run_records import artifact_name as _an
+
+        assert holder["artifact"] is not None
+        assert holder["artifact"].name == _an(run_id)
+
+        # The same record, as an artifact the pull will find.
+        root = write_artifact_root(tmp_path / "src", TASK, run_id, record)
+        artifact = FakeVersionedArtifact(
+            root, run_record_metadata(record, metadata_extras())
+        )
+        api.collections.append(FakeCollection(f"c-{run_id}", [artifact]))
+        monkeypatch.setattr(
+            "research_lib.utils.secrets.check_auth", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            sys, "argv", ["03_pull", "--project", "P", "--runs-dir", str(runs)]
+        )
+        code = pull_main(expected_counts=EXPECTED_RUNS, conf_config_path=None)
+        assert code == 0
+        installed = runs / TASK / f"{run_id}.json"
+        assert installed.exists()
+        assert json.loads(installed.read_text())["config_hash"] == "abc123"
 
 
 class TestRunRecordMetadata:

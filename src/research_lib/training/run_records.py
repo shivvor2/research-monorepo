@@ -514,7 +514,10 @@ def pull(
         try:
             resolved = record_path.resolve()
         except OSError:
-            resolved = record_path
+            # An unresolvable (or escaping) path must not fall back to a
+            # ``..``-carrying relative target; report and skip instead.
+            summary.failures.append((run_id, "cannot resolve local target"))
+            continue
         if resolved != anchor and anchor not in resolved.parents:
             summary.failures.append(
                 (run_id, "unsafe run_id or task in artifact metadata")
