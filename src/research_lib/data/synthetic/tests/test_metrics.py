@@ -840,3 +840,30 @@ def test_custom_class_names_key_the_metric_dict():
 def test_recall_metrics_rejects_empty_class_names():
     with pytest.raises(ValueError):
         RecallMetrics(slice_values=[8], class_names=())
+
+
+def test_class_count_other_than_four_and_missing_codes():
+    """A class_names list shorter than the max class code still works: the
+    no-class bucket sits after the listed classes, and a class code at or
+    above the count lands in the no-class bucket (never a key fragment)."""
+    # A hand batch with two classes (codes 0 and 3) but only two names.
+    metrics = RecallMetrics(slice_values=[8], class_names=("alpha", "beta"))
+    batch = _hand_batch()  # contains classes adjacent(1) and single(3)
+    logits = _hand_logits()
+    metrics.update(logits, batch)
+    out = metrics.compute()
+    # Only code 1 is named (beta); code 3 is beyond the named classes.
+    assert "acc/class=alpha" not in out
+    assert "acc/class=beta" in out  # adjacent -> beta
+    # The overall accuracy is still measured.
+    assert "acc" in out
+
+
+def test_with_classes_false_omits_class_keys():
+    metrics = RecallMetrics(slice_values=[8], with_classes=False)
+    batch = _hand_batch()
+    logits = _hand_logits()
+    metrics.update(logits, batch)
+    out = metrics.compute()
+    assert not any("/class=" in k for k in out)
+    assert "acc" in out

@@ -11,5 +11,3 @@ harness:
   layer_pattern: null
   state_mixer: null
 lr_table: {}
-anchor_lr: {}
-overwrite_task_by_d_model: {}

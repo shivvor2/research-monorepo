@@ -9,6 +9,7 @@ Pilot-specific fix-ups (e.g. the first pilot's rebuilding of old
 pooled-accuracy records) are passed in by the pilot as a wrapper around
 :func:`flatten`, never built in here.
 """
+
 from __future__ import annotations
 
 from typing import Any, Mapping
@@ -41,6 +42,8 @@ def flatten(record: Mapping[str, Any]) -> dict[str, Any]:
         "expand_v": model.get("expand_v"),
         "layer_pattern": model.get("layer_pattern"),
         "state_mixer": model.get("state_mixer"),
+        "mixer": model.get("mixer"),
+        "harness": (cfg.get("harness") or {}).get("name"),
         "lr": (
             record["lr_resolved"]
             if "lr_resolved" in record

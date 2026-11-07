@@ -297,20 +297,26 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             sync_dist=True,
         )
         assert self._val_metrics is not None  # set in on_validation_epoch_start
+        predictions = self._predictions(out, batch)
         if isinstance(out, AnswerLogits):
             self._val_metrics.update_answers(out.logits, batch)
         else:
             self._val_metrics.update(out, batch)
         for extra in self.extra_metrics:
-            extra.update(self._predictions(out, batch), batch)
+            extra.update(predictions, batch)
         return loss
 
     def on_validation_epoch_end(self) -> None:
         assert self._val_metrics is not None
-        for key, value in self._val_metrics.compute().items():
+        base = self._val_metrics.compute()
+        for key, value in base.items():
             self.log(f"val/{key}", value)
         for extra in self.extra_metrics:
             for key, value in extra.compute().items():
+                if key in base:
+                    raise ValueError(
+                        f"extra metric {key!r} collides with a RecallMetrics key"
+                    )
                 self.log(f"val/{key}", value)
 
     def on_test_epoch_start(self) -> None:
@@ -340,18 +346,24 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             sync_dist=True,
         )
         assert self._test_metrics is not None  # set in on_test_epoch_start
+        predictions = self._predictions(out, batch)
         if isinstance(out, AnswerLogits):
             self._test_metrics.update_answers(out.logits, batch)
         else:
             self._test_metrics.update(out, batch)
         for extra in self.extra_metrics:
-            extra.update(self._predictions(out, batch), batch)
+            extra.update(predictions, batch)
         return loss
 
     def on_test_epoch_end(self) -> None:
         assert self._test_metrics is not None
-        for key, value in self._test_metrics.compute().items():
+        base = self._test_metrics.compute()
+        for key, value in base.items():
             self.log(f"test/{key}", value)
         for extra in self.extra_metrics:
             for key, value in extra.compute().items():
+                if key in base:
+                    raise ValueError(
+                        f"extra metric {key!r} collides with a RecallMetrics key"
+                    )
                 self.log(f"test/{key}", value)

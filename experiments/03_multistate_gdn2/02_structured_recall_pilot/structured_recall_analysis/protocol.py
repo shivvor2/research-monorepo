@@ -27,3 +27,8 @@ SCREENING_CELLS: dict[str, str] = {
 
 # Expected run counts per tier: filled in by the task PRs' sweep files.
 EXPECTED_RUNS: dict[str, int] = {}
+
+# The tiers whose finished runs are recognised as done by the skip check
+# (tooling tiers like smoke/debug always run). Filled in as the task PRs
+# add their sweeps.
+PROTOCOL_TIERS: frozenset[str] = frozenset(EXPECTED_RUNS) | frozenset({"calibration"})

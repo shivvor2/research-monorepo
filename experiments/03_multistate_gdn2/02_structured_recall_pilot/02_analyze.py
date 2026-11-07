@@ -1,28 +1,43 @@
 """Command-line entry point for the structured-recall pilot's reports.
 
-Builds on :mod:`research_lib.training.records.load_records` (with
-``common.records.flatten``) and the shared :mod:`common.analysis` pieces;
-each subcommand answers one question. Each task registers its screening
-cell in ``structured_recall_analysis/protocol.py``.
+Builds on :mod:`research_lib.training.record_table.load_records` (with
+``common.records.flatten``) and the shared :mod:`common.analysis` pieces.
+Each subcommand answers one question; the task-specific readings and
+screening cells live in the pilot's protocol.
 
 Usage:
     python 02_analyze.py calibration positive_control completeness
     python 02_analyze.py --runs-dir runs --out-dir analysis
 """
+
 from __future__ import annotations
 
 import argparse
 import logging
+import sys
 from pathlib import Path
 
 import pandas as pd
 
-import common.records
-from common.analysis import gap_column, paired_gap_report
-from common.records import flatten
-from research_lib.training.records import load_records
+_PILOT = Path(__file__).resolve().parent
+_PROJECT = _PILOT.parent
+_SRC = _PROJECT.parents[1] / "src"
+for _path in (_PILOT, _PROJECT, _SRC):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from common.analysis import gap_column, paired_gap_report  # noqa: E402
+from common.records import flatten  # noqa: E402
+
+from research_lib.training.record_table import load_records  # noqa: E402
 
 logger = logging.getLogger(__name__)
+
+# The calibration tiers (single-state selection) come from the protocol.
+from structured_recall_analysis import protocol as _protocol  # noqa: E402
+
+lr_key = "lr"
+CALIBRATION_TIERS = frozenset(_protocol.EXPECTED_RUNS) | frozenset({"calibration"})
 
 
 def _load(runs_dir: Path) -> pd.DataFrame:
@@ -30,50 +45,71 @@ def _load(runs_dir: Path) -> pd.DataFrame:
 
 
 def calibration(table: pd.DataFrame, out_dir: Path) -> None:
-    """The per-(task, layout, gate) best validation value and the gap
-    ``full - kda`` at each selected point."""
-    out = []
-    for (task, layout), group in table.groupby(
-        ["task", "layout"], dropna=False
-    ):
-        cell = None
-        for metric in ("best_value", "test/acc/slice=64"):
-            if metric in group.columns and group[metric].notna().any():
-                cell = metric
-                break
-        if cell is None:
+    """Per (task, layout, gate, lambda) the best validation value per LR,
+    the selected point, and at each gate's point the screening cell with
+    the ``full - kda`` gap for single-state rows (calibration tiers only)."""
+    rows = []
+    for keys, group in table.groupby(["task", "layout", "gate_mode", "lambda_mode"]):
+        task, layout, gate, lam = keys
+        if task not in _protocol.SCREENING_CELLS and layout != "single":
             continue
-        row = {
-            "task": task,
-            "layout": layout,
-            "best_full": _at(group, cell, "full"),
-            "best_kda": _at(group, cell, "kda"),
-        }
-        row["gap_full_kda"] = (
-            None if pd.isna(row["best_full"]) or pd.isna(row["best_kda"])
-            else round(row["best_full"] - row["best_kda"], 4)
+        if not set(group["tier"].dropna()).intersection(CALIBRATION_TIERS):
+            continue
+        numeric = group["best_value"].dropna()
+        if numeric.empty:
+            continue
+        best = float(numeric.max())
+        selected_lr = _lr_of(numeric, group)
+        rows.append(
+            {
+                "task": task,
+                "layout": layout,
+                "gate_mode": gate,
+                "lambda_mode": lam,
+                "best_value": best,
+                "selected_lr": selected_lr,
+            }
         )
-        out.append(row)
-    df = pd.DataFrame(out)
-    (out_dir / "calibration.csv").write_text(df.to_csv(index=False), encoding="utf-8")
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        metric = _protocol.SCREENING_CELLS.get(df["task"].iloc[0])
+        cells = (
+            table[table["layout"] == "single"][["task", "layout", "gate_mode", metric]]
+            if metric and metric in table
+            else pd.DataFrame()
+        )
+        if metric and metric in table:
+            cells = table[["task", "layout", "gate_mode", metric]].dropna(
+                subset=[metric]
+            )
+            gap = gap_column(cells, metric)
+            cells["gap_full_kda"] = gap.reindex(cells.index).values
+        (out_dir / "calibration.csv").write_text(
+            df.to_csv(index=False), encoding="utf-8"
+        )
 
 
-def _at(group: pd.DataFrame, metric: str, gate: str) -> float | None:
-    sub = group[group["gate_mode"] == gate][metric]
-    non_null = sub.dropna()
-    return float(non_null.max()) if not non_null.empty else None
+def _lr_of(best: pd.Series, group: pd.DataFrame) -> float | None:
+    if "best_value" not in group:
+        return None
+    chosen = group.loc[best.index.max()]
+    return float(chosen.get("lr")) if chosen.get("lr") is not None else None
 
 
 def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
-    """The paired gap over seeds on each task's screening cell."""
-    from structured_recall_analysis.protocol import SCREENING_CELLS
-
+    """The paired gap over seeds on each task's screening cell, single-state
+    gated-delta runs in the task's tier, at the selected LR per gate."""
     rows = []
-    for task, metric in SCREENING_CELLS.items():
-        single = table[table["layout"] == "single"]
-        if metric not in single.columns:
+    for task, metric in _protocol.SCREENING_CELLS.items():
+        if metric not in table:
             continue
-        report = paired_gap_report(single, metric)
+        subset = table[
+            (table["task"] == task)
+            & (table["layout"] == "single")
+            & (table["mixer"].fillna("gated_delta") == "gated_delta")
+            & (table["tier"].isin(list(CALIBRATION_TIERS)))
+        ]
+        report = paired_gap_report(subset, metric)
         report.insert(0, "task", task)
         rows.append(report)
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -83,16 +119,16 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
 
 
 def completeness(table: pd.DataFrame, out_dir: Path) -> None:
-    """Missing runs per sweep (given the loaded records; expected counts
-    come from the pilot protocol empty until the task PRs)."""
-    from structured_recall_analysis.protocol import EXPECTED_RUNS
-
-    counts = table.groupby("tier").size()
+    """Missing run IDs per sweep (the expected counts from the protocol)."""
+    done = set(table["run_id"].dropna())
+    missing = [r for r, _ in _protocol.EXPECTED_RUNS.items()]  # placeholder
     df = pd.DataFrame(
-        {"tier": list(counts.index), "local_done": list(counts.values)}
+        {
+            "run_id": missing,
+            "expected": [_protocol.EXPECTED_RUNS.get(r, 0) for r in missing],
+        }
     )
-    df["expected"] = df["tier"].map(EXPECTED_RUNS)
-    df["missing"] = (df["expected"] - df["local_done"]).clip(lower=0)
+    df = df[~df["run_id"].isin(done)]
     (out_dir / "completeness.csv").write_text(df.to_csv(index=False), encoding="utf-8")
 
 
@@ -122,7 +158,9 @@ def main() -> None:
     logger.info("Loaded %d runs", len(table))
     for name in args.reports:
         if name not in REPORTS:
-            raise SystemExit(f"unknown report {name!r}; available: {', '.join(REPORTS)}")
+            raise SystemExit(
+                f"unknown report {name!r}; available: {', '.join(REPORTS)}"
+            )
         REPORTS[name](table, out_dir)
         logger.info("Wrote %s", name)
 

@@ -63,3 +63,19 @@ class TestZoologyLMWithAttention:
         torch.testing.assert_close(
             logits[:, :6, :], logits2[:, :6, :], atol=1e-5, rtol=1e-5
         )
+
+
+class TestOddRotaryRejected:
+    def test_odd_resolved_rotary_dimension_raises(self):
+        import pytest
+
+        # A head width of 5 (d_model 10, 2 heads) is odd: the rotary
+        # dimension resolves to it and cannot be paired into sin/cos.
+        with pytest.raises(ValueError, match="rotary dimension must be even"):
+            CausalSelfAttention(10, 2)
+
+    def test_explicit_odd_rotary_dimension_raises(self):
+        import pytest
+
+        with pytest.raises(ValueError, match="rotary dimension must be even"):
+            CausalSelfAttention(32, 2, rotary_dim=3)

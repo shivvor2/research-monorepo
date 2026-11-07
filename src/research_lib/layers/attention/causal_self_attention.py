@@ -10,6 +10,7 @@ positive-control mixer of a synthetic recall project: a model that
 should solve the task, so that a failure can be blamed on the task
 rather than on the gate.
 """
+
 from __future__ import annotations
 
 import torch
@@ -49,9 +50,22 @@ class CausalSelfAttention(nn.Module):
         dropout: float = 0.0,
     ) -> None:
         super().__init__()
+        if num_heads <= 0 or d_model % num_heads != 0:
+            raise ValueError(
+                f"d_model ({d_model}) must be a positive multiple of num_heads "
+                f"({num_heads})"
+            )
         self.d_model = d_model
         self.num_heads = num_heads
         self.rotary_dim = rotary_dim
+        resolved = rotary_dim if rotary_dim is not None else d_model // num_heads
+        if resolved % 2 != 0:
+            raise ValueError(
+                f"the rotary dimension must be even to pair sine/cosine rotary "
+                f"embeddings, got d_model={d_model}, num_heads={num_heads}, "
+                f"rotary_dim={resolved}; pick an even rotary dimension or an "
+                f"even head width"
+            )
         self.attention = RotaryMultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,

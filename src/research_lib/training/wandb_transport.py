@@ -7,6 +7,7 @@ own config onto them) and an upload takes explicit local paths and their
 artifact-relative names, so no Hydra config path or folder convention
 appears in this module.
 """
+
 from __future__ import annotations
 
 import logging
@@ -82,29 +83,6 @@ def upload_init_kwargs(wandb_kwargs: Mapping[str, Any]) -> dict[str, Any]:
     kwargs.pop("log_model", None)
     kwargs["job_type"] = "upload"
     return kwargs
-
-
-def list_existing_versions(api: Any, location: str) -> list[Any]:
-    """Every version of every ``run_record`` collection at ``location``.
-
-    Args:
-        api: A ``wandb.Api``-like object.
-        location: The entity/project path.
-
-    Returns:
-        The latest version (by version number) of each collection, flat.
-    """
-    from research_lib.training.run_records import version_index
-
-    versions = []
-    for collection in api.artifact_collections(location, ARTIFACT_TYPE):
-        collection_versions = list(collection.artifacts())
-        if not collection_versions:
-            continue
-        versions.append(
-            max(collection_versions, key=lambda a: version_index(a.version))
-        )
-    return versions
 
 
 def upload_run_record_artifact(

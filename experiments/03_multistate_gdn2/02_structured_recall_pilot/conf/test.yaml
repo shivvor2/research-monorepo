@@ -13,20 +13,18 @@ experiment:
   phase: 1
   tier: smoke
 
-model:
-  vocab_size: 64
-  d_model: 16
-  num_heads: 1
-  t_max: 32
-  window: 4
-  gate_mode: full
-  layout: ws
-
 task:
   vocab_size: 64
   seq_len: 32
-  num_kv_pairs: [2, 4]
   max_seq_len: 32
+  num_kv_pairs: [2, 4]
+
+model:
+  d_model: 16
+  num_heads: 1
+  window: 4
+  gate_mode: full
+  layout: ws
 
 data:
   num_workers: 0

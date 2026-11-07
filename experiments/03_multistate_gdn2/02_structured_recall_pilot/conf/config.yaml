@@ -2,10 +2,19 @@
 # Structured-Recall Pilot Config
 # =============================================================================
 # Usage:
-#   python 01_train.py                                # defaults (mqar)
-#   python 01_train.py task=mqar model.mixer=attention
-#   python 01_train.py --config-name=test task=mqar   # tiny CPU smoke
+#   python 01_train.py --config-name=test task=mqar          # tiny CPU smoke
+#   python 01_train.py task=mqar optimizer.lr=0.003          # one run
+#   python 01_train.py +sweep=<tier> --multirun              # a sweep tier
+#
+# The architecture and training choices live in the harness config (the
+# task names its harness via its own defaults); config.yaml holds only
+# what the pilots do not vary, and _self_ comes first so the task and
+# harness override it.
 # =============================================================================
+
+defaults:
+  - _self_
+  - task: mqar
 
 seed: 0
 
@@ -14,50 +23,11 @@ experiment:
   phase: 1                 # 1 = calibration; >= 2 needs frozen_protocol.frozen
   tier: null               # set by sweep configs, recorded in the run JSON
 
-defaults:
-  - task: mqar
-  - harness: zoology
-  - _self_
-
-model:                     # -> ZoologyLMConfig (harness-specific extras below)
-  vocab_size: 8192
-  d_model: 32
-  n_layer: 2
-  layer_pattern: zoology   # layer 0 BaseConv, layer 1 the mixer under test
-  state_mixer: none
-  num_heads: 2
-  head_dim: null           # null -> d_model // num_heads
-  expand_v: 1.0
-  ff_mult: 4               # feed-forward hidden-dim multiplier
-  base_conv_kernel: 3      # the Zoology layer-0 short-conv kernel size
-  gate_mode: full
-  layout: single
-  lambda_mode: mlp
-  window: 8
-  chunk_size: 16
-  t_max: ${task.max_seq_len}
-  output_gate_activation: silu
-  mixer_mode: chunk
-  mixer: gated_delta       # gated_delta | attention (the mixer choice)
-
 optimizer:
   lr: null   # null -> frozen_protocol.yaml (task, layout, gate_mode)
-  weight_decay: 0.1
-  betas: [0.9, 0.95]
-  decay_scheme: grouped
 
 training:
-  batch_size: 256
-  collect_mixer_stats: true  # per-layer lambda/erase stats in validation
-  max_steps: 20000
-  val_check_interval: 500
-  early_stop_threshold: 0.99
-  precision: 32-true
-  grad_clip_val: null
-  loss_on: answers
-  answer_head: true
-  compile: false
-  log_every_n_steps: 50
+  monitor_key: val/acc   # drives early stopping and the best-value track
 
 data:
   num_workers: 2
@@ -80,7 +50,7 @@ logging:
     save_dir: ${output.runs_dir}/curves
   wandb:
     enabled: false
-    project: MultistateGDN2
+    project: StructuredRecallGDN2
     entity: null
     upload_record: true
     upload_checkpoint: false

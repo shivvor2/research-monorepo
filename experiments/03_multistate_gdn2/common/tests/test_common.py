@@ -55,6 +55,20 @@ class TestRunIdTaskKeys:
         run_id = make_run_id(_cfg(tier="tier_a"), 0.003, include_task_keys=True)
         assert run_id.startswith("tier_a_")
 
+    def test_default_mixer_and_harness_are_omitted(self):
+        run_id = make_run_id(_cfg(), 0.003, include_task_keys=True)
+        assert "-mix-" not in run_id
+        assert "-h-" not in run_id
+        assert "-wd-" not in run_id
+
+    def test_non_default_mixer_and_harness_are_appended(self):
+        cfg = _cfg()
+        cfg.model.mixer = "attention"
+        cfg.harness = {"name": "mad"}
+        run_id = make_run_id(cfg, 0.003, include_task_keys=True)
+        assert "-mix-attention" in run_id
+        assert "-h-mad" in run_id
+
 
 class TestRegistries:
     def test_config_types_come_from_the_general_registry(self):

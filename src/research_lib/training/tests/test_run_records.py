@@ -97,7 +97,17 @@ class FakeArtifact:
         return {"run_id": self._run_id, "seed": self._seed, "config_hash": self._hash}
 
     def download(self, root, path_prefix=None):
-        shutil.copytree(self._source, root, dirs_exist_ok=True)
+        target = Path(root)
+        for src in Path(self._source).rglob("*"):
+            if not src.is_file():
+                continue
+            rel = src.relative_to(Path(self._source))
+            if path_prefix is not None and not str(rel).startswith(path_prefix):
+                continue
+            dst = target / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+        return str(target)
 
 
 class FakeCollection:
@@ -360,7 +370,7 @@ class TestGeneralPull:
         for name in (
             "run_control.py",
             "run_records.py",
-            "records.py",
+            "record_table.py",
             "wandb_transport.py",
         ):
             text = (root / "training" / name).read_text()
@@ -385,3 +395,63 @@ class TestRenderReport:
         assert "== even ==" in report
         assert "no expected count" in report  # expected_counts not supplied
         assert "pull clean: no conflicts, no failures" in report
+
+
+class _NullTargetLayout:
+    """A layout whose local_target maps nothing (the record has no target)."""
+
+    def record_path(self, metadata):
+        return f"{metadata['run_id']}.json"
+
+    def curve_path(self, metadata):
+        return f"curves/{metadata['run_id']}/metrics.csv"
+
+    def checkpoint_path(self, metadata):
+        return None
+
+    def local_target(self, rel, metadata, include_checkpoints):
+        return None
+
+
+class TestRobustness:
+    def test_read_record_non_dict_json_is_none(self, tmp_path):
+        from research_lib.training.run_control import read_record
+
+        path = tmp_path / "r.json"
+        path.write_text("[1, 2, 3]")
+        assert read_record(path) is None
+
+    def test_read_record_non_utf8_is_none(self, tmp_path):
+        from research_lib.training.run_control import read_record
+
+        path = tmp_path / "r.json"
+        path.write_bytes(b"\xff\xfe garbage")
+        assert read_record(path) is None
+
+    def test_missing_local_target_is_a_failure_not_a_crash(self, tmp_path):
+        runs = tmp_path / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        art = FakeArtifact("run-0", 0, "h")
+        art._source = _write_source(tmp_path, _record(0))
+        summaries = pull(
+            [art],
+            runs,
+            _NullTargetLayout(),
+            TOY_IDENTITY,
+            group_of=toy_group_of,
+            group_of_record=toy_group_of_record,
+            dry_run=True,
+        )
+        # The record has no local target: reported as a failure, no crash.
+        assert any("no local target" in r for _, r in summaries["even"].failures)
+
+    def test_download_honours_path_prefix(self, tmp_path):
+        src = _write_source(tmp_path, _record(0))
+        # Download only the record prefix into a clean target.
+        target = tmp_path / "clean"
+        target.mkdir()
+        art = FakeArtifact("run-0", 0, "h")
+        art._source = src
+        art.download(root=str(target), path_prefix="run-0.json")
+        assert (target / "run-0.json").exists()
+        assert not (target / "curves").exists()

@@ -6,6 +6,7 @@ record from a caller-supplied ``flatten`` function. The column choices
 are the caller's; nothing about groups, tasks, layouts or any other
 project convention appears here.
 """
+
 from __future__ import annotations
 
 import logging
