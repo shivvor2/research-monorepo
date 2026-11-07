@@ -21,6 +21,7 @@ decision is :func:`pull_decision`; a download is installed atomically
 and only after the staged record validates against the artifact's
 metadata.
 """
+
 from __future__ import annotations
 
 import json
@@ -34,7 +35,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
-from research_lib.training.run_control import RUN_DONE_STATUS
+from research_lib.training.run_control import RUN_DONE_STATUS, read_record
+from research_lib.utils.io import atomic_write
 from research_lib.utils.run_lock import exclusive_lock
 
 logger = logging.getLogger(__name__)
@@ -90,7 +92,10 @@ def version_index(version: str | int | None) -> int:
 
 
 def list_run_record_artifacts(
-    api: Any, project: str, entity: str | None, group: str | None = None,
+    api: Any,
+    project: str,
+    entity: str | None,
+    group: str | None = None,
     group_of: Callable[[Mapping[str, Any]], str] | None = None,
 ) -> list[Any]:
     """The latest version of every ``run_record`` artifact of the project.
@@ -101,17 +106,21 @@ def list_run_record_artifacts(
         entity: The entity; ``None`` uses the API key's default.
         group: Optional filter: keep only artifacts whose group (from
             ``group_of``) equals this.
-        group_of: Maps an artifact's metadata to its group name; when
-            ``None``, defaults to the metadata's ``"group"`` key (with
-            ``"none"`` for an absent or empty value).
+        group_of: Maps an artifact's metadata to its group name; required
+            when ``group`` is set (the general layer has no group
+            convention of its own).
 
     Returns:
         One artifact per collection: the newest version by version
         number (order-independent), found by paging through every
         version of each collection. Collections whose metadata carries no
         run ID are not run records and are skipped.
+
+    Raises:
+        ValueError: When ``group`` is set without a ``group_of``.
     """
-    group_of = group_of or (lambda md: str(md.get("group")) if md.get("group") else "none")
+    if group is not None and group_of is None:
+        raise ValueError("group_of is required when filtering by group")
     project_path = f"{entity}/{project}" if entity else project
     artifacts = []
     for collection in api.artifact_collections(project_path, ARTIFACT_TYPE):
@@ -128,24 +137,16 @@ def list_run_record_artifacts(
     return artifacts
 
 
-def read_record(path: Path) -> dict[str, Any] | None:
-    """The run record at ``path``, or ``None`` when missing/unparseable."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-
-
 def identity_of(record_or_metadata: Mapping[str, Any]) -> str:
     """The run identity of a record or artifact metadata: ``hash:seed``."""
     return (
-        f"{record_or_metadata.get('config_hash')}:"
-        f"{record_or_metadata.get('seed')}"
+        f"{record_or_metadata.get('config_hash')}:" f"{record_or_metadata.get('seed')}"
     )
 
 
-def run_record_metadata(record: Mapping[str, Any], extra_fields: Mapping[str, str] = ()) -> dict[str, Any]:
+def run_record_metadata(
+    record: Mapping[str, Any], extra_fields: Mapping[str, str] = ()
+) -> dict[str, Any]:
     """The artifact metadata of a completed run record.
 
     The identity fields let the pull decide skip / conflict / download
@@ -294,23 +295,19 @@ class ArtifactLayout(Protocol):
 
 
 def atomic_copy(src: Path, target: Path) -> None:
-    """Copy one file into place atomically.
+    """Copy one file into place atomically (temp file in the target dir,
+    flushed and fsynced, then renamed).
 
-    A unique temporary file in the target directory, then
-    ``os.replace``; the temporary file is removed if the copy raises, so
-    a failed pull never leaves a partial file under the record's name
-    (the next pull sees no record and retries).
+    Reuses :func:`research_lib.utils.io.atomic_write`, so the target never
+    holds a partial file (a failed pull leaves no record and the next pull
+    retries) and both the file and the rename survive a power loss.
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.")
-    os.close(fd)
-    tmp = Path(tmp_name)
-    try:
-        shutil.copyfile(src, tmp)
-        os.replace(tmp, target)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
+
+    def _copy_file(f) -> None:
+        with open(src, "rb") as s:
+            shutil.copyfileobj(s, f)
+
+    atomic_write(target, _copy_file, "wb")
 
 
 def install_artifact(
@@ -376,9 +373,10 @@ def install_artifact(
             src = tmp / rel
             if not src.exists():
                 continue
-            _, target = layout.local_target(rel, metadata, include_checkpoints)
-            if target is None:
+            hit = layout.local_target(rel, metadata, include_checkpoints)
+            if hit is None:
                 continue
+            _, target = hit
             atomic_copy(src, runs_dir / target)
             written.append(runs_dir / target)
     return written
@@ -431,6 +429,7 @@ def pull(
     identity_fields: Mapping[str, Callable[[Mapping[str, Any]], Any]],
     *,
     group_of: Callable[[Mapping[str, Any]], str],
+    group_of_record: Callable[[Mapping[str, Any]], str],
     expected_counts: Mapping[str, int] | None = None,
     include_checkpoints: bool = False,
     dry_run: bool = False,
@@ -453,6 +452,10 @@ def pull(
         identity_fields: ``{metadata_key: record_extractor}`` for
             :func:`staged_record_problem`.
         group_of: Maps an artifact's metadata to its group name.
+        group_of_record: Maps a run record to its group name. Separate
+            from ``group_of`` because an artifact's entire metadata is a
+            different shape from a run JSON; local counts must come from
+            the records, not the metadata.
         expected_counts: The expected done-count per group, for the
             report.
         include_checkpoints: Also install the artifacts' checkpoints.
@@ -466,7 +469,7 @@ def pull(
         One :class:`GroupSummary` per group.
     """
     expected_counts = expected_counts or {}
-    local_done = local_done_counts(runs_dir, group_of)
+    local_done = local_done_counts(runs_dir, group_of_record)
     if group_filter is not None:
         group_names = {group_filter}
     else:
@@ -488,14 +491,22 @@ def pull(
             continue
         summary = summaries[group]
         if not re.fullmatch(r"[A-Za-z0-9._-]+", run_id):
-            summary.failures.append(
-                (run_id, "unsafe run_id in artifact metadata")
-            )
+            summary.failures.append((run_id, "unsafe run_id in artifact metadata"))
             continue
-        record_rel = layout.local_target(
-            Path(layout.record_path(metadata)), metadata, include_checkpoints
-        )[1]
-        record_path = runs_dir / record_rel
+        try:
+            hit = layout.local_target(
+                Path(layout.record_path(metadata)), metadata, include_checkpoints
+            )
+            if hit is None:
+                summary.failures.append(
+                    (run_id, "no local target for the artifact's record")
+                )
+                continue
+            record_rel = hit[1]
+            record_path = runs_dir / record_rel
+        except Exception as exc:
+            summary.failures.append((run_id, str(exc)))
+            continue
 
         if dry_run:
             local = read_record(record_path)
@@ -551,7 +562,7 @@ def pull(
     # The report counts the store as it is after the pull: a record
     # installed just now is locally done. A dry run installs nothing,
     # so its local counts are the pre-pull ones.
-    after = local_done_counts(runs_dir, group_of)
+    after = local_done_counts(runs_dir, group_of_record)
     for summary in summaries.values():
         summary.local_done = after.get(summary.group, 0)
     return summaries

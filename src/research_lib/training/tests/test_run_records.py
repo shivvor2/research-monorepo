@@ -20,8 +20,8 @@ from research_lib.training.run_records import (
     ARTIFACT_TYPE,
     artifact_name,
     atomic_copy,
-    list_run_record_artifacts,
     identity_of,
+    list_run_record_artifacts,
     pull,
     pull_decision,
     render_report,
@@ -65,11 +65,23 @@ TOY_IDENTITY = {
 
 
 def toy_group_of(metadata):
-    return str(int(metadata["seed"]) % 2)  # "0"/"1" by seed parity
+    return "even" if int(metadata["seed"]) % 2 == 0 else "odd"
+
+
+def toy_group_of_record(record):
+    # The record's group lives in its config, a different place from the
+    # metadata's (which reads the metadata ``seed``).
+    return (record.get("config") or {}).get("group") or "none"
 
 
 def _record(seed, hash_="h", status="test_done"):
-    return {"run_id": f"run-{seed}", "config_hash": hash_, "seed": seed, "status": status}
+    return {
+        "run_id": f"run-{seed}",
+        "config_hash": hash_,
+        "seed": seed,
+        "status": status,
+        "config": {"group": "even" if seed % 2 == 0 else "odd"},
+    }
 
 
 class FakeArtifact:
@@ -181,9 +193,7 @@ class TestPullDecision:
 class TestStagedRecordProblem:
     def test_matching_record_passes(self):
         record = _record(0)
-        assert (
-            staged_record_problem(record, record, TOY_IDENTITY) is None
-        )
+        assert staged_record_problem(record, record, TOY_IDENTITY) is None
 
     def test_mismatch_reports(self):
         record = _record(0, hash_="a")
@@ -215,9 +225,10 @@ class TestGeneralPull:
             TOY,
             TOY_IDENTITY,
             group_of=toy_group_of,
-            expected_counts={str(0): 1},
+            group_of_record=toy_group_of_record,
+            expected_counts={"even": 1},
         )
-        s = summaries["0"]
+        s = summaries["even"]
         assert s.pulled == ["run-0"]
         assert (runs / "run-0.json").exists()
         assert (runs / "curves" / "run-0" / "metrics.csv").exists()
@@ -232,8 +243,15 @@ class TestGeneralPull:
         # A download would overwrite; make the source record a different hash
         # so an (incorrect) download would change the file.
         (art._source / "run-0.json").write_text(json.dumps(_record(0, hash_="WRONG")))
-        summaries = pull([art], runs, TOY, TOY_IDENTITY, group_of=toy_group_of)
-        s = summaries["0"]
+        summaries = pull(
+            [art],
+            runs,
+            TOY,
+            TOY_IDENTITY,
+            group_of=toy_group_of,
+            group_of_record=toy_group_of_record,
+        )
+        s = summaries["even"]
         assert s.skipped == ["run-0"]
         assert json.loads((runs / "run-0.json").read_text())["config_hash"] == "h"
 
@@ -243,8 +261,15 @@ class TestGeneralPull:
         (runs / "run-0.json").write_text(json.dumps(_record(0, hash_="local")))
         art = FakeArtifact("run-0", 0, "h")
         art._source = _write_source(tmp_path, _record(0, hash_="h"))
-        summaries = pull([art], runs, TOY, TOY_IDENTITY, group_of=toy_group_of)
-        s = summaries["0"]
+        summaries = pull(
+            [art],
+            runs,
+            TOY,
+            TOY_IDENTITY,
+            group_of=toy_group_of,
+            group_of_record=toy_group_of_record,
+        )
+        s = summaries["even"]
         assert s.conflicts and len(s.conflicts) == 1
         assert json.loads((runs / "run-0.json").read_text())["config_hash"] == "local"
 
@@ -253,9 +278,15 @@ class TestGeneralPull:
         art = FakeArtifact("run-0", 0, "h")
         art._source = _write_source(tmp_path, _record(0))
         summaries = pull(
-            [art], runs, TOY, TOY_IDENTITY, group_of=toy_group_of, dry_run=True
+            [art],
+            runs,
+            TOY,
+            TOY_IDENTITY,
+            group_of=toy_group_of,
+            group_of_record=toy_group_of_record,
+            dry_run=True,
         )
-        s = summaries["0"]
+        s = summaries["even"]
         assert s.would_pull == ["run-0"]
         assert not (runs / "run-0.json").exists()
 
@@ -265,10 +296,45 @@ class TestGeneralPull:
         even._source = _write_source(tmp_path, _record(0))
         odd = FakeArtifact("run-1", 1, "h")
         odd._source = _write_source(tmp_path, _record(1))
-        summaries = pull([even, odd], runs, TOY, TOY_IDENTITY, group_of=toy_group_of)
-        assert set(summaries) == {"0", "1"}
-        assert summaries["0"].pulled == ["run-0"]
-        assert summaries["1"].pulled == ["run-1"]
+        summaries = pull(
+            [even, odd],
+            runs,
+            TOY,
+            TOY_IDENTITY,
+            group_of=toy_group_of,
+            group_of_record=toy_group_of_record,
+        )
+        assert set(summaries) == {"even", "odd"}
+        assert summaries["even"].pulled == ["run-0"]
+        assert summaries["odd"].pulled == ["run-1"]
+
+    def test_local_counts_use_the_record_not_the_metadata(self, tmp_path):
+        # A local record whose group (config.group) differs from what the
+        # metadata's seed would imply must be counted under the record's
+        # group, not folded into the metadata-derived one.
+        runs = tmp_path / "runs"
+        runs.mkdir(parents=True, exist_ok=True)
+        local = {
+            "run_id": "run-0",
+            "config_hash": "h",
+            "seed": 0,  # metadata parity would say "even"
+            "status": "test_done",
+            "config": {"group": "odd"},  # record itself says "odd"
+        }
+        (runs / "run-0.json").write_text(json.dumps(local))
+        art = FakeArtifact("run-0", 0, "h")
+        art._source = _write_source(tmp_path, _record(0))
+        summaries = pull(
+            [art],
+            runs,
+            TOY,
+            TOY_IDENTITY,
+            group_of=toy_group_of,
+            group_of_record=toy_group_of_record,
+            dry_run=True,
+        )
+        assert summaries["odd"].local_done == 1
+        assert set(summaries) == {"odd", "even"}
 
     def test_listing_filters_by_group(self, tmp_path):
         even = FakeArtifact("run-0", 0, "h")
@@ -276,15 +342,27 @@ class TestGeneralPull:
         odd = FakeArtifact("run-1", 1, "h")
         odd._source = _write_source(tmp_path, _record(1))
         api = FakeAPI([FakeCollection([even, odd])])
-        listed = list_run_record_artifacts(api, "P", None, group="0", group_of=toy_group_of)
+        listed = list_run_record_artifacts(
+            api, "P", None, group="even", group_of=toy_group_of
+        )
         assert [a.metadata["run_id"] for a in listed] == ["run-0"]
+
+    def test_listing_requires_group_of_when_filtering(self, tmp_path):
+        api = FakeAPI([])
+        with pytest.raises(ValueError):
+            list_run_record_artifacts(api, "P", None, group="even", group_of=None)
 
     def test_no_project_conventions_in_general_sources(self):
         """The general modules never reference groups' or tasks' nouns."""
         import pathlib
 
         root = pathlib.Path(__file__).resolve().parents[2]
-        for name in ("run_control.py", "run_records.py", "records.py", "wandb_transport.py"):
+        for name in (
+            "run_control.py",
+            "run_records.py",
+            "records.py",
+            "wandb_transport.py",
+        ):
             text = (root / "training" / name).read_text()
             for token in ("tier", "experiment."):
                 assert token not in text, f"{name} mentions {token!r}"
@@ -295,8 +373,15 @@ class TestRenderReport:
         runs = tmp_path / "runs"
         art = FakeArtifact("run-0", 0, "h")
         art._source = _write_source(tmp_path, _record(0))
-        summaries = pull([art], runs, TOY, TOY_IDENTITY, group_of=toy_group_of)
+        summaries = pull(
+            [art],
+            runs,
+            TOY,
+            TOY_IDENTITY,
+            group_of=toy_group_of,
+            group_of_record=toy_group_of_record,
+        )
         report = render_report(summaries, 1)
-        assert "== 0 ==" in report
+        assert "== even ==" in report
         assert "no expected count" in report  # expected_counts not supplied
         assert "pull clean: no conflicts, no failures" in report

@@ -14,6 +14,7 @@ Three helpers read the record format :class:`RunSummaryCallback` writes
 (``status``, ``config_hash``, ``seed``): :func:`should_skip`,
 :func:`claim_run` and the shared :data:`RUN_DONE_STATUS` constant.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,6 +38,28 @@ logger = logging.getLogger(__name__)
 # shared by the callback that writes the record, the skip check
 # (:func:`should_skip`) and the pull that moves records about.
 RUN_DONE_STATUS = "test_done"
+
+
+def read_record(path: Path) -> dict[str, Any] | None:
+    """The run record at ``path``, or ``None`` when missing/unparseable or
+    not a JSON object.
+
+    Catches ``OSError`` (missing), ``json.JSONDecodeError`` and
+    ``UnicodeDecodeError`` (not valid JSON / not UTF-8); a parse result
+    that is not a ``dict`` is also unreadable as a record (``None``).
+
+    Args:
+        path: The record's JSON path.
+
+    Returns:
+        The parsed record dict, or ``None``.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
 
 
 def disable_tf32() -> dict[str, bool]:
@@ -114,14 +137,8 @@ def should_skip(record_path: Path, identity: tuple[str, Any]) -> str | None:
     Returns:
         A human-readable skip reason, or ``None`` to run.
     """
-    if not record_path.exists():
-        return None
-    try:
-        with open(record_path, encoding="utf-8") as f:
-            record = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if record.get("status") != RUN_DONE_STATUS:
+    record = read_record(record_path)
+    if record is None or record.get("status") != RUN_DONE_STATUS:
         return None
     if (record.get("config_hash"), record.get("seed")) != identity:
         return None
