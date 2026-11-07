@@ -78,6 +78,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from ._sampling import _SAMPLER_LOG_FLOOR, _distinct_ints, _sampler_log_prob
+
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
@@ -89,8 +91,8 @@ NO_DISTANCE = -1
 """write_distance value at non-answer positions."""
 
 _MAX_EXAMPLE_RESTARTS = 100
-"""Hard cap on example restarts (safety net; never observed at the pilot
-grid settings; tight configs that pass the construction-time check can
+"""Hard cap on example restarts (safety net; never observed at the
+default settings; tight configs that pass the construction-time check can
 still need restarts)."""
 
 
@@ -123,31 +125,6 @@ def _round_half_up(x: float) -> int:
     return int(math.floor(x + 0.5))
 
 
-def _distinct(rng: np.random.Generator, low: int, high: int, size: int) -> np.ndarray:
-    """``size`` distinct integers from ``[low, high)``, drawn uniformly.
-
-    The whole draw is redrawn (rejection) until distinct, which preserves
-    the uniform law over ordered distinct draws. Deterministic for a given
-    generator state. Requires ``high - low >= size`` (checked by the
-    configuration-time feasibility rules).
-
-    Args:
-        rng: numpy Generator.
-        low: inclusive lower bound.
-        high: exclusive upper bound.
-        size: number of distinct ids.
-
-    Returns:
-        Int64 array of ``size`` distinct values.
-    """
-    if size <= 0:
-        return np.empty(0, dtype=np.int64)
-    out = rng.integers(low, high, size=size)
-    while np.unique(out).size < size:
-        out = rng.integers(low, high, size=size)
-    return out
-
-
 @dataclass(frozen=True)
 class EntityFieldConfig:
     """Configuration for the entity-field generator.
@@ -170,7 +147,8 @@ class EntityFieldConfig:
         placement_probs: class assignment probabilities for the updated
             pairs, in ``(same, adjacent, distant)`` order. Must sum to 1.
         block_size: placement block size ``B`` in tokens (``B = 16`` in
-            the pilot); a write's block is the block of its value token.
+            the default settings); a write's block is the block of its
+            value token.
         distant_min_blocks: minimum block distance for the ``distant``
             class.
         reserved_filler: number ``F`` of token ids at ``[V/2 - F, V/2)``
@@ -287,7 +265,10 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
     taking two slots each) within ``(T - 3N) // 3`` slots; the write
     region must span ``distant_min_blocks + 1`` blocks; ``e`` distinct
     entity tokens must fit in ``[1, V/2 - F - M)``; and ``N + U``
-    distinct values must fit in the value half ``[V/2, V)``.
+    distinct values must fit in the value half ``[V/2, V)``. The two
+    without-replacement draws (``e`` entity ids, ``N + U`` values) must
+    also clear the 1% per-round success floor, so a valid config never
+    stalls the redraw loop.
     """
     if n_entities < 1:
         raise ValueError(f"num_entities entries must be >= 1, got {n_entities}")
@@ -323,28 +304,50 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
             f"region spans fewer than distant_min_blocks + 1 = "
             f"{config.distant_min_blocks + 1} blocks"
         )
-    n_entity_ids = config.vocab_size // 2 - config.reserved_filler - config.num_fields
-    if n_entities > n_entity_ids - 1:
+    n_entity_pool = (
+        config.vocab_size // 2 - config.reserved_filler - config.num_fields - 1
+    )
+    if n_entities > n_entity_pool:
         raise ValueError(
             f"infeasible num_entities entry {n_entities}: entity tokens come "
-            f"from [1, {n_entity_ids}), which has only {n_entity_ids - 1} ids, "
-            f"fewer than {n_entities} distinct entities"
+            f"from [1, {n_entity_pool + 1}), which has only {n_entity_pool} "
+            f"ids, fewer than {n_entities} distinct entities"
+        )
+    log_entity = _sampler_log_prob(n_entity_pool, n_entities)
+    if log_entity < _SAMPLER_LOG_FLOOR:
+        prob = math.exp(log_entity)
+        raise ValueError(
+            f"num_entities entry {n_entities} would stall the entity sampler: "
+            f"drawing {n_entities} distinct ids from the {n_entity_pool}-id "
+            f"entity pool succeeds with exact probability {prob:.3%}, below "
+            f"the 1% floor (expected redraws ~{1.0 / prob:.0f} per row); "
+            f"increase vocab_size or reduce reserved_filler"
         )
     n_values = n + u
-    if n_values > config.vocab_size // 2:
+    n_value_pool = config.vocab_size // 2
+    if n_values > n_value_pool:
         raise ValueError(
             f"infeasible num_entities entry {n_entities}: N + U = {n_values} "
             f"distinct values are needed but the value pool "
-            f"[vocab_size // 2, vocab_size) has only "
-            f"{config.vocab_size // 2} ids"
+            f"[vocab_size // 2, vocab_size) has only {n_value_pool} ids"
+        )
+    log_value = _sampler_log_prob(n_value_pool, n_values)
+    if log_value < _SAMPLER_LOG_FLOOR:
+        prob = math.exp(log_value)
+        raise ValueError(
+            f"num_entities entry {n_entities} would stall the value sampler: "
+            f"drawing N + U = {n_values} distinct values from the "
+            f"{n_value_pool}-id value pool succeeds with exact probability "
+            f"{prob:.3%}, below the 1% floor (expected redraws "
+            f"~{1.0 / prob:.0f} per row); increase vocab_size"
         )
 
 
-def _block_of_value_position(position: int, block_size: int) -> int:
-    """The block index of a token ``position``.
+def _block_of(position: int, block_size: int) -> int:
+    """The block index of a token ``position``: ``position // B``.
 
     A write slot ``i`` holds its value at ``3i + 2``; a write's block is
-    the block of that value token, ``(3i + 2) // B``.
+    the block of that value token.
     """
     return position // block_size
 
@@ -385,14 +388,15 @@ def _try_example(
     u = _round_half_up(config.update_fraction * n_entities)
 
     # Pairs are indexed row-major by (entity, field): pi = e * M + f.
-    entity_ids = _distinct(rng, 1, field_offset, n_entities)  # distinct
+    entity_ids = _distinct_ints(rng, 1, field_offset, (1, n_entities))[0]
     # N base values (one per pair) + U update values, all distinct.
-    values = _distinct(rng, half, vocab, n + u)
+    values = _distinct_ints(rng, half, vocab, (1, n + u))[0]
     v0 = values[:n]          # original value per pair (v_old when updated)
     v_new = values[n:]       # update value per updated pair
 
     if u > 0:
-        upd_entities = _distinct(rng, 0, n_entities, u)  # distinct entity idx
+        # A permutation prefix is distinct by construction (no rejection).
+        upd_entities = rng.permutation(n_entities)[:u]
         upd_fields = rng.integers(0, m, size=u)
         upd_pairs = upd_entities * m + upd_fields
         upd_classes = rng.choice(
@@ -433,11 +437,11 @@ def _try_example(
             if not free:
                 return None
             s1 = int(free[rng.integers(0, len(free))])
-            b1 = _block_of_value_position(3 * s1 + 2, block)
+            b1 = _block_of(3 * s1 + 2, block)
             cands = [
                 s
                 for s in free
-                if s > s1 and _class_ok(b1, _block_of_value_position(3 * s + 2, block), cls)
+                if s > s1 and _class_ok(b1, _block_of(3 * s + 2, block), cls)
             ]
             if cands:
                 s2 = int(cands[rng.integers(0, len(cands))])
@@ -565,7 +569,7 @@ def generate_entity_field(
             infeasible for ``config``.
         RuntimeError: if placement fails for an example after
             ``_MAX_EXAMPLE_RESTARTS`` restarts (never observed at the
-            pilot grid settings; tight configs that pass the
+            default settings; tight configs that pass the
             construction-time check can still need restarts).
     """
     if num_examples < 1:

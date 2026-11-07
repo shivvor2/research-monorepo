@@ -341,7 +341,6 @@ def test_drawn_entity_structure_and_length():
 
 def test_update_count_and_one_field_per_entity():
     batch = generate_entity_field(SMALL, num_examples=20, seed=13, num_entities=8)
-    M = SMALL.num_fields
     expected_u = int(np.floor(SMALL.update_fraction * 8 + 0.5))
     for ex in range(20):
         kc = batch["key_class"][ex]
@@ -438,7 +437,7 @@ def test_infeasible_config_raises():
             vocab_size=2048, seq_len=256, num_fields=4, num_entities=(16,)
         )
     with pytest.raises(ValueError):
-        # Region too short for distant_min_blocks + 1 blocks (the 256-token
+        # Region too short for distant_min_blocks + 1 blocks (the 160-token
         # write region spans 10 blocks, too few for 11).
         EntityFieldConfig(
             vocab_size=2048,
@@ -462,6 +461,38 @@ def test_infeasible_config_raises():
         # Too few entity ids for the requested count.
         EntityFieldConfig(
             vocab_size=32, seq_len=64, num_fields=2, num_entities=(24,)
+        )
+
+
+# =============================================================================
+# Sampler safeguards
+# =============================================================================
+
+
+def test_full_update_fraction_generates_without_stalling():
+    """Every entity updated (the worst case for the distinct-entity draw)
+    generates quickly and only emits valid class codes."""
+    config = EntityFieldConfig(
+        update_fraction=1.0, num_fields=1, num_entities=(16,), seq_len=256
+    )
+    batch = generate_entity_field(config, num_examples=64, seed=71)
+    assert batch["input_ids"].shape == (64, 256)
+    codes = set(batch["key_class"].reshape(-1).tolist())
+    assert codes <= {NO_CLASS, SAME, ADJACENT, DISTANT, SIBLING, SIBLING_LATE}
+    assert UNTOUCHED not in codes, "every entity is updated, so no untouched"
+
+
+def test_value_sampler_floor_raises():
+    """A value draw below the 1% per-round success floor is rejected at
+    construction instead of stalling the redraw loop."""
+    with pytest.raises(ValueError, match="value sampler"):
+        EntityFieldConfig(
+            vocab_size=128,
+            seq_len=256,
+            num_fields=1,
+            num_entities=(16,),
+            update_fraction=1.0,
+            reserved_filler=2,
         )
 
 
