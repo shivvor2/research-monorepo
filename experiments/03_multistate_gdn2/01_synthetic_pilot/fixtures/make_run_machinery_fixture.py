@@ -1,14 +1,14 @@
 """Regenerate the run-machinery fixtures (run IDs, identity hashes, W&B
 kwargs and metadata, and the pull --check report).
 
-Run this on a checkout of the reference commit (``b3d162e``, master
-before the shared-code move), then commit the written fixture files
-unchanged. The pull fixtures were written once; a regeneration is only
-ever a reference re-capture, never a fix. On the reference checkout the
-record metadata comes from the old ``wandb_artifacts`` and the pull from
-``03_pull.py``'s internals; on a migrated checkout both come from
-``common`` / ``research_lib`` (the same functions ``03_pull``'s
-``main`` calls), so regenerating either way yields identical bytes.
+Reference-only by design: it runs only on a checkout whose
+``01_synthetic_pilot/`` matches the commit ``b3d162e`` (master before the
+shared-code move) — the state that produced these fixture files. On any
+later checkout it fails (or, if it happens to import, it must not) because
+it reads the pilot's now-migrated internals directly; a re-capture means
+checking out ``b3d162e`` and running it there. A regeneration is only
+ever a reference re-capture, never a fix: commit the written files
+unchanged.
 
 Usage:
     python fixtures/make_run_machinery_fixture.py
@@ -23,62 +23,12 @@ import sys
 from pathlib import Path
 
 _PILOT = Path(__file__).resolve().parents[1]
-_PROJECT = _PILOT.parent
 _SRC = _PILOT.parents[2] / "src"
-for _p in (_PILOT, _PROJECT, _SRC):
+for _p in (_PILOT, _SRC):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
 HERE = Path(__file__).resolve().parent
-
-
-def _record_metadata(record) -> dict:
-    """The artifact metadata of a completed run.
-
-    On a migrated checkout this is ``common.layout.record_metadata``; on
-    the reference checkout (b3d162e, no ``common``) it is the old
-    ``wandb_artifacts.run_record_metadata`` shim, which the migration
-    promoted into ``common.layout``.
-    """
-    try:
-        from common.layout import record_metadata
-    except ImportError:  # the reference checkout precedes the move
-        from wandb_artifacts import run_record_metadata as record_metadata
-    return record_metadata(record)
-
-
-def _pull_shared(tier_filter):
-    """The migrated pull path: the exact functions ``03_pull.main`` calls,
-    wired to the general run records and this project's layout."""
-    from common.layout import (
-        LAYOUT,
-        group_of,
-        group_of_record,
-        metadata_identity_fields,
-    )
-
-    from research_lib.training.run_records import (
-        list_run_record_artifacts,
-        pull,
-        render_report,
-    )
-
-    return (
-        LAYOUT,
-        group_of,
-        group_of_record,
-        metadata_identity_fields(),
-        list_run_record_artifacts,
-        pull,
-        render_report,
-    )
-
-
-def _expected_runs() -> dict:
-    from pilot_analysis.protocol import EXPECTED_RUNS
-
-    return EXPECTED_RUNS
-
 
 # A representative configuration per dimension the run ID and identity
 # hash depend on: tier prefixes, gate / layout / lambda, non-default
@@ -242,17 +192,11 @@ class FakeApi:
 
 
 def pull_report(train, cfg_upsert, tmp, tier_filter):
-    (
-        LAYOUT,
-        group_of,
-        group_of_record,
-        identity_fields,
-        list_run_record_artifacts,
-        pull,
-        render_report,
-    ) = _pull_shared(tier_filter)
-    expected = _expected_runs()
-    record_metadata = _record_metadata
+    import importlib.util as _util
+
+    spec = _util.spec_from_file_location("pilot_pull_ref", _PILOT / "03_pull.py")
+    p = _util.module_from_spec(spec)
+    spec.loader.exec_module(p)
 
     records = {
         "tier2_gates_overwrite-ws-full-mlp-d32-lr0.003-s0": (
@@ -279,7 +223,7 @@ def pull_report(train, cfg_upsert, tmp, tier_filter):
         collections.append(
             FakeCollection(
                 f"c-{run_id}",
-                [FakeVersionedArtifact(root, record_metadata(rec))],
+                [FakeVersionedArtifact(root, train.run_record_metadata(rec))],
             )
         )
 
@@ -298,21 +242,9 @@ def pull_report(train, cfg_upsert, tmp, tier_filter):
         pth.parent.mkdir(parents=True, exist_ok=True)
         pth.write_text(json.dumps(local))
     api = FakeApi(collections)
-    listed = list_run_record_artifacts(
-        api, "P", None, group=tier_filter, group_of=group_of
-    )
-    summaries = pull(
-        listed,
-        runs,
-        LAYOUT,
-        identity_fields,
-        group_of=group_of,
-        group_of_record=group_of_record,
-        expected_counts=expected,
-        dry_run=True,
-        group_filter=tier_filter,
-    )
-    return render_report(summaries, len(listed))
+    listed = p.list_run_record_artifacts(api, "P", None, tier=tier_filter)
+    summaries = p.pull(listed, runs, dry_run=True, tier_filter=tier_filter)
+    return p.render_report(summaries, len(listed))
 
 
 def main() -> None:
@@ -354,12 +286,10 @@ def main() -> None:
         "git": {"commit": "beef", "dirty": False},
         "provenance": {"uv.lock": "deadbeef"},
     }
-    record_metadata = _record_metadata
-
     sample = {
         "run_id": run_id,
         "wandb_logger_kwargs": kwargs,
-        "artifact_metadata": record_metadata(sample_record),
+        "artifact_metadata": train.run_record_metadata(sample_record),
     }
 
     # (c) the pull --check report, with and without a tier filter.
