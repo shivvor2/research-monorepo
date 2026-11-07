@@ -515,9 +515,7 @@ class TestScreeningFallback:
     @pytest.fixture
     def fallback_protocol(self, protocol, monkeypatch):
         monkeypatch.setattr(protocol, "SCREENING_CELLS", {"toy": PRIMARY})
-        monkeypatch.setattr(
-            protocol, "SCREENING_FALLBACKS", {"toy": (FALLBACK, 0.15)}
-        )
+        monkeypatch.setattr(protocol, "SCREENING_FALLBACKS", {"toy": (FALLBACK, 0.15)})
         return protocol
 
     def _calib_rows(self, full_primary, kda_primary):

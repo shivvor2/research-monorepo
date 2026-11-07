@@ -111,9 +111,7 @@ class EntityFieldClass(enum.IntEnum):
     UNTOUCHED = 5
 
 
-ENTITY_FIELD_CLASSES: tuple[str, ...] = tuple(
-    c.name.lower() for c in EntityFieldClass
-)
+ENTITY_FIELD_CLASSES: tuple[str, ...] = tuple(c.name.lower() for c in EntityFieldClass)
 """Metric key fragments per entity-field class code, in class order:
 ``('same', 'adjacent', 'distant', 'sibling', 'sibling_late',
 'untouched')``. Exported next to the generator so the metrics and
@@ -391,8 +389,8 @@ def _try_example(
     entity_ids = _distinct_ints(rng, 1, field_offset, (1, n_entities))[0]
     # N base values (one per pair) + U update values, all distinct.
     values = _distinct_ints(rng, half, vocab, (1, n + u))[0]
-    v0 = values[:n]          # original value per pair (v_old when updated)
-    v_new = values[n:]       # update value per updated pair
+    v0 = values[:n]  # original value per pair (v_old when updated)
+    v_new = values[n:]  # update value per updated pair
 
     if u > 0:
         # A permutation prefix is distinct by construction (no rejection).
@@ -400,9 +398,13 @@ def _try_example(
         upd_fields = rng.integers(0, m, size=u)
         upd_pairs = upd_entities * m + upd_fields
         upd_classes = rng.choice(
-            np.asarray([int(EntityFieldClass.SAME),
-                        int(EntityFieldClass.ADJACENT),
-                        int(EntityFieldClass.DISTANT)]),
+            np.asarray(
+                [
+                    int(EntityFieldClass.SAME),
+                    int(EntityFieldClass.ADJACENT),
+                    int(EntityFieldClass.DISTANT),
+                ]
+            ),
             size=u,
             p=probs,
         )
@@ -517,9 +519,7 @@ def _try_example(
 
     # ---- Filler (reserved range, disjoint from every key and value) ----
     fill_pos = np.nonzero(input_ids == 0)[0]
-    input_ids[fill_pos] = rng.integers(
-        half - f, half, size=fill_pos.size
-    )
+    input_ids[fill_pos] = rng.integers(half - f, half, size=fill_pos.size)
 
     return {
         "input_ids": input_ids,

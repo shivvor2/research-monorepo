@@ -136,9 +136,7 @@ def _check_example(
         assert 0 <= f_tok - field_offset < M, "field id out of range"
         c = int(cls[a])
         write_slots = [
-            i
-            for i in range(num_slots)
-            if x[3 * i] == e_tok and x[3 * i + 1] == f_tok
+            i for i in range(num_slots) if x[3 * i] == e_tok and x[3 * i + 1] == f_tok
         ]
         if c in UPDATED_CLASSES:
             assert len(write_slots) == 2, "an updated pair is written twice"
@@ -199,11 +197,7 @@ def _entity_idx(e_tok, batch, ex):
     M = SMALL.num_fields
     entity_range_end = half - F - M
     toks = sorted(
-        {
-            int(t)
-            for t in batch["input_ids"][ex]
-            if 1 <= int(t) < entity_range_end
-        }
+        {int(t) for t in batch["input_ids"][ex] if 1 <= int(t) < entity_range_end}
     )
     return toks.index(e_tok)
 
@@ -344,12 +338,13 @@ def test_update_count_and_one_field_per_entity():
     expected_u = int(np.floor(SMALL.update_fraction * 8 + 0.5))
     for ex in range(20):
         kc = batch["key_class"][ex]
-        updated_pos = [
-            p for p in range(SMALL.seq_len) if int(kc[p]) in UPDATED_CLASSES
-        ]
+        updated_pos = [p for p in range(SMALL.seq_len) if int(kc[p]) in UPDATED_CLASSES]
         assert len(updated_pos) == expected_u, "round_half_up updated pairs"
         # Each updated pair is on a distinct entity (one field per entity).
-        entities = {_entity_idx(int(batch["input_ids"][ex][p - 2]), batch, ex) for p in updated_pos}
+        entities = {
+            _entity_idx(int(batch["input_ids"][ex][p - 2]), batch, ex)
+            for p in updated_pos
+        }
         assert len(entities) == expected_u, "one updated field per entity"
 
 
@@ -410,9 +405,7 @@ def test_shortest_slice_has_no_untouched_pairs():
     entity, so it has no untouched pairs; the longer slices do."""
     config = EntityFieldConfig()
     for e, expected in ((2, 0), (4, 4), (8, 8)):
-        batch = generate_entity_field(
-            config, num_examples=8, seed=61, num_entities=e
-        )
+        batch = generate_entity_field(config, num_examples=8, seed=61, num_entities=e)
         for ex in range(8):
             n_untouched = int((batch["key_class"][ex] == UNTOUCHED).sum())
             assert n_untouched == expected
@@ -433,9 +426,9 @@ def test_updated_class_proportions_match_placement_probs():
     for c, name in ((SAME, "same"), (ADJACENT, "adjacent"), (DISTANT, "distant")):
         expected = SMALL.placement_probs[index[name]]
         ratio = counts[c] / total
-        assert abs(ratio - expected) < 0.02, (
-            f"{name} proportion {ratio:.3f} deviates from {expected:.3f}"
-        )
+        assert (
+            abs(ratio - expected) < 0.02
+        ), f"{name} proportion {ratio:.3f} deviates from {expected:.3f}"
 
 
 # =============================================================================
@@ -472,9 +465,7 @@ def test_infeasible_config_raises():
         EntityFieldConfig(block_size=1)
     with pytest.raises(ValueError):
         # Too few entity ids for the requested count.
-        EntityFieldConfig(
-            vocab_size=32, seq_len=64, num_fields=2, num_entities=(24,)
-        )
+        EntityFieldConfig(vocab_size=32, seq_len=64, num_fields=2, num_entities=(24,))
 
 
 # =============================================================================

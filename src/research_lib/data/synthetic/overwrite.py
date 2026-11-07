@@ -99,6 +99,7 @@ pilot grid settings; tight configs that pass the construction-time check
 can still need restarts (e.g. all-distant K=42 at T=256 restarts ~79% of
 examples))."""
 
+
 class OverwriteClass(enum.IntEnum):
     """Placement classes, encoded in ``key_class`` at answer positions."""
 

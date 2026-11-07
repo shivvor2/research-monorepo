@@ -219,9 +219,7 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
         reading = _protocol.TASK_DAMAGE.get(task)
         if reading is not None:
             for gate, row in gate_rows.items():
-                at_lr = grp[
-                    (grp["gate_mode"] == gate) & (grp["lr"] == gate_lr[gate])
-                ]
+                at_lr = grp[(grp["gate_mode"] == gate) & (grp["lr"] == gate_lr[gate])]
                 for n in reading.slices:
                     row[f"damage/slice={n}"] = _damage(at_lr, task, n)
         # Attach the full - kda gap to the single-state rows of this cell.
@@ -420,9 +418,7 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
             for gate in ("full", "kda"):
                 gate_rows = by_task[by_task["gate_mode"] == gate]
                 for n in reading.slices:
-                    report[f"damage_{gate}/slice={n}"] = _damage(
-                        gate_rows, task, n
-                    )
+                    report[f"damage_{gate}/slice={n}"] = _damage(gate_rows, task, n)
         rows.append(report)
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     (out_dir / "positive_control.csv").write_text(
