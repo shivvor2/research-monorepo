@@ -1,8 +1,9 @@
 # Structured-Recall Pilot
 
-The second pilot of the multi-state GDN-2 project: new synthetic
-recall tasks on which single-state GDN-2 should beat its reference, run
-through the shared run machinery in `common/` and `research_lib`. This
+A structured-recall pilot of the multi-state GDN-2 project: new
+synthetic recall tasks on which single-state GDN-2 should beat its
+reference, run through the shared run machinery in `common/` and
+`research_lib`. This
 pilot shares the frozen protocol, the analysis reports and the primary
 statistic with the first pilot; each task adds its own generator, its
 task and harness configs, and its calibration and tier sweeps.

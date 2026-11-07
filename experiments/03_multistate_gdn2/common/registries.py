@@ -1,8 +1,9 @@
 """This project's harness registry (and the task config-type lookup).
 
 The train script builds its model through the harness registry instead of
-an ``if harness == ...`` ladder; a task PR registers its own harness (and
-an existing task can be paired with a new one) here. Task *config types*
+an ``if harness == ...`` ladder; a harness that ships with a task
+registers itself here (and an existing task can be paired with a new
+one). Task *config types*
 and slice/class-name facts come from the general task registry in
 ``research_lib`` — :func:`config_type_of_task` is a thin delegation so
 nobody re-declares them in the project layer.
@@ -54,6 +55,6 @@ def require_harness(name: str) -> HarnessBuilder:
 
 
 def register_harness(name: str, builder: HarnessBuilder) -> None:
-    """Register a harness builder under ``name`` (a task PR with its own
-    architecture registers it here)."""
+    """Register a harness builder under ``name`` (a harness that ships
+    with a task registers itself here)."""
     HARNESSES[name] = builder

@@ -219,7 +219,7 @@ class TestStagedRecordProblem:
 
 
 # --------------------------------------------------------------------------- #
-# The convention-free pull (S04)
+# The pull over an artifact whose record carries no grouper
 # --------------------------------------------------------------------------- #
 
 

@@ -5,9 +5,9 @@ artifact. The base ID covers task / layout / gate / lambda / width / lr /
 seed; non-default optimiser, model, harness and mixer keys are appended so
 two runs that differ only in such a key never share a file name. With
 ``include_task_keys`` on, the non-default fields of the task's registered
-config type are appended too ("the second pilot turns it on, because its
-task keys are part of the run's identity"); with it off (the default) the
-base ID reproduces the first pilot's builder exactly.
+config type are appended too (a run whose task keys are part of its
+identity enables it); with it off (the default) the base ID reproduces
+the first pilot's builder exactly.
 """
 
 from __future__ import annotations

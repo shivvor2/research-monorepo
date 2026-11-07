@@ -19,16 +19,17 @@ from common.protocol import (  # noqa: F401  (re-exported for convenience)
 
 # The screening cell the reports read, per task: the metric key (a
 # ``test/<key>`` column) that single-state calibration reports the gap
-# and positive-control on. Filled in by the task PRs.
+# and positive-control on. Each registered task declares its cell here.
 SCREENING_CELLS: dict[str, str] = {
     "mqar": "test/acc/slice=64",
 }
 """The screening metric key per registered task."""
 
-# Expected run counts per tier: filled in by the task PRs' sweep files.
+# Expected run counts per tier: a task's sweep files add its expected
+# runs here.
 EXPECTED_RUNS: dict[str, int] = {}
 
 # The tiers whose finished runs are recognised as done by the skip check
-# (tooling tiers like smoke/debug always run). Filled in as the task PRs
-# add their sweeps.
+# (tooling tiers like smoke/debug always run). A tier joins as its sweep
+# is added.
 PROTOCOL_TIERS: frozenset[str] = frozenset(EXPECTED_RUNS) | frozenset({"calibration"})
