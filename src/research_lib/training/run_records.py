@@ -508,6 +508,19 @@ def pull(
             summary.failures.append((run_id, str(exc)))
             continue
 
+        # The local target must stay under runs_dir: a task or run_id
+        # such as ``../`` in the metadata must not escape the store.
+        anchor = runs_dir.resolve()
+        try:
+            resolved = record_path.resolve()
+        except OSError:
+            resolved = record_path
+        if resolved != anchor and anchor not in resolved.parents:
+            summary.failures.append(
+                (run_id, "unsafe run_id or task in artifact metadata")
+            )
+            continue
+
         if dry_run:
             local = read_record(record_path)
             decision = pull_decision(local, metadata)

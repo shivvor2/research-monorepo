@@ -1,10 +1,14 @@
 """Regenerate the run-machinery fixtures (run IDs, identity hashes, W&B
 kwargs and metadata, and the pull --check report).
 
-Run this on a checkout where the first pilot's run machinery is in its
-reference state (target: master before the shared-code move), then commit
-the written fixture files unchanged. The pull fixtures were written once;
-a regeneration is only ever a reference re-capture, never a fix.
+Run this on a checkout of the reference commit (``b3d162e``, master
+before the shared-code move), then commit the written fixture files
+unchanged. The pull fixtures were written once; a regeneration is only
+ever a reference re-capture, never a fix. On the reference checkout the
+record metadata comes from the old ``wandb_artifacts`` and the pull from
+``03_pull.py``'s internals; on a migrated checkout both come from
+``common`` / ``research_lib`` (the same functions ``03_pull``'s
+``main`` calls), so regenerating either way yields identical bytes.
 
 Usage:
     python fixtures/make_run_machinery_fixture.py
@@ -26,6 +30,55 @@ for _p in (_PILOT, _PROJECT, _SRC):
         sys.path.insert(0, str(_p))
 
 HERE = Path(__file__).resolve().parent
+
+
+def _record_metadata(record) -> dict:
+    """The artifact metadata of a completed run.
+
+    On a migrated checkout this is ``common.layout.record_metadata``; on
+    the reference checkout (b3d162e, no ``common``) it is the old
+    ``wandb_artifacts.run_record_metadata`` shim, which the migration
+    promoted into ``common.layout``.
+    """
+    try:
+        from common.layout import record_metadata
+    except ImportError:  # the reference checkout precedes the move
+        from wandb_artifacts import run_record_metadata as record_metadata
+    return record_metadata(record)
+
+
+def _pull_shared(tier_filter):
+    """The migrated pull path: the exact functions ``03_pull.main`` calls,
+    wired to the general run records and this project's layout."""
+    from common.layout import (
+        LAYOUT,
+        group_of,
+        group_of_record,
+        metadata_identity_fields,
+    )
+
+    from research_lib.training.run_records import (
+        list_run_record_artifacts,
+        pull,
+        render_report,
+    )
+
+    return (
+        LAYOUT,
+        group_of,
+        group_of_record,
+        metadata_identity_fields(),
+        list_run_record_artifacts,
+        pull,
+        render_report,
+    )
+
+
+def _expected_runs() -> dict:
+    from pilot_analysis.protocol import EXPECTED_RUNS
+
+    return EXPECTED_RUNS
+
 
 # A representative configuration per dimension the run ID and identity
 # hash depend on: tier prefixes, gate / layout / lambda, non-default
@@ -189,11 +242,17 @@ class FakeApi:
 
 
 def pull_report(train, cfg_upsert, tmp, tier_filter):
-    import importlib.util as _util
-
-    spec = _util.spec_from_file_location("pilot_pull_ref", _PILOT / "03_pull.py")
-    p = _util.module_from_spec(spec)
-    spec.loader.exec_module(p)
+    (
+        LAYOUT,
+        group_of,
+        group_of_record,
+        identity_fields,
+        list_run_record_artifacts,
+        pull,
+        render_report,
+    ) = _pull_shared(tier_filter)
+    expected = _expected_runs()
+    record_metadata = _record_metadata
 
     records = {
         "tier2_gates_overwrite-ws-full-mlp-d32-lr0.003-s0": (
@@ -216,8 +275,6 @@ def pull_report(train, cfg_upsert, tmp, tier_filter):
             "seed": 0,
             "config": {"task": {"name": task}, "experiment": {"tier": tier}},
         }
-        from common.layout import record_metadata
-
         root = write_artifact_root(tmp / f"src-{run_id}", task, run_id, rec)
         collections.append(
             FakeCollection(
@@ -241,9 +298,21 @@ def pull_report(train, cfg_upsert, tmp, tier_filter):
         pth.parent.mkdir(parents=True, exist_ok=True)
         pth.write_text(json.dumps(local))
     api = FakeApi(collections)
-    listed = p.list_run_record_artifacts(api, "P", None, tier=tier_filter)
-    summaries = p.pull(listed, runs, dry_run=True, tier_filter=tier_filter)
-    return p.render_report(summaries, len(listed))
+    listed = list_run_record_artifacts(
+        api, "P", None, group=tier_filter, group_of=group_of
+    )
+    summaries = pull(
+        listed,
+        runs,
+        LAYOUT,
+        identity_fields,
+        group_of=group_of,
+        group_of_record=group_of_record,
+        expected_counts=expected,
+        dry_run=True,
+        group_filter=tier_filter,
+    )
+    return render_report(summaries, len(listed))
 
 
 def main() -> None:
@@ -285,7 +354,7 @@ def main() -> None:
         "git": {"commit": "beef", "dirty": False},
         "provenance": {"uv.lock": "deadbeef"},
     }
-    from common.layout import record_metadata
+    record_metadata = _record_metadata
 
     sample = {
         "run_id": run_id,
