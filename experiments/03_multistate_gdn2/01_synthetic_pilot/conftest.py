@@ -7,7 +7,8 @@ import sys
 from pathlib import Path
 
 _PILOT = Path(__file__).resolve().parent
+_PROJECT = _PILOT.parent  # the shared project package parent
 _SRC = _PILOT.parents[2] / "src"
-for _path in (_PILOT, _SRC):
+for _path in (_PILOT, _PROJECT, _SRC):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))

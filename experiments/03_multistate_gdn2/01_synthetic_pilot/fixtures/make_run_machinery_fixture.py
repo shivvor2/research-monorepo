@@ -19,8 +19,9 @@ import sys
 from pathlib import Path
 
 _PILOT = Path(__file__).resolve().parents[1]
+_PROJECT = _PILOT.parent
 _SRC = _PILOT.parents[2] / "src"
-for _p in (_PILOT, _SRC):
+for _p in (_PILOT, _PROJECT, _SRC):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
@@ -215,11 +216,13 @@ def pull_report(train, cfg_upsert, tmp, tier_filter):
             "seed": 0,
             "config": {"task": {"name": task}, "experiment": {"tier": tier}},
         }
+        from common.layout import record_metadata
+
         root = write_artifact_root(tmp / f"src-{run_id}", task, run_id, rec)
         collections.append(
             FakeCollection(
                 f"c-{run_id}",
-                [FakeVersionedArtifact(root, train.run_record_metadata(rec))],
+                [FakeVersionedArtifact(root, record_metadata(rec))],
             )
         )
 
@@ -282,10 +285,12 @@ def main() -> None:
         "git": {"commit": "beef", "dirty": False},
         "provenance": {"uv.lock": "deadbeef"},
     }
+    from common.layout import record_metadata
+
     sample = {
         "run_id": run_id,
         "wandb_logger_kwargs": kwargs,
-        "artifact_metadata": train.run_record_metadata(sample_record),
+        "artifact_metadata": record_metadata(sample_record),
     }
 
     # (c) the pull --check report, with and without a tier filter.

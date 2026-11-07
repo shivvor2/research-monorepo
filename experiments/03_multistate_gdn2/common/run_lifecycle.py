@@ -370,7 +370,16 @@ def upload_run_record_artifact(
 
     path = Path(cfg.output.runs_dir) / f"{run_id}.json"
     record = read_record(path)
-    if record is None or record.get("status") != RUN_DONE_STATUS:
+    if record is None:
+        logger.error("run record %s not found; skipping the W&B artifact upload", path)
+        return
+    if record.get("status") != RUN_DONE_STATUS:
+        logger.error(
+            "run record %s has status %r, not test_done; skipping the W&B "
+            "artifact upload",
+            path,
+            record.get("status"),
+        )
         return
     _transport_upload(
         artifact_name(run_id),

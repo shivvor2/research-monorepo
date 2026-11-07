@@ -96,7 +96,9 @@ class TestWandbSample:
             "git": {"commit": "beef", "dirty": False},
             "provenance": {"uv.lock": "deadbeef"},
         }
-        assert train.run_record_metadata(record) == expect["artifact_metadata"]
+        import common.layout
+
+        assert common.layout.record_metadata(record) == expect["artifact_metadata"]
 
 
 def expect_config_hash(train):

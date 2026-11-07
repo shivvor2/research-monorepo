@@ -98,6 +98,7 @@ from pilot_analysis.protocol import EXPECTED_RUNS  # noqa: E402  (sys.path)
 from research_lib.data.synthetic import (  # noqa: E402
     RecallMetrics,
     SyntheticRecallDataModule,
+    require_task,
 )
 from research_lib.training.losses import AnswerLogits  # noqa: E402
 
@@ -234,7 +235,14 @@ def optimizers_of(module: L.LightningModule) -> list[torch.optim.Optimizer]:
 def build_benchmark_module(cfg: DictConfig, lr: float) -> L.LightningModule:
     """The seeded training module on CPU (caller moves it to the device)."""
     model = build_model(cfg)
-    return build_module(cfg, model, lr)
+    return build_module(
+        cfg,
+        model,
+        lr,
+        slice_values(cfg),
+        monitor_key="val/acc",
+        class_names=require_task(str(cfg.task.name)).class_names,
+    )
 
 
 def pregenerate_batches(
