@@ -1,10 +1,13 @@
 # =============================================================================
-# Debug config: a handful of steps on every layout and mixer.
+# Debug config: a handful of steps, brief enough to exercise the full
+# run path without a long run.
 # =============================================================================
-# Usage:
+# Usage (a brief cartesian sweep over layouts x mixer settings):
 #   python 01_train.py --config-name=debug --multirun \
-#     model.layout=single,ws,ll,ws model.mixer=gated_delta,gated_delta,gated_delta,attention
-# Each of the four jobs runs a few steps and writes a distinct run JSON.
+#     task=mqar model.layout=single,ws,ll,ws \
+#     model.mixer=gated_delta,gated_delta,gated_delta,attention
+# Each job runs a few steps; claimed_run rounds the jobs down to as many
+# distinct run IDs as the sweep actually yields and writes one JSON each.
 
 defaults:
   - config
