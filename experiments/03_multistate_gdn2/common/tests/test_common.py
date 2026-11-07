@@ -9,11 +9,14 @@ Run with: pytest experiments/03_multistate_gdn2/common/tests/test_common.py -v
 import pandas as pd
 import pytest
 from common.analysis import delta_int_table, gap_column, paired_gap_report
+from common.harnesses import build_zoology
 from common.registries import config_type_of_task, require_harness
 from common.run_id import make_run_id
 from omegaconf import OmegaConf
 
+from research_lib.architectures.zoology_lm import BaseConv
 from research_lib.data.synthetic import MQARConfig, OverwriteConfig, require_task
+from research_lib.layers.attention import CausalSelfAttention, MultistateGatedDelta
 
 
 def _cfg(*, reserved_filler=0, tier=None):
@@ -95,6 +98,75 @@ class TestRegistries:
             require_harness("nope")
 
 
+def _harness_cfg(*, mixer=None):
+    cfg = OmegaConf.create(
+        {
+            "model": {
+                "vocab_size": 64,
+                "d_model": 32,
+                "num_heads": 2,
+                "head_dim": 16,
+                "expand_v": 1.0,
+                "gate_mode": "full",
+                "layout": "single",
+                "lambda_mode": "mlp",
+                "window": 4,
+                "chunk_size": 16,
+                "t_max": 32,
+                "mixer_mode": "chunk",
+                "output_gate_activation": "sigmoid",
+                "n_layer": 2,
+                "layer_pattern": "zoology",
+                "base_conv_kernel": 3,
+                "state_mixer": "none",
+                "ff_mult": 2.0,
+            }
+        }
+    )
+    if mixer is not None:
+        cfg.model.mixer = mixer
+    return cfg
+
+
+def _mixer_kinds(model) -> list:
+    return [block.mixer for block in model.blocks]
+
+
+def _managed_mixers(model) -> list:
+    # The harness's ``zoology`` pattern alternates BaseConv conv blocks
+    # with the managed mixer; the managed ones are what the config chose.
+    return [m for m in _mixer_kinds(model) if not isinstance(m, BaseConv)]
+
+
+class TestHarnessBuildsTheRunsMixer:
+    def test_default_builds_gated_delta_only(self):
+        model = build_zoology(_harness_cfg())
+        managed = _managed_mixers(model)
+        assert managed
+        assert all(isinstance(m, MultistateGatedDelta) for m in managed)
+        assert not any(isinstance(m, CausalSelfAttention) for m in managed)
+
+    def test_attention_config_builds_attention_only(self):
+        model = build_zoology(_harness_cfg(mixer="attention"))
+        managed = _managed_mixers(model)
+        assert managed
+        assert all(isinstance(m, CausalSelfAttention) for m in managed)
+        assert not any(isinstance(m, MultistateGatedDelta) for m in managed)
+
+    def test_attention_ignores_the_gated_delta_head_dim(self):
+        # head_dim is the gated-delta key width and must not set the
+        # attention control's rotary dimension (which stays the head width).
+        cfg = _harness_cfg(mixer="attention")
+        cfg.model.head_dim = 10  # not a divisor of 32, irrelevant to attention
+        model = build_zoology(cfg)
+        for m in _managed_mixers(model):
+            assert m.rotary_dim in (None, 16)
+
+    def test_unknown_mixer_raises(self):
+        with pytest.raises(ValueError):
+            build_zoology(_harness_cfg(mixer="nope"))
+
+
 class TestAnalysis:
     def test_gap_column(self):
         df = pd.DataFrame(
@@ -136,3 +208,21 @@ class TestAnalysis:
         assert set(out["layout"]) == {"ws", "ll"}
         for _, row in out.iterrows():
             assert row["mean"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_delta_int_catches_a_ws_only_gate_effect(self):
+        # Raise only ws/full by 0.4 across both seeds: the interaction is
+        # +0.4 for ws and 0 for ll (a sign/pairing slip would show here).
+        rows = []
+        for layout in ("single", "ws", "ll"):
+            for gate in ("full", "kda"):
+                for seed in (0, 1):
+                    value = 0.5
+                    if layout == "ws" and gate == "full":
+                        value += 0.4
+                    rows.append((layout, gate, seed, value))
+        df = pd.DataFrame(rows, columns=["layout", "gate_mode", "seed", "metric"])
+        out = delta_int_table(df, "metric", layouts=("ws", "ll"))
+        ws_row = out[out["layout"] == "ws"].iloc[0]
+        ll_row = out[out["layout"] == "ll"].iloc[0]
+        assert ws_row["mean"] == pytest.approx(0.4, abs=1e-9)
+        assert ll_row["mean"] == pytest.approx(0.0, abs=1e-9)

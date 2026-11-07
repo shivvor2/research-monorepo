@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from enum import Enum
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 
 from research_lib.architectures.config import ZoologyLMConfig
 from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
@@ -32,29 +32,30 @@ class MixerKind(str, Enum):
     ATTENTION = "attention"
 
 
-def build_zoology(
-    cfg: DictConfig, *, mixer: MixerKind | str = MixerKind.GATED_DELTA
-) -> ZoologyLM:
-    """Build the Zoology harness with the chosen mixer.
+def build_zoology(cfg: DictConfig) -> ZoologyLM:
+    """Build the Zoology harness with the mixer the run selects.
 
-    The mixer choice is :class:`MixerKind` (or its string value); the
-    gated-delta mixer is configured from ``cfg.model``, while attention
-    uses the model width and head count directly.
+    The mixer is read from ``cfg.model.mixer`` (the run's own choice):
+    ``gated_delta`` (the default, and the only value the first pilot's
+    config can produce) builds the layer under test, ``attention`` builds
+    the expected-to-do-well control. The gated-delta mixer is configured
+    from ``cfg.model``; attention uses the model width and head count
+    directly (its rotary dimension is the full head width — the
+    gated-delta ``head_dim`` key must not set it).
 
     Args:
         cfg: The resolved config (``model.*``).
-        mixer: The :class:`MixerKind` for the sequence mixers.
 
     Returns:
         A :class:`ZoologyLM` ready to train.
 
     Raises:
-        ValueError: An unknown mixer kind.
+        ValueError: An unknown ``model.mixer`` value.
     """
     c = cfg.model
     head_dim = c.head_dim
     head_dim = int(head_dim) if head_dim is not None else c.d_model // c.num_heads
-    kind = MixerKind(mixer)
+    kind = MixerKind(OmegaConf.select(cfg, "model.mixer", default="gated_delta"))
 
     def make_mixer():
         if kind is MixerKind.GATED_DELTA:
@@ -73,7 +74,7 @@ def build_zoology(
                 output_gate_activation=c.output_gate_activation,
             )
         if kind is MixerKind.ATTENTION:
-            return CausalSelfAttention(c.d_model, c.num_heads, rotary_dim=head_dim)
+            return CausalSelfAttention(c.d_model, c.num_heads)
         raise ValueError(f"unknown mixer {kind}")
 
     mixers = zoology_mixers(

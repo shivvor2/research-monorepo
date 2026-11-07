@@ -51,7 +51,7 @@ if str(_PROJECT) not in sys.path:
 
 # The shared run machinery. The names imported here are the modules'
 # public surfaces; the pilot keeps only its protocol and run_job below.
-from common.harnesses import MixerKind, build_zoology  # noqa: E402
+from common.harnesses import build_zoology  # noqa: E402
 from common.launch import job_num, stop_requested  # noqa: E402
 from common.layout import wandb_kwargs as wandb_logger_kwargs  # noqa: E402
 from common.run_id import HASH_EXCLUDE, make_run_id  # noqa: E402
@@ -388,8 +388,9 @@ def slice_values(cfg: DictConfig) -> tuple[int, ...]:
 
 def build_model(cfg: DictConfig) -> ZoologyLM:
     """Build the model: the shared Zoology harness with the gated-delta
-    mixer (the first pilot's mechanism)."""
-    return build_zoology(cfg, mixer=MixerKind.GATED_DELTA)
+    mixer (the first pilot's config has no ``model.mixer`` key, so the
+    harness defaults to gated-delta; the identity hash is unchanged)."""
+    return build_zoology(cfg)
 
 
 def run_job(cfg: DictConfig) -> None:
