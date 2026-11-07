@@ -10,4 +10,15 @@ d_model: null
 harness:
   layer_pattern: null
   state_mixer: null
+# The frozen peak LR per (task, mixer, layout, gate).
+#
+#   lr_table:
+#     <task>:
+#       gated_delta:
+#         <layout>:
+#           <gate>: <lr>
+#       attention: <lr>          # the attention run has no gate/layout
+#
+# A missing or null node anywhere in a key's path falls through to the
+# "fill conf/frozen_protocol.yaml" error.
 lr_table: {}

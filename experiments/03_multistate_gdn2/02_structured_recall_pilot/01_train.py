@@ -55,8 +55,6 @@ logger = logging.getLogger(__name__)
 
 def load_frozen_protocol() -> DictConfig:
     """Load conf/frozen_protocol.yaml (from this experiment's conf dir)."""
-    from omegaconf import OmegaConf
-
     return OmegaConf.load(_PILOT / "conf" / "frozen_protocol.yaml")
 
 
@@ -199,18 +197,38 @@ def run_job(cfg: DictConfig) -> None:
         logger.info("Run complete (run_id=%s).", run_id)
 
 
+def _walk(node: object, *keys: str) -> object | None:
+    """The node reached by ``keys``, or ``None`` if any step is absent
+    (a missing key and a present-``null`` key are treated the same, so a
+    hand-edited ``lr_table`` node with no value cannot raise)."""
+    current = node
+    for key in keys:
+        if current is None:
+            return None
+        current = current.get(key) if hasattr(current, "get") else None
+        if current is None:
+            return None
+    return current
+
+
 def _frozen_lr(cfg: DictConfig, frozen: DictConfig) -> float:
-    value = (
-        frozen.get("lr_table", {})
-        .get(str(cfg.task.name), {})
-        .get(str(cfg.model.layout), {})
-        .get(str(cfg.model.gate_mode))
-    )
+    """The frozen peak LR for this run, or raise.
+
+    For the gated-delta mixer the table is
+    ``lr_table.<task>.gated_delta.<layout>.<gate>``; an attention run has
+    its own row ``lr_table.<task>.attention``.
+    """
+    mixer = str(OmegaConf.select(cfg, "model.mixer", default="gated_delta"))
+    task_node = _walk(frozen.get("lr_table"), str(cfg.task.name))
+    if mixer == "attention":
+        value = _walk(task_node, "attention")
+    else:
+        value = _walk(task_node, mixer, str(cfg.model.layout), str(cfg.model.gate_mode))
     if value is None:
         raise RuntimeError(
-            "optimizer.lr is null and no frozen-protocol entry exists; fill "
-            "conf/frozen_protocol.yaml after calibration, or pass "
-            "optimizer.lr=<value>"
+            "optimizer.lr is null and no frozen-protocol entry exists (mixer="
+            f"{mixer!r}); fill conf/frozen_protocol.yaml after calibration, or "
+            "pass optimizer.lr=<value>"
         )
     return float(value)
 
