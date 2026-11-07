@@ -1,0 +1,9 @@
+1 run_record artifacts on W&B
+== tier3_frozen ==
+  local test_done: 1 / 20 expected (19 short)
+  pulled now: 0
+  skipped: 0
+  CONFLICTS (1, never overwritten):
+    tier3_frozen_mqar-ll-full-mlp-d32-lr0.003-s1: artifact hashB:0 != local hashX:0
+  still missing locally: 1: tier3_frozen_mqar-ll-full-mlp-d32-lr0.003-s1
+pull incomplete: 1 conflicts, 0 failures

@@ -1,0 +1,31 @@
+{
+  "artifact_metadata": {
+    "config_hash": "f19c8015042cfca0e8ba8c294364ed3623070f494a3ebd0ff76596cf520af9fb",
+    "git_commit": "beef",
+    "lock_hash": "deadbeef",
+    "run_id": "tier1_core_overwrite-ws-full-mlp-d32-lr0.003-s0",
+    "seed": 0,
+    "status": "test_done",
+    "task": "overwrite",
+    "tier": "tier1_core"
+  },
+  "run_id": "tier1_core_overwrite-ws-full-mlp-d32-lr0.003-s0",
+  "wandb_logger_kwargs": {
+    "config": null,
+    "entity": null,
+    "group": "tier1_core",
+    "job_type": "phase1",
+    "log_model": false,
+    "name": "tier1_core_overwrite-ws-full-mlp-d32-lr0.003-s0",
+    "project": "MultistateGDN2",
+    "save_dir": "logs/wandb",
+    "tags": [
+      "multistate_gdn2_synthetic_pilot",
+      "overwrite",
+      "ws",
+      "full",
+      "mlp",
+      "d32"
+    ]
+  }
+}
