@@ -1,0 +1,24 @@
+# =============================================================================
+# Frozen protocol: filled at the end of calibration, then committed.
+# =============================================================================
+# While ``frozen: false``, the smoke and debug configs run; an experiment
+# phase >= 2 refuses to run. Calibration fills the LR table, then the
+# screening reading picks d_model / harness and sets ``frozen: true``.
+
+frozen: false
+d_model: null
+harness:
+  layer_pattern: null
+  state_mixer: null
+# The frozen peak LR per (task, mixer, layout, gate).
+#
+#   lr_table:
+#     <task>:
+#       gated_delta:
+#         <layout>:
+#           <gate>: <lr>
+#       attention: <lr>          # the attention run has no gate/layout
+#
+# A missing or null node anywhere in a key's path falls through to the
+# "fill conf/frozen_protocol.yaml" error.
+lr_table: {}

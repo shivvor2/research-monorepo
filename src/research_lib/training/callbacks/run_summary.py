@@ -87,6 +87,7 @@ from lightning.pytorch.trainer.states import TrainerFn
 from lightning.pytorch.utilities.exceptions import SIGTERMException
 
 from research_lib.training.param_utils import select_parameters
+from research_lib.training.run_control import RUN_DONE_STATUS
 from research_lib.utils.io import atomic_write
 
 logger = logging.getLogger(__name__)
@@ -722,7 +723,7 @@ class RunSummaryCallback(L.Callback):
         # this run's previously failed record.
         self.summary.pop("error", None)
         self.summary.pop("failed_stage", None)
-        self.summary["status"] = "test_done"
+        self.summary["status"] = RUN_DONE_STATUS
         # Nothing else: timing and stopping are fit-time sections, computed
         # at fit end only. Recomputing them here would either fold the test
         # run into the timing of a fit in the same process, or (in a

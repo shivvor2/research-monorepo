@@ -682,3 +682,73 @@ class TestResume:
         resumed_b = rec_b.batches({3, 4, 5})
         for index in (3, 4, 5):
             torch.testing.assert_close(full_b[index], resumed_b[index])
+
+
+class _FakeExtraMetric:
+    """An extra metric: counts the predictions it received."""
+
+    def __init__(self):
+        self.updates = 0
+        self.last_predictions = None
+
+    def reset(self):
+        self.updates = 0
+        self.last_predictions = None
+
+    def update(self, predictions, batch):
+        self.updates += 1
+        self.last_predictions = predictions
+
+    def compute(self):
+        return {"extra_metric": float(self.updates)}
+
+
+class TestTaskHooks:
+    """Spec: task class names, a configurable monitor key, and pluggable
+    extra metrics that receive the same predictions as RecallMetrics."""
+
+    def test_monitor_key_defaults_to_val_acc(self):
+        module = make_module()
+        assert module.monitor_key == "val/acc"
+
+    def test_class_names_reach_the_validation_metrics(self):
+        module = make_module()
+        module.class_names = ("A", "B", "C", "D")
+        metrics = module._new_metrics()
+        assert metrics._class_names == ("A", "B", "C", "D")
+
+    def test_extra_metric_receives_predictions_and_logs_under_val(self):
+        module = make_module(layout="ws", answer_head=False)  # full-logits path
+        extra = _FakeExtraMetric()
+        module.extra_metrics = (extra,)
+        logged = {}
+        module.log = lambda name, value, **kwargs: logged.update({name: value})
+
+        module.on_validation_epoch_start()
+        batch = generate_mqar(tiny_mqar_config(), num_examples=4, seed=0)
+        module.validation_step(batch, 0)
+        module.on_validation_epoch_end()
+
+        assert extra.updates == 1
+        # The extra metric saw the shifted argmax predictions (B, T-1).
+        assert extra.last_predictions is not None
+        assert extra.last_predictions.shape[0] == 4
+        assert extra.last_predictions.ndim == 2
+        assert "val/extra_metric" in logged
+        assert "val/acc" in logged  # RecallMetrics still logs its own key
+
+    def test_extra_metric_logged_under_test_too(self):
+        module = make_module(layout="ws", answer_head=False)
+        extra = _FakeExtraMetric()
+        module.extra_metrics = (extra,)
+        logged = {}
+        module.log = lambda name, value, **kwargs: logged.update({name: value})
+
+        module.on_test_epoch_start()
+        batch = generate_mqar(tiny_mqar_config(), num_examples=4, seed=0)
+        module.test_step(batch, 0)
+        module.on_test_epoch_end()
+
+        assert extra.updates == 1
+        assert "test/extra_metric" in logged
+        assert "test/acc" in logged

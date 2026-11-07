@@ -1,0 +1,50 @@
+{
+  "calib_harness_mqar_kda_ll": {
+    "config_hash": "412810c8aa97fa75ae9ca8923733f8d55d851974e7d20bbb76f226c696e70fc6",
+    "run_id": "calib_harness_mqar-ll-kda-mlp-d32-lr0.003-s0"
+  },
+  "calib_lr_mqar_full_ws": {
+    "config_hash": "b85c6741b92bb2bbe8adca2d6eaf7954810340cfd736d6193374c439d0a000f3",
+    "run_id": "calib_lr_mqar-ws-full-mlp-d32-lr0.003-s0"
+  },
+  "calib_lr_overwrite_full_single_pat_mlp_sm": {
+    "config_hash": "0ec8e8ee52d34f8d4da1f0737398e7f8f9b630791c7f5155b0c45e1bd3f71796",
+    "run_id": "calib_harness_overwrite-single-full-mlp-d32-lr0.003-pat-mixer_x2-sm-mlp-s0"
+  },
+  "calib_lr_overwrite_kda_single": {
+    "config_hash": "e6b893b6274c40a8cf85329206dfdf0a7c51bf74fd4d7b5ba4f8417c22ea844c",
+    "run_id": "calib_lr_overwrite-single-kda-mlp-d32-lr0.003-s0"
+  },
+  "r1_overwrite_kda_ws_uniform": {
+    "config_hash": "2f1d34425db7186e29f811a3bc536d9c60e34be7b8145de446cc69aa9b2ad1b5",
+    "run_id": "R1_overwrite-ws-kda-mlp-d32-lr0.003-wd-uniform-s0"
+  },
+  "tier1_core_overwrite_full_ll": {
+    "config_hash": "f19c8015042cfca0e8ba8c294364ed3623070f494a3ebd0ff76596cf520af9fb",
+    "run_id": "tier1_core_overwrite-ll-full-mlp-d32-lr0.003-s0"
+  },
+  "tier2_gates_overwrite_b_only_single": {
+    "config_hash": "27928d5199ee39eaf63d73128fe8f7918fe68f30c9ba519dbecc6cfd6797249f",
+    "run_id": "tier2_gates_overwrite-single-b_only-mlp-d32-lr0.003-s0"
+  },
+  "tier3_frozen_mqar_full_fs": {
+    "config_hash": "b1a6db4d1e87bcba2301315101ef41e711c2fa5a555d06209c54d59ff95f543d",
+    "run_id": "tier3_frozen_mqar-fs-full-mlp-d32-lr0.003-s0"
+  },
+  "tier4_lambda_overwrite_kda_ws_static": {
+    "config_hash": "93d9da0d4992b3a58091ce3ebcbb1c39fd8d6435029ad0ddab76c788f56194e5",
+    "run_id": "tier4_lambda_overwrite-ws-kda-static-d32-lr0.003-s0"
+  },
+  "tier5_matched_overwrite_kda_single_ev10": {
+    "config_hash": "ac52ae8cea1e7aa0f8e3f8cbbdb0c80461e49c37668b74c4c73d076ee155fc6d",
+    "run_id": "tier5_matched_bytes_overwrite-single-kda-mlp-d32-lr0.003-ev10-s0"
+  },
+  "tier6_anchor_mqar_gdn_single_d32_1head": {
+    "config_hash": "b5562ac256ede3cdb4795479e7174afcd14150d8d56a1caf5f75b40d83ece8d4",
+    "run_id": "tier6_anchors_mqar-single-gdn-mlp-d32-lr0.003-s0"
+  },
+  "tier_longT_mqar_full_ll": {
+    "config_hash": "a39362c5e16406f188b3485420588a6cc747421db0f550664c24729067abf390",
+    "run_id": "tier_longT_mqar-ll-full-mlp-d32-lr0.003-s0"
+  }
+}

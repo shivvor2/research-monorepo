@@ -1,0 +1,50 @@
+# @package _global_
+# =============================================================================
+# Zoology harness: the positive-control architecture shared by the tasks.
+# =============================================================================
+# The architecture and training choices come from here (single source),
+# with the vocab size from the task. The mixer under test is model.mixer
+# (gated_delta | attention), chosen by the run, not by the harness.
+
+harness:
+  name: zoology
+
+model:
+  vocab_size: ${task.vocab_size}
+  d_model: 32
+  n_layer: 2
+  layer_pattern: zoology
+  state_mixer: none
+  num_heads: 2
+  head_dim: null           # null -> d_model // num_heads
+  expand_v: 1.0
+  ff_mult: 4
+  base_conv_kernel: 3
+  gate_mode: full
+  layout: single
+  lambda_mode: mlp
+  window: 8
+  chunk_size: 16
+  t_max: ${task.max_seq_len}
+  output_gate_activation: silu
+  mixer_mode: chunk
+  mixer: gated_delta       # gated_delta | attention
+
+optimizer:
+  weight_decay: 0.1
+  betas: [0.9, 0.95]
+  decay_scheme: grouped
+
+training:
+  batch_size: 256
+  collect_mixer_stats: true
+  max_steps: 20000
+  val_check_interval: 500
+  early_stop_threshold: 0.99
+  precision: 32-true
+  grad_clip_val: null
+  loss_on: answers
+  answer_head: true
+  compile: false
+  log_every_n_steps: 50
+  devices: 1               # one device per job (the run lock is per-machine)

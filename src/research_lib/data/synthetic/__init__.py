@@ -12,17 +12,32 @@ Public names:
 """
 
 from .datamodule import SyntheticRecallDataModule
-from .metrics import RecallMetrics, answer_predictions
+from .metrics import OVERWRITE_CLASSES, RecallMetrics, answer_predictions
 from .mqar import MQARConfig, generate_mqar
 from .overwrite import OverwriteClass, OverwriteConfig, generate_overwrite
+from .registry import (
+    TASKS,
+    TaskSpec,
+    config_types,
+    generators,
+    require_task,
+    slice_values_of,
+)
 
 __all__ = [
     "MQARConfig",
     "OverwriteClass",
     "OverwriteConfig",
+    "OVERWRITE_CLASSES",
     "RecallMetrics",
     "SyntheticRecallDataModule",
+    "TASKS",
+    "TaskSpec",
     "answer_predictions",
+    "config_types",
     "generate_mqar",
     "generate_overwrite",
+    "generators",
+    "require_task",
+    "slice_values_of",
 ]

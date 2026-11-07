@@ -460,10 +460,28 @@ class TestSynchronizedWindows:
         assert result["elapsed_s"] == pytest.approx(1.0, abs=0.20)
         assert result["steps"] >= 1
 
-    def test_late_worker_reports_late(self, capsys):
+    def test_late_worker_reports_late(self, capsys, monkeypatch):
+        import types
+
         cfg = make_bench_cfg()
-        cfg.bench.concurrency_seconds = 1.5
-        cfg.bench.start_at = time.time() - 0.5  # the shared start went by
+        # Make the worker deterministic regardless of the machine's
+        # speed: no dataloader worker processes to spin up (their cost is
+        # load-dependent), a monotonic clock so a wall-clock step can't
+        # shorten the window, and a window (shared end) comfortably past
+        # the build + warmup + first-batch generation so the late-but-
+        # still-measuring path is exercised instead of racy with setup.
+        cfg.data.num_workers = 0
+        monkeypatch.setattr(
+            bench,
+            "time",
+            types.SimpleNamespace(
+                time=time.perf_counter,
+                perf_counter=time.perf_counter,
+                sleep=lambda _s: None,
+            ),
+        )
+        cfg.bench.concurrency_seconds = 5.0
+        cfg.bench.start_at = time.perf_counter() - 0.5  # the shared start went by
         bench.worker_main(cfg)
         result = bench.parse_worker_result(capsys.readouterr().out)
         assert result is not None

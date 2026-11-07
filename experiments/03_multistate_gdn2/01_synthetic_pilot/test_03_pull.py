@@ -1,6 +1,6 @@
 """
-Tests for the W&B run-record transport: 03_pull.py and the shared
-wandb_artifacts helpers.
+Tests for the W&B run-record transport: 03_pull.py wired to the shared
+research_lib / common machinery.
 
 Target: experiments/03_multistate_gdn2/01_synthetic_pilot/03_pull.py
 Run with: pytest experiments/03_multistate_gdn2/01_synthetic_pilot/test_03_pull.py -v
@@ -18,8 +18,8 @@ from pathlib import Path
 
 import pytest
 from omegaconf import OmegaConf
-from wandb_artifacts import artifact_name, run_record_metadata
 
+from research_lib.training.run_records import artifact_name, run_record_metadata
 from research_lib.utils.run_lock import exclusive_lock
 
 _SRC = Path(__file__).resolve().parents[3] / "src"
@@ -27,9 +27,55 @@ if str(_SRC) not in sys.path:
     sys.path.insert(0, str(_SRC))
 
 _ROOT = Path(__file__).resolve().parent
-_SPEC = importlib.util.spec_from_file_location("pilot_pull", _ROOT / "03_pull.py")
-pull = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(pull)
+
+from common.layout import (
+    LAYOUT,
+    group_of,
+    group_of_record,
+    metadata_extras,
+    metadata_identity_fields,
+)
+from common.pull import default_entity_project
+from pilot_analysis.protocol import EXPECTED_RUNS
+
+# The general pull (decisions, install, report) and the reusable
+# artifacts, pointed at this pilot's layout / identity fields.
+import research_lib.training.run_records as pull
+
+_ID = metadata_identity_fields()
+
+
+def _list(api, project, entity, tier=None):
+    """The newest-version run-record listing, tier-filtered by group."""
+    return pull.list_run_record_artifacts(
+        api, project, entity, group=tier, group_of=group_of
+    )
+
+
+def _staged(record, metadata):
+    """The staged-record validation with this pilot's identity fields."""
+    return pull.staged_record_problem(record, metadata, _ID)
+
+
+def _install(artifact, runs_dir, include_checkpoints=False):
+    """Install one artifact's files at the pilot layout's local shapes."""
+    return pull.install_artifact(artifact, runs_dir, LAYOUT, include_checkpoints, _ID)
+
+
+def _do_pull(artifacts, runs_dir, *, dry_run=False, tier_filter=None):
+    """The pilot's pull: its layout, identity fields and expected counts."""
+    return pull.pull(
+        artifacts,
+        runs_dir,
+        LAYOUT,
+        _ID,
+        group_of=group_of,
+        group_of_record=group_of_record,
+        expected_counts=EXPECTED_RUNS,
+        dry_run=dry_run,
+        group_filter=tier_filter,
+    )
+
 
 # 01_train.py for wandb_logger_kwargs (imports torch/lightning; heavy).
 _TRAIN_SPEC = importlib.util.spec_from_file_location(
@@ -150,7 +196,7 @@ def make_artifact(tmp_path, record, *, curves=True, checkpoint=False, version=1)
         checkpoint=checkpoint,
     )
     return FakeVersionedArtifact(
-        root, run_record_metadata(record), version=f"v{version}"
+        root, run_record_metadata(record, metadata_extras()), version=f"v{version}"
     )
 
 
@@ -167,11 +213,103 @@ class TestArtifactName:
         with pytest.raises(ValueError, match="outside"):
             artifact_name("x-lr1e+06-s0")
 
-    def test_contract_with_the_training_script(self):
-        # 01_train.py names its uploads through the same helper.
-        import wandb_artifacts
 
-        assert artifact_name is wandb_artifacts.artifact_name
+class TestUploadAndPullShareTheName:
+    """The name the training path uploads a record under is the name the
+    pull finds: upload through common.run_lifecycle (a fake wandb that
+    materialises the artifact), then pull it with common.pull and assert
+    it is installed."""
+
+    def test_uploaded_record_is_pulled_back(self, tmp_path, monkeypatch):
+        from common.pull import main as pull_main
+        from common.run_lifecycle import upload_run_record_artifact
+        from omegaconf import OmegaConf
+
+        runs = tmp_path / "runs"
+        runs.mkdir()
+        run_id = "tier1_core_overwrite-ws-full-mlp-d32-lr0.003-s0"
+        record = {
+            "run_id": run_id,
+            "status": "test_done",
+            "config_hash": "abc123",
+            "seed": 0,
+            "config": {"task": {"name": TASK}, "experiment": {"tier": "tier1_core"}},
+            "git": {"commit": "beef", "dirty": False},
+            "provenance": {"uv.lock": "deadbeef"},
+        }
+        (runs / f"{run_id}.json").write_text(json.dumps(record))
+        cfg = OmegaConf.create(
+            {
+                "task": {"name": TASK},
+                "output": {"runs_dir": str(runs)},
+                "logging": {
+                    "wandb": {
+                        "enabled": True,
+                        "upload_record": True,
+                        "upload_checkpoint": False,
+                    },
+                    "csv": {"save_dir": str(runs / "curves")},
+                },
+            }
+        )
+
+        holder = {"artifact": None}
+
+        class FakeArtifact:
+            """A minimal wandb Artifact: records its name and metadata,
+            and accepts file additions (which the test can ignore)."""
+
+            def __init__(self, name, type=None, metadata=None):
+                self.name = name
+                self.type = type
+                self.metadata = metadata or {}
+
+            def add_file(self, local_path, name=None):
+                pass
+
+            def wait(self):
+                pass
+
+        class FakeWandb:
+            run = object()  # a live W&B run
+
+            def Artifact(self, name, type=None, metadata=None):
+                return FakeArtifact(name, type, metadata)
+
+            def log_artifact(self, artifact):
+                holder["artifact"] = artifact
+
+            def Api(self):
+                return api
+
+        api = FakeApi([])
+        monkeypatch.setitem(sys.modules, "wandb", FakeWandb())
+        upload_run_record_artifact(cfg, run_id, True)
+
+        # The upload named the artifact with the shared helper (the same
+        # name the pull's listing looks for).
+        from research_lib.training.run_records import artifact_name as _an
+
+        assert holder["artifact"] is not None
+        assert holder["artifact"].name == _an(run_id)
+
+        # The same record, as an artifact the pull will find.
+        root = write_artifact_root(tmp_path / "src", TASK, run_id, record)
+        artifact = FakeVersionedArtifact(
+            root, run_record_metadata(record, metadata_extras())
+        )
+        api.collections.append(FakeCollection(f"c-{run_id}", [artifact]))
+        monkeypatch.setattr(
+            "research_lib.utils.secrets.check_auth", lambda *a, **k: None
+        )
+        monkeypatch.setattr(
+            sys, "argv", ["03_pull", "--project", "P", "--runs-dir", str(runs)]
+        )
+        code = pull_main(expected_counts=EXPECTED_RUNS, conf_config_path=None)
+        assert code == 0
+        installed = runs / TASK / f"{run_id}.json"
+        assert installed.exists()
+        assert json.loads(installed.read_text())["config_hash"] == "abc123"
 
 
 class TestRunRecordMetadata:
@@ -180,7 +318,7 @@ class TestRunRecordMetadata:
 
     def test_fields(self):
         record = _record()
-        metadata = run_record_metadata(record)
+        metadata = run_record_metadata(record, metadata_extras())
         assert metadata == {
             "run_id": RUN_ID,
             "tier": TIER,
@@ -234,14 +372,14 @@ class TestStagedRecordProblem:
     claims before anything is installed."""
 
     def test_passing_record(self):
-        metadata = run_record_metadata(_record())
-        assert pull.staged_record_problem(_record(), metadata) is None
+        metadata = run_record_metadata(_record(), metadata_extras())
+        assert _staged(_record(), metadata) is None
 
     def test_missing_record(self):
-        assert pull.staged_record_problem(None, {}) is not None
+        assert _staged(None, {}) is not None
 
     def test_not_done_record(self):
-        problem = pull.staged_record_problem(_record(status="failed"), {})
+        problem = _staged(_record(status="failed"), {})
         assert problem is not None and "not test_done" in problem
 
     @pytest.mark.parametrize(
@@ -253,9 +391,9 @@ class TestStagedRecordProblem:
         ],
     )
     def test_record_identity_field_differs(self, field, kwargs):
-        metadata = run_record_metadata(_record())
+        metadata = run_record_metadata(_record(), metadata_extras())
         record = _record(**kwargs)
-        problem = pull.staged_record_problem(record, metadata)
+        problem = _staged(record, metadata)
         assert problem is not None and field in problem
 
     @pytest.mark.parametrize(
@@ -269,19 +407,19 @@ class TestStagedRecordProblem:
         # An identity field missing from both record and metadata must
         # not match as str(None) != str(None): it is rejected outright.
         record = _record(**kwargs)
-        problem = pull.staged_record_problem(record, run_record_metadata(_record()))
+        problem = _staged(record, run_record_metadata(_record(), metadata_extras()))
         assert problem is not None and field in problem
 
     def test_record_task_differs(self):
-        metadata = run_record_metadata(_record())
+        metadata = run_record_metadata(_record(), metadata_extras())
         record = _record(task="mqar")
-        problem = pull.staged_record_problem(record, metadata)
+        problem = _staged(record, metadata)
         assert problem is not None and "task" in problem
 
     def test_record_tier_differs(self):
-        metadata = run_record_metadata(_record())
+        metadata = run_record_metadata(_record(), metadata_extras())
         record = _record(tier="tier3_frozen")
-        problem = pull.staged_record_problem(record, metadata)
+        problem = _staged(record, metadata)
         assert problem is not None and "tier" in problem
 
 
@@ -302,7 +440,7 @@ class TestListing:
         newer = make_artifact(tmp_path, _record(), version=2)
         collection = FakeCollection(f"run-{RUN_ID}", [older, newer])
         api = FakeApi([collection])
-        artifacts = pull.list_run_record_artifacts(api, "P", None)
+        artifacts = _list(api, "P", None)
         assert artifacts == [newer]
 
     def test_v9_and_v10_order_by_number_not_lexicographically(self, tmp_path):
@@ -311,27 +449,27 @@ class TestListing:
         # v10 is the newest and is picked regardless of list order.
         for order in ([v10, v9], [v9, v10]):
             api = FakeApi([FakeCollection(f"run-{RUN_ID}", order)])
-            assert pull.list_run_record_artifacts(api, "P", None) == [v10]
+            assert _list(api, "P", None) == [v10]
 
     def test_tier_filter(self, tmp_path):
         artifact = make_artifact(tmp_path, _record())
         api = FakeApi([FakeCollection(f"run-{RUN_ID}", [artifact])])
-        assert pull.list_run_record_artifacts(api, "P", None, tier=TIER) == [artifact]
-        assert pull.list_run_record_artifacts(api, "P", None, tier="tier3_frozen") == []
+        assert _list(api, "P", None, tier=TIER) == [artifact]
+        assert _list(api, "P", None, tier="tier3_frozen") == []
 
     def test_foreign_collections_are_skipped(self, tmp_path):
         foreign = FakeVersionedArtifact(tmp_path / "foreign", {}, version=1)
         api = FakeApi([FakeCollection("some-other-artifact", [foreign])])
-        assert pull.list_run_record_artifacts(api, "P", None) == []
+        assert _list(api, "P", None) == []
 
     def test_entity_path_is_forwarded(self, tmp_path):
         collection = FakeCollection(
             f"run-{RUN_ID}", [make_artifact(tmp_path, _record())]
         )
         api = FakeApi([collection])
-        pull.list_run_record_artifacts(api, "P", "my-entity")
+        _list(api, "P", "my-entity")
         assert api.calls[-1][0] == "my-entity/P"
-        pull.list_run_record_artifacts(api, "P", None)
+        _list(api, "P", None)
         assert api.calls[-1][0] == "P"
 
 
@@ -341,7 +479,7 @@ class TestInstall:
     def test_record_and_curve_land_at_the_local_shapes(self, tmp_path):
         artifact = make_artifact(tmp_path, _record())
         runs_dir = tmp_path / "runs"
-        written = pull.install_artifact(artifact, runs_dir, False)
+        written = _install(artifact, runs_dir, False)
         assert sorted(written) == sorted(
             [
                 runs_dir / TASK / f"{RUN_ID}.json",
@@ -354,26 +492,26 @@ class TestInstall:
     def test_checkpoint_only_with_the_flag(self, tmp_path):
         artifact = make_artifact(tmp_path, _record(), checkpoint=True)
         runs_dir = tmp_path / "runs"
-        pull.install_artifact(artifact, runs_dir, include_checkpoints=False)
+        _install(artifact, runs_dir, include_checkpoints=False)
         assert not (runs_dir / TASK / f"{RUN_ID}.pt").exists()
-        pull.install_artifact(artifact, runs_dir, include_checkpoints=True)
+        _install(artifact, runs_dir, include_checkpoints=True)
         assert (runs_dir / TASK / f"{RUN_ID}.pt").read_text() == "weights"
 
     def test_checkpoint_not_downloaded_without_the_flag(self, tmp_path):
         artifact = make_artifact(tmp_path, _record(), checkpoint=True)
         runs_dir = tmp_path / "runs"
-        pull.install_artifact(artifact, runs_dir, include_checkpoints=False)
+        _install(artifact, runs_dir, include_checkpoints=False)
         requested = artifact.requested_prefixes
         assert f"{TASK}/{RUN_ID}.pt" not in requested
-        assert f"{TASK}/curves/{RUN_ID}/" in requested
+        assert f"{TASK}/curves/{RUN_ID}/metrics.csv" in requested
         assert f"{TASK}/{RUN_ID}.json" in requested
-        pull.install_artifact(artifact, runs_dir, include_checkpoints=True)
+        _install(artifact, runs_dir, include_checkpoints=True)
         assert f"{TASK}/{RUN_ID}.pt" in artifact.requested_prefixes
 
     def test_no_curve_artifact_writes_no_curve(self, tmp_path):
         artifact = make_artifact(tmp_path, _record(), curves=False)
         runs_dir = tmp_path / "runs"
-        pull.install_artifact(artifact, runs_dir, False)
+        _install(artifact, runs_dir, False)
         assert not (runs_dir / TASK / "curves").exists()
 
 
@@ -383,7 +521,7 @@ class TestPull:
     def test_new_record_is_pulled(self, tmp_path):
         artifact = make_artifact(tmp_path, _record())
         runs_dir = tmp_path / "runs"
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.pulled == [RUN_ID]
         assert summary.conflicts == []
@@ -398,7 +536,7 @@ class TestPull:
         target = runs_dir / TASK / f"{RUN_ID}.json"
         target.parent.mkdir(parents=True)
         target.write_text(json.dumps(_record()))
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.skipped == [RUN_ID]
         assert summary.pulled == []
@@ -410,7 +548,7 @@ class TestPull:
         target = runs_dir / TASK / f"{RUN_ID}.json"
         target.parent.mkdir(parents=True)
         target.write_text(json.dumps(_record(hash_="local-hash")))
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.conflicts == [(RUN_ID, "artifact-hash:0", "local-hash:0")]
         # Never overwritten, and not downloaded either.
@@ -424,7 +562,7 @@ class TestPull:
         target = runs_dir / TASK / f"{RUN_ID}.json"
         target.parent.mkdir(parents=True)
         target.write_text(json.dumps(_record(status="interrupted")))
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         assert summaries[TIER].pulled == [RUN_ID]
         assert json.loads(target.read_text())["status"] == "test_done"
 
@@ -432,7 +570,9 @@ class TestPull:
         record = _record()
         root = write_artifact_root(tmp_path / "src", TASK, RUN_ID, record)
         (root / TASK / f"{RUN_ID}.json").write_text("{not json")
-        artifact = FakeVersionedArtifact(root, run_record_metadata(record))
+        artifact = FakeVersionedArtifact(
+            root, run_record_metadata(record, metadata_extras())
+        )
         runs_dir = tmp_path / "runs"
         # A pre-existing local record that is not done: the broken
         # artifact must not be installed and must leave it untouched.
@@ -440,7 +580,7 @@ class TestPull:
         target.parent.mkdir(parents=True)
         local_bytes = b'{"status": "interrupted"}'
         target.write_bytes(local_bytes)
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.pulled == []
         assert len(summary.failures) == 1
@@ -457,12 +597,12 @@ class TestPull:
         # also points the fetch at paths the artifact does not carry, so
         # only the metadata-consistency case names the field.
         record = _record()
-        metadata = run_record_metadata(record)
+        metadata = run_record_metadata(record, metadata_extras())
         metadata[field] = "claimed-by-metadata"
         root = write_artifact_root(tmp_path / "src", TASK, RUN_ID, record)
         artifact = FakeVersionedArtifact(root, metadata)
         runs_dir = tmp_path / "runs"
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.pulled == []
         assert len(summary.failures) == 1
@@ -483,7 +623,7 @@ class TestPull:
             return real_copy(src, target)
 
         monkeypatch.setattr(pull, "atomic_copy", fail_curves_copy)
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.pulled == []
         assert len(summary.failures) == 1
@@ -493,7 +633,7 @@ class TestPull:
     def test_check_reports_without_downloading(self, tmp_path):
         artifact = make_artifact(tmp_path, _record())
         runs_dir = tmp_path / "runs"
-        summaries = pull.pull([artifact], runs_dir, dry_run=True)
+        summaries = _do_pull([artifact], runs_dir, dry_run=True)
         summary = summaries[TIER]
         assert summary.would_pull == [RUN_ID]
         assert summary.pulled == []
@@ -503,7 +643,7 @@ class TestPull:
     def test_check_leaves_no_lock_file(self, tmp_path):
         artifact = make_artifact(tmp_path, _record())
         runs_dir = tmp_path / "runs"
-        pull.pull([artifact], runs_dir, dry_run=True)
+        _do_pull([artifact], runs_dir, dry_run=True)
         assert not (runs_dir / TASK / f"{RUN_ID}.lock").exists()
 
     def test_run_lock_held_by_training_fails_without_writing(self, tmp_path):
@@ -513,7 +653,7 @@ class TestPull:
         runs_dir = tmp_path / "runs"
         lock_path = runs_dir / TASK / f"{RUN_ID}.lock"
         with exclusive_lock(lock_path):
-            summaries = pull.pull([artifact], runs_dir)
+            summaries = _do_pull([artifact], runs_dir)
             summary = summaries[TIER]
             assert summary.pulled == []
             assert summary.failures == [(RUN_ID, "run lock held by another process")]
@@ -532,16 +672,14 @@ class TestPull:
             ),
         )
         runs_dir = tmp_path / "runs"
-        summaries = pull.pull(
-            [artifact_a, artifact_b], runs_dir, tier_filter=other_tier
-        )
+        summaries = _do_pull([artifact_a, artifact_b], runs_dir, tier_filter=other_tier)
         assert set(summaries) == {other_tier}
         assert summaries[other_tier].pulled == [artifact_b.metadata["run_id"]]
 
     def test_expected_counts_are_reported(self, tmp_path):
         artifact = make_artifact(tmp_path, _record())
         runs_dir = tmp_path / "runs"
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.expected == 60  # tier2_gates in the protocol
         assert summary.local_done == 1
@@ -550,11 +688,11 @@ class TestPull:
         # The metadata names the local target; a task such as ``../`` must
         # not escape runs_dir. The artifact is rejected before a path or
         # lock is built.
-        metadata = run_record_metadata(_record())
+        metadata = run_record_metadata(_record(), metadata_extras())
         metadata["task"] = "../../escape"
         artifact = FakeVersionedArtifact(tmp_path / "src", metadata)
         runs_dir = tmp_path / "runs"
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         summary = summaries[TIER]
         assert summary.pulled == []
         assert summary.failures == [
@@ -569,7 +707,7 @@ class TestPull:
         target = runs_dir / TASK / f"{RUN_ID}.json"
         target.parent.mkdir(parents=True)
         target.write_text(json.dumps(_record(hash_="local-hash")))
-        summaries = pull.pull([artifact], runs_dir)
+        summaries = _do_pull([artifact], runs_dir)
         report = pull.render_report(summaries, 1)
         assert "1 run_record artifacts on W&B" in report
         assert "local test_done: 1 / 60 expected" in report
@@ -582,7 +720,7 @@ class TestDefaults:
     """The --entity/--project defaults come from conf/config.yaml."""
 
     def test_defaults_from_config(self):
-        entity, project = pull.default_entity_project()
+        entity, project = default_entity_project()
         assert project == "MultistateGDN2"
         # The config's entity is empty (the personal default applies).
         assert entity is None

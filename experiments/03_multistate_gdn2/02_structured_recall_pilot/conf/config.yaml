@@ -1,0 +1,65 @@
+# =============================================================================
+# Structured-Recall Pilot Config
+# =============================================================================
+# Usage:
+#   python 01_train.py --config-name=test task=mqar          # tiny CPU smoke
+#   python 01_train.py task=mqar optimizer.lr=0.003          # one run
+#   python 01_train.py +sweep=<tier> --multirun              # a sweep tier
+#
+# The architecture and training choices live in the harness config (the
+# task names its harness via its own defaults); config.yaml holds only
+# what the pilots do not vary, and _self_ comes first so the task and
+# harness override it.
+# =============================================================================
+
+defaults:
+  - _self_
+  - task: mqar
+
+seed: 0
+
+experiment:
+  name: multistate_gdn2_structured_recall_pilot
+  phase: 1                 # 1 = calibration; >= 2 needs frozen_protocol.frozen
+  tier: null               # set by sweep configs, recorded in the run JSON
+
+optimizer:
+  lr: null   # null -> frozen_protocol.yaml (task, layout, gate_mode)
+
+training:
+  monitor_key: val/acc   # drives early stopping and the best-value track
+
+data:
+  num_workers: 2
+  num_val_per_slice: 1000
+  num_test_per_slice: 1000
+
+launch:
+  skip_completed: true
+  stop_file: STOP
+  shard_index: 0
+  num_shards: 1
+
+output:
+  runs_dir: ${hydra:runtime.cwd}/runs/${task.name}
+  save_final_checkpoint: false
+
+logging:
+  csv:
+    enabled: true
+    save_dir: ${output.runs_dir}/curves
+  wandb:
+    enabled: false
+    project: StructuredRecallGDN2
+    entity: null
+    upload_record: true
+    upload_checkpoint: false
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: "${hydra:job.num}"
+  job:
+    chdir: true

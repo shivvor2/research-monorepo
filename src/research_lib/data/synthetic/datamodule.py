@@ -48,19 +48,13 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-from .mqar import MQARConfig, generate_mqar
-from .overwrite import OverwriteConfig, generate_overwrite
+from .mqar import MQARConfig
+from .overwrite import OverwriteConfig
+from .registry import require_task
 
 logger = logging.getLogger(__name__)
 
 TaskConfig = MQARConfig | OverwriteConfig
-
-_GENERATORS = {
-    "mqar": generate_mqar,
-    "overwrite": generate_overwrite,
-}
-CONFIG_TYPES = {"mqar": MQARConfig, "overwrite": OverwriteConfig}
-TASKS = ("mqar", "overwrite")
 
 
 def _batch_seed(train_seed: int, index: int) -> int:
@@ -133,7 +127,7 @@ class _SyntheticTrainDataset(IterableDataset):
         DataModule's ``on_before_batch_transfer`` uses to track the stream
         position for any worker count.
         """
-        batch = _GENERATORS[self.task](
+        batch = require_task(self.task).generator(
             self.config,  # type: ignore[arg-type]
             num_examples=self.batch_size,
             seed=_batch_seed(self.train_seed, index),
@@ -199,18 +193,17 @@ def _generate_fixed_set(
     and runs / later re-evaluations stay comparable. Base seeds of the
     val/test/train streams must differ (enforced by the DataModule).
     """
-    generator = _GENERATORS[task]
+    spec = require_task(task)
+    generator = spec.generator
     parts = []
-    for slice_value in config.slices:  # type: ignore[attr-defined]
+    for slice_value in spec.slice_values(config):
         part_seed = int(
             np.random.SeedSequence([int(seed), int(slice_value)]).generate_state(
                 1, dtype=np.uint64
             )[0]
         )
-        if task == "mqar":
-            part = generator(config, num_per_slice, part_seed, num_kv_pairs=slice_value)  # type: ignore[arg-type, call-arg]
-        else:
-            part = generator(config, num_per_slice, part_seed, num_keys=slice_value)  # type: ignore[arg-type, call-arg]
+        kwargs = {spec.slice_kwarg: slice_value} if spec.slice_kwarg else {}
+        part = generator(config, num_per_slice, part_seed, **kwargs)  # type: ignore[arg-type, call-arg]
         parts.append(part)
     return {key: torch.cat([part[key] for part in parts], dim=0) for key in parts[0]}
 
@@ -283,9 +276,8 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         num_workers: int = 0,
     ) -> None:
         super().__init__()
-        if task not in TASKS:
-            raise ValueError(f"task must be one of {TASKS}, got {task!r}")
-        expected_type = CONFIG_TYPES[task]
+        spec = require_task(task)  # raises ValueError for an unknown task
+        expected_type = spec.config_type
         if not isinstance(task_config, expected_type):
             raise TypeError(
                 f"task {task!r} requires a {expected_type.__name__}, "

@@ -1,0 +1,65 @@
+# =============================================================================
+# Debug config: a handful of steps, brief enough to exercise the full
+# run path without a long run.
+# =============================================================================
+# Two canonical diagnostics:
+#   1. the layouts with the default gated-delta mixer, as a small
+#      multirun:
+#        python 01_train.py --config-name=debug --multirun task=mqar \
+#          model.layout=single,ws,ll
+#   2. one attention run (the positive control), single:
+#        python 01_train.py --config-name=debug task=mqar model.mixer=attention
+# Each job runs a few steps and writes one JSON.
+
+defaults:
+  - config
+
+experiment:
+  name: multistate_gdn2_structured_recall_pilot_debug
+  phase: 1
+  tier: debug
+
+task:
+  vocab_size: 64
+  seq_len: 32
+  max_seq_len: 32
+  num_kv_pairs: [2, 4]
+
+model:
+  d_model: 16
+  num_heads: 1
+  window: 4
+  gate_mode: full
+  layout: ws
+
+data:
+  num_workers: 0
+  num_val_per_slice: 16
+  num_test_per_slice: 16
+
+training:
+  batch_size: 32
+  max_steps: 4
+  val_check_interval: 4
+  log_every_n_steps: 1
+
+optimizer:
+  lr: 0.003
+  decay_scheme: grouped
+
+logging:
+  csv:
+    enabled: true
+    save_dir: logs/debug_csv
+  wandb:
+    enabled: false
+
+launch:
+  skip_completed: false
+
+hydra:
+  mode: MULTIRUN
+  sweep:
+    subdir: "${hydra.job.num}"
+  run:
+    dir: outputs/debug/${now:%Y-%m-%d}/${now:%H-%M-%S}

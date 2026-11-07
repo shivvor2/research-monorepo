@@ -64,15 +64,15 @@ from collections.abc import Sequence
 import torch
 
 from .mqar import IGNORE_INDEX
-from .overwrite import OverwriteClass
+from .overwrite import OVERWRITE_CLASSES
 
 logger = logging.getLogger(__name__)
 
-CLASS_NAMES: tuple[str, ...] = tuple(c.name.lower() for c in OverwriteClass)
+# The default class names: the overwrite placement classes, in class
+# order. :class:`RecallMetrics` takes ``class_names`` (defaulting to
+# these); the module-level alias keeps existing importers working.
+CLASS_NAMES: tuple[str, ...] = OVERWRITE_CLASSES
 """Metric key fragments per class code: ('same', 'adjacent', 'distant', 'single')."""
-
-_NO_CLASS_BUCKET = 4
-"""Column of the count tensor's class axis used when class metrics are off."""
 
 DEFAULT_DISTANCE_BINS: tuple[float, ...] = (0, 16, 32, 64, 128, 256, math.inf)
 """Default bin edges for the write-distance metrics: the token distance
@@ -134,6 +134,13 @@ class RecallMetrics:
             :meth:`compute`.
         with_classes: accumulate class-conditioned metrics. ``None``
             (default) auto-detects per batch from the ``key_class`` key.
+        class_names: the metric key fragments per class code, indexed by
+            the ``key_class`` code, with the no-class bucket (used when
+            class metrics are off) after the last class. Defaults to
+            :data:`OVERWRITE_CLASSES` (``same``, ``adjacent``,
+            ``distant``, ``single``), so every existing call site behaves
+            exactly as before; a task supplies its own names to key its
+            metrics by its own classes.
         distance_bins: bin edges for the write-distance metrics (the token
             distance between a key's two writes, from ``batch[
             "write_distance"]``, only overwritten keys), as half-open
@@ -162,6 +169,7 @@ class RecallMetrics:
         slice_values: Sequence[int],
         with_classes: bool | None = None,
         distance_bins: Sequence[float] | None = DEFAULT_DISTANCE_BINS,
+        class_names: Sequence[str] | None = None,
     ) -> None:
         values = tuple(slice_values)
         if not values:
@@ -171,8 +179,19 @@ class RecallMetrics:
         duplicates = sorted({v for v in values if values.count(v) > 1})
         if duplicates:
             raise ValueError(f"duplicate slice_values entries: {duplicates}")
+        names = tuple(class_names) if class_names is not None else OVERWRITE_CLASSES
+        if not names:
+            raise ValueError("class_names must be non-empty")
+        if any(not isinstance(n, str) or not n for n in names):
+            raise ValueError("class_names entries must be non-empty strings")
         self._slice_values = values
         self._num_slices = len(values)
+        self._class_names = names
+        self._num_classes = len(names)
+        # The count tensor's class axis: the classes plus the no-class
+        # bucket after the last class.
+        self._num_class_cols = self._num_classes + 1
+        self._no_class_col = self._num_classes
         self._with_classes = with_classes
         # slice VALUE -> row of the count tensor (-1 = unknown value).
         lookup = torch.full((max(values) + 1,), -1, dtype=torch.long)
@@ -194,9 +213,10 @@ class RecallMetrics:
 
     def reset(self) -> None:
         """Zero all counters."""
-        # One long tensor of shape (num_slices, 5, 3): axis 1 = the four
-        # placement classes + the "no class" bucket (class metrics off),
-        # axis 2 = (answers, correct, leaked). Created lazily on the device
+        # One long tensor of shape (num_slices, num_classes + 1, 3): the
+        # class axis is the task's classes plus the "no class" bucket
+        # (class metrics off), axis 2 = (answers, correct, leaked).
+        # Created lazily on the device
         # of the first update; the unknown-slice counter is a scalar.
         self._counts: torch.Tensor | None = None
         self._unknown: torch.Tensor | None = None
@@ -253,7 +273,9 @@ class RecallMetrics:
         device = preds.device
         if self._counts is None or self._unknown is None:
             self._counts = torch.zeros(
-                (self._num_slices, 5, 3), dtype=torch.long, device=device
+                (self._num_slices, self._num_class_cols, 3),
+                dtype=torch.long,
+                device=device,
             )
             self._unknown = torch.zeros((), dtype=torch.long, device=device)
         correct = (preds == targets) & mask
@@ -273,11 +295,11 @@ class RecallMetrics:
             key_pos = batch["key_class"].to(device)[:, 1:]
             # Garbage class codes at masked positions are harmless (zero
             # weight below); clamp keeps the combined index in range.
-            class_col = key_pos.clamp(min=0, max=_NO_CLASS_BUCKET)
+            class_col = key_pos.clamp(min=0, max=self._no_class_col)
             self._has_class_batches = True
         else:
             leak = torch.zeros_like(mask)
-            class_col = torch.full_like(targets, _NO_CLASS_BUCKET)
+            class_col = torch.full_like(targets, self._no_class_col)
 
         # Slice rows (-1 = a slice value not among slice_values; values
         # outside the lookup's range are forced unknown without a sync).
@@ -298,8 +320,8 @@ class RecallMetrics:
         # the three counters with index_add_ (sync-free; torch.bincount
         # synchronizes the CUDA stream).
         counted = mask & known
-        idx = (row_pos * 5 + class_col).reshape(-1)
-        flat = self._counts.view(-1)  # (num_slices * 5 * 3,) contiguous view
+        idx = (row_pos * self._num_class_cols + class_col).reshape(-1)
+        flat = self._counts.view(-1)  # (num_slices * num_class_cols * 3,)
         flat.index_add_(0, idx * 3 + 0, counted.reshape(-1).long())
         flat.index_add_(0, idx * 3 + 1, (correct & known).reshape(-1).long())
         flat.index_add_(0, idx * 3 + 2, (leak & known).reshape(-1).long())
@@ -526,21 +548,21 @@ class RecallMetrics:
             acc_n, _, _ = _ratio(stats)
             out[f"acc/slice={value}"] = acc_n
         if self._has_class_batches:
-            for c in range(len(CLASS_NAMES)):
+            for c in range(self._num_classes):
                 stats = counts[:, c, :].sum(dim=0)
                 if int(stats[0]) == 0:
                     continue
-                name = CLASS_NAMES[c]
+                name = self._class_names[c]
                 acc_c, leak_c, other_c = _ratio(stats)
                 out[f"acc/class={name}"] = acc_c
                 out[f"leak/class={name}"] = leak_c
                 out[f"other/class={name}"] = other_c
             for row, value in enumerate(self._slice_values):
-                for c in range(len(CLASS_NAMES)):
+                for c in range(self._num_classes):
                     stats = counts[row, c, :]
                     if int(stats[0]) == 0:
                         continue
-                    name = CLASS_NAMES[c]
+                    name = self._class_names[c]
                     acc_nc, leak_nc, other_nc = _ratio(stats)
                     out[f"acc/slice={value}/class={name}"] = acc_nc
                     out[f"leak/slice={value}/class={name}"] = leak_nc

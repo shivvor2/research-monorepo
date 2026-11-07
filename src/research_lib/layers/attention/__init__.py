@@ -1,3 +1,4 @@
+from .causal_self_attention import CausalSelfAttention
 from .gated_delta import (
     GatedDeltaReference,
     GateMode,
@@ -9,6 +10,7 @@ from .gated_delta import (
 from .rotatory_mha import RotaryMultiheadAttention
 
 __all__ = [
+    "CausalSelfAttention",
     "GateMode",
     "GatedDeltaReference",
     "Layout",

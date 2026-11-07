@@ -749,7 +749,7 @@ class TestIntegration:
     """End-to-end integration tests."""
 
     def build_mini_architecture(self):
-        """Build a minimal recurrent architecture per spec 8.1."""
+        """Build a minimal recurrent architecture for the stepping check."""
         dim = 64
         attention = SelfAttentionWrapper(
             nn.MultiheadAttention(dim, 2, batch_first=True)

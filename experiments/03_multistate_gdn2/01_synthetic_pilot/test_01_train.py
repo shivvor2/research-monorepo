@@ -27,9 +27,9 @@ import torch
 from lightning.pytorch.loggers import CSVLogger
 from lightning.pytorch.trainer.states import TrainerFn, TrainerStatus
 from omegaconf import OmegaConf
-from wandb_artifacts import artifact_name, run_record_metadata
 
 from research_lib.training.callbacks import RunSummaryCallback
+from research_lib.training.run_records import artifact_name, run_record_metadata
 from research_lib.utils.run_lock import exclusive_lock
 
 _SRC = Path(__file__).resolve().parents[3] / "src"
@@ -868,10 +868,12 @@ class TestPostFit:
             {"output": {"save_final_checkpoint": True, "runs_dir": str(runs_dir)}}
         )
 
+        import common.run_lifecycle
+
         def boom(*args, **kwargs):
             raise OSError("disk full")
 
-        monkeypatch.setattr(train, "atomic_torch_save", boom)
+        monkeypatch.setattr(common.run_lifecycle, "atomic_torch_save", boom)
         with pytest.raises(OSError, match="disk full"):
             train.post_fit(cfg, trainer, module, [cb], "ckpt")
         record = json.loads((runs_dir / "ckpt.json").read_text())
@@ -906,21 +908,33 @@ class TestStopRequested:
     def _cfg(self):
         return OmegaConf.create({"launch": {"stop_file": "STOP"}})
 
+    @staticmethod
+    def _launch(tmp_path):
+        import common.launch
+
+        return common.launch
+
     def test_no_stop_file(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            self._launch(tmp_path), "get_original_cwd", lambda: str(tmp_path)
+        )
         assert train.stop_requested(self._cfg()) is None
 
     def test_stop_file_found(self, tmp_path, monkeypatch):
         stop = tmp_path / "STOP"
         stop.touch()
-        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            self._launch(tmp_path), "get_original_cwd", lambda: str(tmp_path)
+        )
         assert train.stop_requested(self._cfg()) == stop
 
     def test_stop_file_elsewhere_is_not_seen(self, tmp_path, monkeypatch):
         other = tmp_path / "other"
         other.mkdir()
         (other / "STOP").touch()
-        monkeypatch.setattr(train, "get_original_cwd", lambda: str(tmp_path))
+        monkeypatch.setattr(
+            self._launch(tmp_path), "get_original_cwd", lambda: str(tmp_path)
+        )
         assert train.stop_requested(self._cfg()) is None
 
 
@@ -1138,7 +1152,7 @@ class TestCallbacksBeforeCurvesReset:
 
         cfg = _callbacks_cfg(runs_dir, curves_dir)
         with pytest.raises(FileExistsError, match="different run"):
-            train.create_callbacks_reset_curves(cfg, run_id, {})
+            train.create_callbacks_reset_curves(cfg, run_id, {}, lr=0.001)
         # The other run's curves were not deleted.
         assert (curves / "metrics.csv").read_text() == "step,acc\n0,0.0\n"
 
@@ -1159,7 +1173,7 @@ class TestCallbacksBeforeCurvesReset:
         )
         curves = self._curves(curves_dir, run_id)
 
-        callbacks = train.create_callbacks_reset_curves(cfg, run_id, {})
+        callbacks = train.create_callbacks_reset_curves(cfg, run_id, {}, lr=0.001)
         # The relaunch is a fresh run: the stale curves directory is gone.
         assert not curves.exists()
         assert any(isinstance(cb, RunSummaryCallback) for cb in callbacks)
@@ -1316,9 +1330,11 @@ class TestUploadRunRecordArtifact:
         artifact = fake.logged[0]
         assert artifact.name == artifact_name(_RUN_ID)
         assert artifact.type == "run_record"
-        assert artifact.metadata == run_record_metadata(
-            json.loads((runs_dir / f"{_RUN_ID}.json").read_text())
+        expected = run_record_metadata(
+            json.loads((runs_dir / f"{_RUN_ID}.json").read_text()),
+            {"task": "task.name", "tier": "experiment.tier"},
         )
+        assert artifact.metadata == expected
         assert artifact.files == [
             f"{_TASK}/{_RUN_ID}.json",
             f"{_TASK}/curves/{_RUN_ID}/metrics.csv",
@@ -1355,22 +1371,25 @@ class TestMainClosesWandbRun:
         fake.run = SimpleNamespace()
         monkeypatch.setitem(sys.modules, "wandb", fake)
         monkeypatch.setenv("WANDB_API_KEY", "test-key")
-        monkeypatch.setattr(train, "run_job", run_job)
         cfg = OmegaConf.create({"logging": {"wandb": {"enabled": True}}})
-        return fake, cfg
+        return fake, cfg, run_job
 
     def test_exit_code_1_when_the_job_raises(self, monkeypatch):
         def boom(cfg):
             raise RuntimeError("boom")
 
-        fake, cfg = self._call(monkeypatch, boom)
+        import common.run_lifecycle
+
+        fake, cfg, run_job = self._call(monkeypatch, boom)
         with pytest.raises(RuntimeError):
-            train._run_and_close(cfg)
+            common.run_lifecycle.run_and_close(cfg, run_job)
         assert fake.finished == [1]
 
     def test_exit_code_0_when_the_job_returns(self, monkeypatch):
-        fake, cfg = self._call(monkeypatch, lambda cfg: None)
-        train._run_and_close(cfg)
+        import common.run_lifecycle
+
+        fake, cfg, run_job = self._call(monkeypatch, lambda cfg: None)
+        common.run_lifecycle.run_and_close(cfg, run_job)
         assert fake.finished == [0]
 
 

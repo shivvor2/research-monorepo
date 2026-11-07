@@ -23,32 +23,63 @@ is resolved from the frozen LR table by (task, layout, gate_mode).
 
 Precision: fp32 throughout; ``torch.set_float32_matmul_precision`` is
 left at its default (TF32 would lower the reference layers' fp32 matmuls).
+
+The run's body is the shared project machinery
+(:mod:`common.run_lifecycle` for callbacks / loggers / post-fit / the W&B
+transport, :mod:`common.launch` for the head and the claim, and
+:mod:`common.harnesses` for the model). This file keeps the pilot's
+protocol: the frozen-LR resolution, the frozen-choice gate and the
+overwrite-width check.
 """
 
-import json
 import logging
-import shutil
 import sys
-from collections.abc import Generator
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, cast
 
 import hydra
 import lightning as L
 import torch
-from hydra.core.hydra_config import HydraConfig
-from hydra.utils import get_original_cwd
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
-from lightning.pytorch.loggers import CSVLogger, WandbLogger
-from lightning.pytorch.trainer.states import TrainerStatus
 from omegaconf import DictConfig, OmegaConf
+
+# The shared project package (common/) sits one level up; its modules
+# import research_lib and the pilot's own protocol, so the pilot adds the
+# project folder to ``sys.path`` the way it adds its own folder for
+# ``pilot_analysis``.
+_PROJECT = Path(__file__).resolve().parent.parent
+if str(_PROJECT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT))
+
+# The shared run machinery. The names imported here are the modules'
+# public surfaces; the pilot keeps only its protocol and run_job below.
+from common.harnesses import build_zoology  # noqa: E402
+from common.launch import job_num, stop_requested  # noqa: E402
+from common.layout import wandb_kwargs as wandb_logger_kwargs  # noqa: E402
+from common.run_id import HASH_EXCLUDE, make_run_id  # noqa: E402
+
+# Re-exports the tests and the module's callers rely on; the definitions
+# live in common / research_lib now, not here. Listed in __all__ so the
+# linter keeps them as intentional re-exports.
+from common.run_lifecycle import (  # noqa: E402; noqa: E402  (bulk re-exports)
+    VECTOR_TARGET_MODULES,
+    build_module,
+    create_callbacks_reset_curves,
+    create_loggers,
+    ensure_run_record_uploaded,
+    first_gated_delta,
+    per_slot_summary,
+    post_fit,
+    run_and_close,
+    run_summary_callback,
+    state_bytes_collector,
+    upload_init_kwargs,
+    upload_run_record_artifact,
+)
 
 # The protocol's tier names, one source of truth shared with the analysis
 # reports (pilot_analysis/protocol.py): a tier added there cannot
 # silently skip the frozen-choice gate, and a tier added here cannot
 # silently vanish from the analysis's expected-run counts.
-from pilot_analysis.protocol import (
+from pilot_analysis.protocol import (  # noqa: E402
     PROTOCOL_TIERS,
     TIER_ANCHORS,
     TIER_CALIB_DMODEL,
@@ -56,221 +87,52 @@ from pilot_analysis.protocol import (
     TIER_CALIB_LR_ANCHORS,
 )
 
-# The W&B run-record artifact contract, shared with 03_pull.py: the
-# artifact name, the metadata, and the paths inside the artifact.
-from wandb_artifacts import artifact_name, run_record_metadata
-
-# Library imports
-from research_lib.architectures.config import ZoologyLMConfig
-from research_lib.architectures.zoology_lm import ZoologyLM, zoology_mixers
-from research_lib.data.synthetic import (
+from research_lib.architectures.zoology_lm import ZoologyLM  # noqa: E402
+from research_lib.data.synthetic import (  # noqa: E402
     MQARConfig,
     OverwriteConfig,
     SyntheticRecallDataModule,
+    require_task,
 )
-from research_lib.layers.attention import MultistateGatedDelta
-from research_lib.training.callbacks import (
-    Collector,
-    LayerStatsCallback,
-    RunSummaryCallback,
-    Stage,
-    config_hash,
-    metrics_by_prefix,
-    param_counts,
+from research_lib.training.callbacks import config_hash  # noqa: E402
+from research_lib.training.run_control import claim_run  # noqa: E402
+from research_lib.training.run_control import assert_fit_finished
+from research_lib.training.run_control import (  # noqa: E402
+    disable_tf32 as set_precision_flags,
 )
-from research_lib.training.configs import ScheduleConfig
-from research_lib.training.modules import MGDN2SyntheticRecallModule
-from research_lib.training.presets import build_weight_decay_configs
-from research_lib.training.scheduling import WarmupStableDecaySchedule
-from research_lib.utils.io import atomic_torch_save
-from research_lib.utils.run_lock import exclusive_lock
+from research_lib.training.run_control import in_shard, should_skip
+from research_lib.training.run_records import run_record_metadata  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# Parameter targeting (weight-decay groups)
-# =============================================================================
-
-# Parameters routed to the VECTOR optimizer (AdamW, weight decay 0):
-# embeddings, the untied LM head, every norm weight, every bias, the
-# depthwise conv filters, the gated-delta decay parameters (A_log,
-# dt_bias) and every LambdaMixer parameter (weight decay would pull λ
-# away from its λ≡1 anchor). Everything else — the 2-D linear weights —
-# goes to the MATRIX optimizer (AdamW, weight decay 0.1).
-VECTOR_TARGET_MODULES: list[str] = [
-    "embedding",
-    "lm_head",
-    r".*norm.*",
-    "A_log",
-    "dt_bias",
-    "lambda_mixer",
-    "conv",
-    r".*\.bias$",
+# The names this module re-exports from common / research_lib, so the
+# linter treats them as public rather than unused.
+__all__ = [
+    "HASH_EXCLUDE",
+    "VECTOR_TARGET_MODULES",
+    "assert_fit_finished",
+    "build_model",
+    "build_module",
+    "claim_run",
+    "config_hash",
+    "create_callbacks_reset_curves",
+    "create_loggers",
+    "ensure_run_record_uploaded",
+    "in_shard",
+    "job_num",
+    "lr_source",
+    "make_run_id",
+    "post_fit",
+    "resolve_lr",
+    "run_summary_callback",
+    "set_precision_flags",
+    "run_record_metadata",
+    "should_skip",
+    "stop_requested",
+    "upload_init_kwargs",
+    "upload_run_record_artifact",
+    "wandb_logger_kwargs",
 ]
-
-TASK_CONFIGS = {"mqar": MQARConfig, "overwrite": OverwriteConfig}
-
-# =============================================================================
-# Run identity: config keys excluded from the hash
-# =============================================================================
-
-# Dotted config keys excluded from the run identity (config_hash). Each
-# one is safe because it cannot change a result:
-#   - output: runs_dir is an absolute path under the launch directory, so
-#     the same run launched from another directory or machine would get a
-#     different identity (and a record pulled from another machine would
-#     block a relaunch);
-#   - logging: logger settings (CSV/W&B on/off, save dirs) do not change
-#     the training stream or the metrics;
-#   - launch: execution controls (skip_completed, stop_file, shards) are
-#     operational, not experimental;
-#   - data.num_workers: the training stream is defined per
-#     (train_seed, batch index) independently of the worker count
-#     (SyntheticRecallDataModule docstring).
-HASH_EXCLUDE: tuple[str, ...] = ("output", "logging", "launch", "data.num_workers")
-
-
-def set_precision_flags() -> dict[str, bool]:
-    """fp32 without TF32: both PyTorch TF32 switches off.
-
-    ``torch.set_float32_matmul_precision`` is left untouched: the matmul
-    flag covers the reference layers' fp32 matmuls, and the cuDNN flag
-    covers BaseConv / the short convs, which run through cuDNN and
-    default to TF32 on.
-
-    Returns:
-        The values read back, for the run record's ``precision_flags``.
-    """
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
-    return {
-        "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
-        "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
-    }
-
-
-def assert_fit_finished(trainer: L.Trainer) -> None:
-    """Raise unless the fit ended normally.
-
-    With Lightning < 2.4, Ctrl-C made ``fit()`` return normally and the
-    script would test a half-trained model and record ``test_done``; the
-    lock pins >= 2.4, the guard keeps the invariant independent of that.
-    ``status == "test_done"`` means fit ended normally (max steps or
-    early stop) AND the test pass completed on the final weights.
-
-    Raises:
-        RuntimeError: Naming the status, if it is not ``FINISHED``.
-    """
-    if trainer.state.status != TrainerStatus.FINISHED:
-        raise RuntimeError(
-            f"fit() ended with trainer.state.status={trainer.state.status!r}, "
-            f"not FINISHED; the model is not fully trained, refusing to test"
-        )
-
-
-def job_num(cfg: DictConfig) -> int:
-    """The Hydra job number (0 when not in a multirun).
-
-    ``hydra.job.num`` is set only in a multirun; a single run has no job
-    number, and the shard round-robin treats it as job 0.
-    """
-    job = cast(Any, HydraConfig.get().job)  # a DictConfig at runtime
-    return int(OmegaConf.select(job, "num", default=0))
-
-
-def stop_requested(cfg: DictConfig) -> Path | None:
-    """The STOP file path if it exists in the launch directory.
-
-    The launch directory is the original working directory (the
-    directory the command was run from; with ``job.chdir`` the job's cwd
-    is the job dir, so the STOP file must live next to the launch
-    command, not in the job dir).
-    """
-    path = Path(get_original_cwd()) / str(cfg.launch.stop_file)
-    return path if path.exists() else None
-
-
-def in_shard(job_num: int, shard_index: int, num_shards: int) -> bool:
-    """Round-robin shard membership: job ``k`` runs only in the process
-    with ``shard_index == k % num_shards``.
-
-    All shards must be launched with the identical sweep command; the
-    round-robin keeps every shard moving along the sweep's priority order
-    (overwrite before mqar, seed-major).
-
-    Raises:
-        ValueError: If ``num_shards < 1`` or ``shard_index`` is outside
-            ``[0, num_shards)``.
-    """
-    if num_shards < 1:
-        raise ValueError(f"num_shards must be >= 1, got {num_shards}")
-    if not 0 <= shard_index < num_shards:
-        raise ValueError(
-            f"shard_index {shard_index} out of range for num_shards {num_shards}"
-        )
-    return job_num % num_shards == shard_index
-
-
-def should_skip(record_path: Path, identity: tuple[str, Any]) -> str | None:
-    """Skip reason for an existing run record, or ``None`` to run.
-
-    A record is done only when its status is ``test_done`` and its
-    ``(config_hash, seed)`` equals this run's identity. Any other record
-    falls through: a different identity is refused by
-    ``RunSummaryCallback`` as today; a non-done record is overwritten by
-    the re-run; a missing or unreadable record runs.
-    """
-    if not record_path.exists():
-        return None
-    try:
-        with open(record_path, encoding="utf-8") as f:
-            record = json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if record.get("status") != "test_done":
-        return None
-    if (record.get("config_hash"), record.get("seed")) != identity:
-        return None
-    return "already test_done"
-
-
-@contextmanager
-def claim_run(
-    lock_path: Path | str,
-    record_path: Path | str | None,
-    identity: tuple[str, Any],
-) -> Generator[str | None, None, None]:
-    """Acquire the run lock and decide whether to run.
-
-    Yields a skip reason (or ``None`` to run) while the lock is held:
-    the record is read only after this process owns the run, so a run
-    that another process just completed is skipped instead of re-run (a
-    check before the lock would race with a process that finishes
-    between the check and the lock). ``record_path=None`` skips the
-    record check (the run always proceeds once the lock is acquired).
-
-    Args:
-        lock_path: The per-run lock file.
-        record_path: The run's record file, or ``None`` when the skip
-            check does not apply (e.g. the smoke and debug configs).
-        identity: The run's ``(config_hash, seed)``.
-
-    Yields:
-        str | None: The skip reason, or ``None`` to run.
-    """
-    with exclusive_lock(lock_path) as acquired:
-        if not acquired:
-            yield "running in another process"
-            return
-        reason = None
-        if record_path is not None:
-            reason = should_skip(Path(record_path), identity)
-        yield reason
-
-
-# =============================================================================
-# Helpers
-# =============================================================================
 
 
 def load_frozen_protocol() -> DictConfig:
@@ -403,10 +265,8 @@ def check_overwrite_k(cfg: DictConfig, frozen: DictConfig) -> None:
     """Assert the overwrite task's largest K equals 2 * d_k.
 
     The primary endpoint is defined at K = 2 * d_k, so the task file must
-    match the model width: conf/task/overwrite.yaml at d_k = 16
-    (d_model = 32), conf/task/overwrite_dk32.yaml at d_k = 32
-    (d_model = 64). On a mismatch the error names the right task file
-    (from the frozen protocol's ``overwrite_task_by_d_model`` record).
+    match the model width. On a mismatch the error names the right task
+    file (from the frozen protocol's ``overwrite_task_by_d_model`` record).
 
     Raises:
         RuntimeError: If the largest key count does not equal 2 * d_k.
@@ -455,16 +315,7 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
     and tier-less runs are tooling, not protocol runs. The run's config
     stays the record: the frozen file is checked against it, never used as
     a second source that silently overrides the config. Each check applies
-    in every phase, but only once the frozen field is filled (so
-    ``calib_lr`` is checked against ``d_model`` as soon as
-    ``calib_dmodel`` has been recorded, before ``frozen: true``).
-
-    Exemptions: ``calib_dmodel`` (chooses the width) and
-    ``calib_lr_anchors`` / ``tier6_anchors`` (the anchors set their own
-    width) skip the ``d_model`` check; ``calib_harness`` skips the harness
-    checks. The anchors are NOT exempt from the harness: it is shared by
-    every tier, so the anchor numbers are read in the same harness as the
-    main grid.
+    in every phase, but only once the frozen field is filled.
 
     Raises:
         RuntimeError: Naming the key, the run's value, the frozen value
@@ -536,541 +387,10 @@ def slice_values(cfg: DictConfig) -> tuple[int, ...]:
 
 
 def build_model(cfg: DictConfig) -> ZoologyLM:
-    """Build the model: make_mixer from cfg.model, layout by zoology_mixers.
-
-    The Hydra config's keys and structure are unchanged; only this
-    Python that reads them is mixer-specific.
-    """
-    c = cfg.model
-    head_dim = c.head_dim
-    head_dim = int(head_dim) if head_dim is not None else c.d_model // c.num_heads
-
-    def make_mixer() -> MultistateGatedDelta:
-        return MultistateGatedDelta(
-            hidden_size=c.d_model,
-            num_heads=c.num_heads,
-            head_dim=head_dim,
-            expand_v=c.expand_v,
-            gate_mode=c.gate_mode,
-            layout=c.layout,
-            lambda_mode=c.lambda_mode,
-            window=c.window,
-            chunk_size=c.chunk_size,
-            t_max=c.t_max,
-            mode=c.mixer_mode,
-            output_gate_activation=c.output_gate_activation,
-        )
-
-    mixers = zoology_mixers(
-        n_layer=c.n_layer,
-        d_model=c.d_model,
-        make_mixer=make_mixer,
-        pattern=c.layer_pattern,
-        conv_kernel=c.base_conv_kernel,
-    )
-    model_config = ZoologyLMConfig(
-        vocab_size=c.vocab_size,
-        d_model=c.d_model,
-        state_mixer=c.state_mixer,
-        ff_mult=c.ff_mult,
-    )
-    return ZoologyLM(model_config, mixers)
-
-
-def build_module(
-    cfg: DictConfig, model: ZoologyLM, lr: float
-) -> MGDN2SyntheticRecallModule:
-    """The training module with the two AdamW weight-decay groups."""
-    matrix_optimizer_config, vector_optimizer_config = build_weight_decay_configs(
-        cfg.optimizer.decay_scheme,
-        weight_decay=cfg.optimizer.weight_decay,
-        betas=tuple(cfg.optimizer.betas),
-    )
-    # Cosine from the peak to 0 over max_steps, no warmup:
-    # the optimizer starts at lr=0 and the scheduler sets the peak for
-    # step 0 (the 02_pretrain.py convention).
-    schedule_config = ScheduleConfig(
-        global_schedules=[
-            WarmupStableDecaySchedule(
-                param_name="lr",
-                warmup_frac=0.0,
-                cooldown_frac=1.0,
-                min_value=0.0,
-                max_value=lr,
-                decay_type="cosine",
-            )
-        ]
-    )
-    return MGDN2SyntheticRecallModule(
-        model=model,
-        slice_values=slice_values(cfg),
-        with_classes=None,  # auto-detect (True for overwrite batches)
-        loss_on=cfg.training.loss_on,
-        answer_head=cfg.training.answer_head,
-        matrix_optimizer_config=matrix_optimizer_config,
-        vector_optimizer_config=vector_optimizer_config,
-        matrix_schedule_config=schedule_config,
-        vector_schedule_config=schedule_config,
-        vector_target_modules=VECTOR_TARGET_MODULES,
-        grad_clip_val=cfg.training.grad_clip_val,
-    )
-
-
-def make_run_id(cfg: DictConfig, lr: float) -> str:
-    run_id = (
-        f"{cfg.task.name}-{cfg.model.layout}-{cfg.model.gate_mode}"
-        f"-{cfg.model.lambda_mode}-d{cfg.model.d_model}-lr{lr:g}"
-    )
-    # Every non-default value that the base ID leaves out is part of the
-    # run's identity too: two runs that differ only in such a key would
-    # overwrite each other's run JSON and checkpoint.
-    scheme = str(cfg.optimizer.decay_scheme)
-    if scheme != "grouped":
-        run_id += f"-wd-{scheme}"
-    if str(cfg.model.layer_pattern) != "zoology":
-        run_id += f"-pat-{cfg.model.layer_pattern}"
-    if str(cfg.model.state_mixer) != "none":
-        run_id += f"-sm-{cfg.model.state_mixer}"
-    if float(cfg.model.expand_v) != 1.0:
-        run_id += f"-ev{cfg.model.expand_v:g}"
-    run_id += f"-s{cfg.seed}"
-    tier = cfg.experiment.get("tier", None)
-    if tier:
-        run_id = f"{tier}_{run_id}"
-    return run_id
-
-
-def first_gated_delta(model) -> MultistateGatedDelta | None:
-    """The first gated-delta mixer under ``model`` (``None`` if none)."""
-    return next(
-        (m for m in model.modules() if isinstance(m, MultistateGatedDelta)), None
-    )
-
-
-def state_bytes_collector(trainer, pl_module):
-    """Recurrent-state bytes of one gated-delta layer, in fp32."""
-    layer = first_gated_delta(pl_module.model)
-    return {} if layer is None else {"bytes_per_mixer": layer.state_bytes()}
-
-
-def per_slot_summary(key, value):
-    """Keep the pilot's mixer metric names: one entry per lambda slot."""
-
-    if key.startswith("lambda_"):
-        per_slot = value.float().mean(dim=0)  # average over heads -> (L,)
-        return {f"{key}/slot{slot}": float(v) for slot, v in enumerate(per_slot)}
-    return {key: float(value.float().mean())}
-
-
-def create_callbacks(
-    cfg: DictConfig, run_id: str, precision_flags: dict[str, bool]
-) -> list:
-    """Early stopping (99% answer accuracy), the run summary, LR logging."""
-    callbacks = [
-        EarlyStopping(
-            monitor="val/acc",
-            mode="max",
-            stopping_threshold=cfg.training.early_stop_threshold,
-            patience=10**9,
-        ),
-        RunSummaryCallback(
-            Path(cfg.output.runs_dir),
-            run_id,
-            OmegaConf.to_container(cfg, resolve=True),
-            # Distribution names of the packages this script imports.
-            packages=("torch", "lightning", "hydra-core", "omegaconf"),
-            monitor="val/acc",
-            mode="max",
-            # The run identity excludes operational keys (see HASH_EXCLUDE).
-            hash_exclude=HASH_EXCLUDE,
-            # The lockfile hash is part of the run's provenance: a tier
-            # that mixed lock versions would be visible.
-            provenance_files=("uv.lock",),
-            collectors=(
-                Collector(
-                    "metrics",
-                    lambda _trainer, _pl: {"acc": "per_sequence_mean"},
-                    Stage.FIT_START,
-                ),
-                Collector(
-                    "params",
-                    param_counts({"lambda": ["lambda_mixer"]}),
-                    Stage.FIT_START,
-                ),
-                Collector("state", state_bytes_collector, Stage.FIT_START),
-                Collector("val_final", metrics_by_prefix("val"), Stage.FIT_END),
-                Collector(
-                    "mixer_stats_final", metrics_by_prefix("mixer"), Stage.FIT_END
-                ),
-                Collector("test", metrics_by_prefix("test"), Stage.TEST_END),
-            ),
-            extra={
-                "lr_resolved": lr_resolved.get("value"),
-                # Also recorded via the config; kept top-level so analyses
-                # need not dig for it (one JSON per run, rsync-able).
-                "decay_scheme": str(cfg.optimizer.decay_scheme),
-                "precision_flags": precision_flags,
-                # Set by main() after the checkpoint is saved (before the
-                # test pass), so the test_done record names the file.
-                "final_checkpoint": None,
-            },
-        ),
-        LearningRateMonitor(logging_interval="step"),
-    ]
-    if bool(cfg.training.collect_mixer_stats):
-        callbacks.append(LayerStatsCallback(prefix="mixer", summarize=per_slot_summary))
-    return callbacks
-
-
-def create_callbacks_reset_curves(
-    cfg: DictConfig, run_id: str, precision_flags: dict[str, bool]
-) -> list:
-    """Build the callbacks (the run-identity check), then reset the curves.
-
-    The run-summary callback's constructor refuses a path that already
-    holds a **different** run's record, and that check must happen
-    before the stale curves directory is deleted: a relaunch that
-    edited a non-identity key (e.g. ``training.max_steps``) must be
-    refused with the recorded run's curves still in place, not refused
-    only after having destroyed them.
-
-    Args:
-        cfg: The resolved config (``output.runs_dir``, ``logging.csv.*``
-            and everything else ``create_callbacks`` reads).
-        run_id: The run ID (names the record and the curves directory).
-        precision_flags: Recorded in the run summary's ``extra``.
-
-    Returns:
-        The trainer callbacks. The loggers are created by the caller,
-    after this, so the CSV logger never appends to a stale
-    ``version_0`` directory.
-    """
-    callbacks = create_callbacks(cfg, run_id, precision_flags)
-    if bool(cfg.logging.csv.enabled):
-        curves_dir = Path(cfg.logging.csv.save_dir) / run_id
-        if curves_dir.exists():
-            shutil.rmtree(curves_dir)
-            logger.info("Removed stale curves directory %s", curves_dir)
-    return callbacks
-
-
-def run_summary_callback(callbacks: list) -> RunSummaryCallback | None:
-    """The run-summary callback among ``callbacks`` (``None`` if absent)."""
-    return next((cb for cb in callbacks if isinstance(cb, RunSummaryCallback)), None)
-
-
-def post_fit(
-    cfg: DictConfig,
-    trainer: L.Trainer,
-    module: L.LightningModule,
-    callbacks: list,
-    run_id: str,
-) -> None:
-    """The post-fit steps: the fit-finished guard and the optional final
-    checkpoint.
-
-    These run outside ``trainer.fit()`` / ``trainer.test()``, so
-    Lightning's ``on_exception`` never fires for them; a failure here is
-    recorded on the run summary (``status == "failed"``,
-    ``failed_stage == "fit"``) and re-raised.
-
-    Args:
-        cfg: The resolved config (``output.save_final_checkpoint``,
-            ``output.runs_dir``).
-        trainer: The fitted trainer (its ``state.status`` must be
-            ``FINISHED``).
-        module: The training module; its ``.model`` state dict is saved
-            as the final checkpoint.
-        callbacks: The trainer's callbacks (the run-summary callback is
-            updated on failure).
-        run_id: The run ID (names the checkpoint file).
-
-    Raises:
-        RuntimeError: If the fit did not end normally.
-        The exception raised by the checkpoint save, if any.
-    """
-    try:
-        # With Lightning < 2.4, Ctrl-C made fit() return normally and
-        # the script would test a half-trained model; the lock pins
-        # >= 2.4, the guard keeps the invariant independent of that.
-        # test_done means fit ended normally AND the test pass completed
-        # on the final weights.
-        assert_fit_finished(trainer)
-        # The final checkpoint for the mechanism probes: saved after fit
-        # and before test, atomically (the test pass must never run on
-        # weights that were not saved; a partial file must never be
-        # observed).
-        if cfg.output.save_final_checkpoint:
-            path = Path(cfg.output.runs_dir) / f"{run_id}.pt"
-            atomic_torch_save(module.model.state_dict(), path)
-            logger.info("Saved final checkpoint to %s", path)
-            summary_cb = run_summary_callback(callbacks)
-            if summary_cb is not None and summary_cb.extra is not None:
-                summary_cb.extra["final_checkpoint"] = path.name
-    except BaseException as exc:
-        summary_cb = run_summary_callback(callbacks)
-        if summary_cb is not None:
-            summary_cb.on_exception(trainer, module, exc)
-        raise
-
-
-# A tiny mutable holder so create_callbacks can record the resolved LR.
-lr_resolved: dict[str, float | None] = {"value": None}
-
-
-def wandb_logger_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
-    """The W&B logger keyword arguments of one run.
-
-    One W&B run per pilot run, named by the run ID (the run record's
-    name); the tier becomes the W&B group, the phase the job type, and
-    the experiment / task / model identity the tags, so the runs of
-    later experiments of the project stay apart inside the same W&B
-    project (the experiment name is the first tag). The resolved
-    config is passed to W&B for browsing.
-
-    Args:
-        cfg: The resolved configuration (``logging.wandb.*``,
-            ``experiment.*``, ``task.name``, ``model.*``).
-        run_id: The run ID (also the run record's file stem).
-
-    Returns:
-        The keyword arguments for ``lightning.pytorch.loggers.WandbLogger``.
-    """
-    tier = cfg.experiment.get("tier", None)
-    entity = cfg.logging.wandb.get("entity", None)
-    return {
-        "project": str(cfg.logging.wandb.project),
-        "entity": str(entity) if entity else None,
-        "name": run_id,
-        "group": str(tier) if tier else "none",
-        "job_type": f"phase{cfg.experiment.phase}",
-        "tags": [
-            str(cfg.experiment.name),
-            str(cfg.task.name),
-            str(cfg.model.layout),
-            str(cfg.model.gate_mode),
-            str(cfg.model.lambda_mode),
-            f"d{cfg.model.d_model}",
-        ],
-        "config": OmegaConf.to_container(cfg, resolve=True),
-        "save_dir": "logs/wandb",
-        "log_model": False,
-    }
-
-
-def upload_run_record_artifact(
-    cfg: DictConfig, run_id: str, is_global_zero: bool
-) -> None:
-    """Upload a completed run to W&B as a ``run_record`` artifact.
-
-    Runs only when W&B is enabled and ``logging.wandb.upload_record`` is
-    set, and only on the global-zero process (a non-zero rank under
-    ``devices="auto"`` has no live W&B run and would only log noise).
-    The artifact's paths are the 03_pull.py contract: the run JSON as
-    ``<task>/<run_id>.json``, the curves CSV as
-    ``<task>/curves/<run_id>/metrics.csv`` and, when
-    ``logging.wandb.upload_checkpoint`` is set and the final checkpoint
-    was saved, ``<task>/<run_id>.pt``. The metadata carries the run's
-    identity and provenance, so the pull script can decide skip /
-    conflict / download without fetching the artifact.
-
-    An upload failure is logged at ERROR level and does not fail the
-    run: the local record is already ``test_done``, and
-    ``03_pull.py --check`` reports what the canonical store still
-    misses. The job waits for the upload (``artifact.wait()``) so it
-    does not end before the artifact is complete.
-
-    Args:
-        cfg: The resolved configuration (``logging.wandb.*``,
-            ``output.runs_dir``, ``task.name``, ``logging.csv.save_dir``).
-        run_id: The run ID (also the run record's file stem).
-        is_global_zero: Whether this process is rank zero (the only one
-            with a live W&B run). The training call site passes
-            ``trainer.is_global_zero``; the re-upload path passes
-            ``True`` directly, with no Lightning trainer around.
-    """
-    if not bool(cfg.logging.wandb.enabled) or not bool(cfg.logging.wandb.upload_record):
-        return
-    if not is_global_zero:
-        return
-    try:
-        import wandb
-        from wandb import Artifact
-
-        record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
-        if not record_path.exists():
-            logger.error(
-                "run record %s not found; skipping the W&B artifact upload",
-                record_path,
-            )
-            return
-        with open(record_path, encoding="utf-8") as f:
-            record = json.load(f)
-        if record.get("status") != "test_done":
-            logger.error(
-                "run record %s has status %r, not test_done; skipping the W&B "
-                "artifact upload",
-                record_path,
-                record.get("status"),
-            )
-            return
-        if wandb.run is None:
-            logger.error("no live W&B run; skipping the artifact upload")
-            return
-        task = str(cfg.task.name)
-        artifact = Artifact(
-            artifact_name(run_id),
-            type="run_record",
-            metadata=run_record_metadata(record),
-        )
-        artifact.add_file(record_path, name=f"{task}/{run_id}.json")
-        curves = Path(cfg.logging.csv.save_dir) / run_id / "version_0" / "metrics.csv"
-        if curves.exists():
-            artifact.add_file(curves, name=f"{task}/curves/{run_id}/metrics.csv")
-        if bool(cfg.logging.wandb.upload_checkpoint):
-            checkpoint = Path(cfg.output.runs_dir) / f"{run_id}.pt"
-            if checkpoint.exists():
-                artifact.add_file(checkpoint, name=f"{task}/{run_id}.pt")
-        wandb.log_artifact(artifact)
-        artifact.wait()  # the job must not end before the upload completes
-        logger.info("Uploaded run record artifact %s", artifact_name(run_id))
-    except Exception as exc:  # an upload failure never fails a completed run
-        logger.error("W&B artifact upload failed for %s: %s", run_id, exc)
-
-
-def upload_init_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
-    """The ``wandb.init`` keyword arguments of a short re-upload run.
-
-    The same project / entity / name / group / tags as the training
-    logger (:func:`wandb_logger_kwargs`), but ``job_type="upload"``: a
-    relaunch that skips a finished run opens this short run to upload
-    the record that finished run missed. The keyword arguments only
-    ``WandbLogger`` understands are mapped or dropped for
-    ``wandb.init``: ``save_dir`` becomes ``dir`` (so the re-upload run
-    writes under ``logs/wandb`` like training does), and ``log_model``
-    is removed.
-    """
-    kwargs = dict(wandb_logger_kwargs(cfg, run_id))
-    kwargs["dir"] = kwargs.pop("save_dir")
-    kwargs.pop("log_model", None)
-    kwargs["job_type"] = "upload"
-    return kwargs
-
-
-def ensure_run_record_uploaded(cfg: DictConfig, run_id: str) -> None:
-    """Make sure a finished run's record reaches W&B as an artifact.
-
-    A relaunched sweep skips a run whose record is already ``test_done``
-    with the same identity, before a fresh job would have uploaded
-    anything, so if that run's upload failed when it finished it would
-    stay off W&B forever. This re-checks the ``run_record`` artifact:
-    when it is absent or carries a different ``(config_hash, seed)``, a
-    short W&B run (``job_type="upload"``) is opened and the record is
-    (re)uploaded. Any problem is logged at ERROR level and never fails
-    the job; a machine without W&B is untouched.
-
-    Args:
-        cfg: The resolved configuration.
-        run_id: The run ID (also the run record's file stem).
-    """
-    if not bool(cfg.logging.wandb.enabled) or not bool(cfg.logging.wandb.upload_record):
-        return
-    try:
-        import wandb
-
-        record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
-        with open(record_path, encoding="utf-8") as f:
-            record = json.load(f)
-        entity = cfg.logging.wandb.get("entity", None)
-        entity = str(entity) if entity else None
-        project = str(cfg.logging.wandb.project)
-        location = f"{entity}/{project}" if entity else project
-        target = f"{location}/{artifact_name(run_id)}:latest"
-        api = wandb.Api()
-        if api.artifact_exists(target):
-            artifact = api.artifact(target)
-            metadata = dict(artifact.metadata or {})
-            already = (metadata.get("config_hash"), metadata.get("seed")) == (
-                record.get("config_hash"),
-                record.get("seed"),
-            )
-            if already:
-                logger.info(
-                    "run record %s already on W&B; nothing to (re)upload", run_id
-                )
-                return
-        wandb.init(**upload_init_kwargs(cfg, run_id))
-        upload_run_record_artifact(cfg, run_id, is_global_zero=True)
-        wandb.finish()
-    except Exception as exc:  # a failed check/upload never fails a skipped job
-        logger.error("could not ensure run record %s is on W&B: %s", run_id, exc)
-
-
-def create_loggers(cfg: DictConfig, run_id: str) -> list | None:
-    """CSV (next to the run records) and optional W&B loggers.
-
-    The CSV logger writes under ``<save_dir>/<run_id>/version_0``, so the
-    curves of one run live next to its run JSON (``runs/<task>/curves/``
-    in the base config; the smoke and debug configs keep their own
-    ``save_dir``). The W&B logger gets one run per pilot run (see
-    :func:`wandb_logger_kwargs`); ``wandb.finish()`` closes it at the
-    end of the job (:func:`main`), so the next job of a Hydra multirun
-    starts its own run.
-    """
-    loggers = []
-    if cfg.logging.csv.enabled:
-        loggers.append(
-            CSVLogger(save_dir=cfg.logging.csv.save_dir, name=run_id, version=0)
-        )
-    if cfg.logging.wandb.enabled:
-        loggers.append(WandbLogger(**wandb_logger_kwargs(cfg, run_id)))
-    return loggers if loggers else None
-
-
-# =============================================================================
-# Main entry point
-# =============================================================================
-
-
-@hydra.main(version_base=None, config_path="conf", config_name="config")
-def main(cfg: DictConfig) -> None:
-    """Run one pilot training run; see :func:`_run_and_close`."""
-    _run_and_close(cfg)
-
-
-def _run_and_close(cfg: DictConfig) -> None:
-    """Check the W&B credentials, run one job, and close the W&B run.
-
-    W&B credentials are required before anything is built when W&B is
-    enabled, so a misconfigured rented machine fails fast. The W&B run
-    is closed after the job no matter how it ends: in a Hydra multirun
-    all jobs share one process, and a job that does not close its run
-    makes the next job reuse it (its log lines and curves land in the
-    first job's run). The exit code records the outcome on the run W&B
-    shows; a job that raised also propagates its exception.
-    """
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    if bool(cfg.logging.wandb.enabled):
-        # The repo-root .env is loaded by research_lib.utils.secrets at
-        # import; on a rented machine the key comes from the
-        # environment. Only W&B is needed here (no other service).
-        from research_lib.utils.secrets import check_auth
-
-        check_auth(["WANDB_API_KEY"])
-
-    error: BaseException | None = None
-    try:
-        run_job(cfg)
-    except BaseException as exc:
-        error = exc
-        raise
-    finally:
-        if bool(cfg.logging.wandb.enabled):
-            import wandb
-
-            if wandb.run is not None:
-                wandb.finish(exit_code=1 if error is not None else 0)
+    """Build the model: the shared Zoology harness with the gated-delta
+    mixer (the first pilot's config has no ``model.mixer`` key, so the
+    harness defaults to gated-delta; the identity hash is unchanged)."""
+    return build_zoology(cfg)
 
 
 def run_job(cfg: DictConfig) -> None:
@@ -1079,10 +399,7 @@ def run_job(cfg: DictConfig) -> None:
     Wrapped by :func:`main`, which checks the W&B credentials first and
     closes the W&B run afterwards.
     """
-    # 0. Precision first: fp32 without TF32. The cuDNN
-    # switch defaults to on, and BaseConv / the short convs run through
-    # cuDNN; the matmul switch covers the reference layers' fp32 matmuls.
-    # torch.set_float32_matmul_precision is left untouched.
+    # 0. Precision first: fp32 without TF32.
     precision_flags = set_precision_flags()
     logger.info("Precision flags: %s", precision_flags)
 
@@ -1132,7 +449,6 @@ def run_job(cfg: DictConfig) -> None:
 
     # 2. Learning rate.
     lr = resolve_lr(cfg, frozen)
-    lr_resolved["value"] = lr
     logger.info("Peak learning rate: %g", lr)
 
     # 3. The ll slot count depends on t_max: it must cover the task.
@@ -1151,14 +467,10 @@ def run_job(cfg: DictConfig) -> None:
     run_id = make_run_id(cfg, lr)
 
     # 5. Claim the run: acquire the lock, then decide. The record is
-    # read only while this process owns the run, so a run that another
-    # process just completed is skipped instead of re-run (a check before
-    # the lock would race with a process that finishes between the check
-    # and the lock). The lock file of a completed run already exists, so
-    # taking the lock for a run that is then skipped costs nothing. The
-    # skip applies to protocol tiers only (the smoke and debug configs
-    # always run); a different identity is refused by RunSummaryCallback,
-    # a non-done record is overwritten by the re-run.
+    # read only while this process owns the run. The skip applies to
+    # protocol tiers only (the smoke and debug configs always run); a
+    # different identity is refused by RunSummaryCallback, a non-done
+    # record is overwritten by the re-run.
     lock_path = Path(cfg.output.runs_dir) / f"{run_id}.lock"
     record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
     identity = (
@@ -1181,19 +493,11 @@ def run_job(cfg: DictConfig) -> None:
             return
 
         # 6. Callbacks first, then the curves reset, then the loggers.
-        # The run-summary callback's constructor refuses a record of a
-        # different run under this run ID, so it is built before the
-        # stale curves directory is deleted (a refused relaunch must not
-        # destroy the recorded run's curves); the loggers are created
-        # only after the reset, because the CSV logger appends to an
-        # existing version_0 directory.
-        callbacks = create_callbacks_reset_curves(cfg, run_id, precision_flags)
+        callbacks = create_callbacks_reset_curves(cfg, run_id, precision_flags, lr=lr)
         loggers = create_loggers(cfg, run_id)
 
-        # 8. Seeds: the run seed fixes init AND the training stream.
+        # 8. Seeds. 9. Data. 10. Model + training module.
         L.seed_everything(cfg.seed)
-
-        # 9. Data.
         datamodule = SyntheticRecallDataModule(
             task=str(cfg.task.name),
             task_config=build_task_config(cfg),
@@ -1205,12 +509,10 @@ def run_job(cfg: DictConfig) -> None:
             test_seed=cfg.task.test_seed,
             num_workers=cfg.data.num_workers,
         )
-
-        # 10. Model + training module.
         model = build_model(cfg)
         if cfg.training.compile:
             model = torch.compile(model)
-        module = build_module(cfg, model, lr)
+        module = common_run_lifecycle_build_module(cfg, model, lr)
         num_params = sum(p.numel() for p in model.parameters())
         gd_layer = first_gated_delta(model)
         state_bytes = gd_layer.state_bytes() if gd_layer is not None else 0
@@ -1237,23 +539,35 @@ def run_job(cfg: DictConfig) -> None:
         trainer.fit(module, datamodule=datamodule)
 
         # 12. Post-fit steps: the fit-finished guard and the optional
-        # final checkpoint. These run outside trainer.fit()/trainer.test(),
-        # so Lightning's on_exception never fires for them; post_fit
-        # records a failure on the run summary (status "failed",
-        # failed_stage "fit") and re-raises.
+        # final checkpoint.
         post_fit(cfg, trainer, module, callbacks, run_id)
 
         # 13. Test on the final weights; the callback updates the run JSON.
         trainer.test(module, datamodule=datamodule)
 
-        # 14. W&B artifact (rented machines): the completed run's
-        # record, curve and optionally its checkpoint go to W&B, where
-        # 03_pull.py picks them up for the canonical store. The upload
-        # waits for completion but never fails the run (the local
-        # record is already test_done).
+        # 14. W&B artifact (rented machines).
         upload_run_record_artifact(cfg, run_id, trainer.is_global_zero)
 
         logger.info("Run complete (run_id=%s).", run_id)
+
+
+def common_run_lifecycle_build_module(cfg, model, lr):
+    """Build the training module via the shared lifecycle (with the
+    task's class names and the default monitor key)."""
+    return build_module(
+        cfg,
+        model,
+        lr,
+        slice_values(cfg),
+        monitor_key="val/acc",
+        class_names=require_task(str(cfg.task.name)).class_names,
+    )
+
+
+@hydra.main(version_base=None, config_path="conf", config_name="config")
+def main(cfg: DictConfig) -> None:
+    """Run one pilot training run; see :func:`run_and_close`."""
+    run_and_close(cfg, run_job)
 
 
 if __name__ == "__main__":
