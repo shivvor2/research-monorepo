@@ -48,13 +48,14 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
+from .entity_field import EntityFieldConfig
 from .mqar import MQARConfig
 from .overwrite import OverwriteConfig
 from .registry import require_task
 
 logger = logging.getLogger(__name__)
 
-TaskConfig = MQARConfig | OverwriteConfig
+TaskConfig = MQARConfig | OverwriteConfig | EntityFieldConfig
 
 
 def _batch_seed(train_seed: int, index: int) -> int:
@@ -202,7 +203,18 @@ def _generate_fixed_set(
                 1, dtype=np.uint64
             )[0]
         )
-        kwargs = {spec.slice_kwarg: slice_value} if spec.slice_kwarg else {}
+        if spec.slice_kwarg is None:
+            kwargs = {}
+        else:
+            # A slice value can be a derived quantity (entity-field's
+            # ``N = E * M``); the fixed generator argument comes from the
+            # spec's optional mapper (identity by default).
+            arg = (
+                spec.slice_arg_of(slice_value, config)  # type: ignore[misc]
+                if spec.slice_arg_of is not None
+                else slice_value
+            )
+            kwargs = {spec.slice_kwarg: arg}
         part = generator(config, num_per_slice, part_seed, **kwargs)  # type: ignore[arg-type, call-arg]
         parts.append(part)
     return {key: torch.cat([part[key] for part in parts], dim=0) for key in parts[0]}
