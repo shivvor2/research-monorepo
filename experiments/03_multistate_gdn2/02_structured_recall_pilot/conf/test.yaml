@@ -13,11 +13,22 @@ experiment:
   phase: 1
   tier: smoke
 
+# Task overrides: each task's builder keeps only its own config fields,
+# so the smoke can run any registered task (mqar ignores the
+# entity-field keys and vice versa). The entity-field numbers keep every
+# slice feasible at seq_len=64 (N + U <= slots, >= distant_min_blocks + 1
+# blocks, enough entity ids and values).
 task:
-  vocab_size: 64
-  seq_len: 32
-  max_seq_len: 32
+  vocab_size: 128
+  seq_len: 64
+  max_seq_len: 64
   num_kv_pairs: [2, 4]
+  num_fields: 2
+  num_entities: [2, 4]
+  update_fraction: 0.75
+  block_size: 8
+  distant_min_blocks: 2
+  reserved_filler: 2
 
 model:
   d_model: 16

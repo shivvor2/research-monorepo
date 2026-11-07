@@ -21,6 +21,24 @@ python 01_train.py --config-name=debug --multirun \
 python 01_train.py --config-name=debug task=mqar model.mixer=attention
 ```
 
+## Tasks
+
+Each task adds its own generator, config and sweeps.
+
+### Entity–field
+
+The entity–field task stores `E` entities, each holding `M` fields, so
+`N = E * M` bindings. A share of the entities is updated: one of their
+fields is written twice (`v_old`, then `v_new ≠ v_old`). The query is the
+multi-query `[e, f, answer]` recall of Zoology (Arora et al., 2023): given an
+entity and a field, recall the latest value. What it tests: an update must
+erase the stale `(e, f) → v_old` binding without disturbing the updated
+entity's *other* fields, whose keys share the entity's code. The screening
+class is the **sibling** — a non-updated pair of an updated entity written
+before the update — and its damage reading (`untouched − sibling` accuracy)
+is what the erase should keep to zero. Same-scale slices read as the
+overwrite task's `K` (`N = E * M` in {8, 16, 32}).
+
 ## Screening workflow
 
 1. Single-state calibration (per task, layout, gate) — read the `full − kda`

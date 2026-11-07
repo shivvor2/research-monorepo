@@ -255,6 +255,61 @@ class TestCalibration:
         assert att["mean_best_value"] == pytest.approx(0.985)
 
 
+class TestCalibrationDamage:
+    HIGH = "test/acc/class=untouched"
+    LOW = "test/acc/class=sibling"
+
+    @pytest.fixture
+    def damage_protocol(self, protocol, monkeypatch):
+        monkeypatch.setattr(
+            protocol,
+            "TASK_DAMAGE_PAIRS",
+            {"toy": (self.HIGH, self.LOW)},
+        )
+        return protocol
+
+    def test_damage_column_at_the_selected_point(self, tmp_path, damage_protocol):
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"f{seed}",
+                    gate="full",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.9,
+                    step=10,
+                    **{METRIC: 0.95, self.HIGH: 0.9, self.LOW: 0.7},
+                )
+            )
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["selected_lr"] == pytest.approx(0.01)
+        # damage = mean(untouched - sibling) at the gate's selected point.
+        assert full["damage"] == pytest.approx(0.2)
+
+    def test_no_damage_pair_means_no_damage_column(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "f100",
+                gate="full",
+                lr=0.01,
+                seed=100,
+                best=0.9,
+                step=10,
+                **{METRIC: 0.95},
+            )
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        assert "damage" not in df.columns
+
+
 class TestPositiveControl:
     def test_known_gap_over_seeds(self, tmp_path, protocol):
         rows = [
@@ -303,6 +358,56 @@ class TestPositiveControl:
         assert df["mean_gap"].iloc[0] == pytest.approx(0.2)
         assert df["mean_high"].iloc[0] == pytest.approx(0.65)
         assert df["mean_low"].iloc[0] == pytest.approx(0.45)
+
+    def test_damage_columns_per_gate(self, tmp_path, protocol, monkeypatch):
+        HIGH = "test/acc/class=untouched"
+        LOW = "test/acc/class=sibling"
+        monkeypatch.setattr(protocol, "TASK_DAMAGE_PAIRS", {"toy": (HIGH, LOW)})
+        rows = [
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6, HIGH: 0.9, LOW: 0.7},
+            ),
+            _row(
+                "p1",
+                gate="full",
+                seed=1,
+                tier=TOY_CONTROL,
+                best=0.7,
+                step=5,
+                **{METRIC: 0.7, HIGH: 0.95, LOW: 0.65},
+            ),
+            _row(
+                "p2",
+                gate="kda",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.4,
+                step=5,
+                **{METRIC: 0.4, HIGH: 0.8, LOW: 0.7},
+            ),
+            _row(
+                "p3",
+                gate="kda",
+                seed=1,
+                tier=TOY_CONTROL,
+                best=0.5,
+                step=5,
+                **{METRIC: 0.5, HIGH: 0.82, LOW: 0.7},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out)
+        df = pd.read_csv(out / "positive_control.csv")
+        assert df["damage_full"].iloc[0] == pytest.approx(0.25)
+        assert df["damage_kda"].iloc[0] == pytest.approx(0.11)
+        assert "damage_full" in df.columns
 
     def test_duplicate_seed_rows_raise_naming_runs(self, tmp_path, protocol):
         rows = [
