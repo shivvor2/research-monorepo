@@ -14,9 +14,11 @@ task and harness configs, and its calibration and tier sweeps.
 # A tiny CPU smoke run (writes a run JSON under runs/<task>/):
 python 01_train.py --config-name=test task=mqar
 
-# The debug grid: once per layout and per mixer:
+# The debug layouts with the default gated-delta mixer:
 python 01_train.py --config-name=debug --multirun \
-  model.layout=single,ws,ll model.mixer=gated_delta,attention
+  task=mqar model.layout=single,ws,ll
+# One attention control run:
+python 01_train.py --config-name=debug task=mqar model.mixer=attention
 ```
 
 ## Screening workflow

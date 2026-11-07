@@ -5,8 +5,9 @@ Usage:
     python 01_train.py --config-name=test task=mqar        # tiny CPU smoke
     python 01_train.py task=mqar optimizer.lr=0.003         # one run
     python 01_train.py --config-name=debug --multirun \
-        model.layout=single,ws,ll,ws \
-        model.mixer=gated_delta,gated_delta,gated_delta,attention
+        task=mqar model.layout=single,ws,ll                # the layouts, default mixer
+    python 01_train.py --config-name=debug task=mqar \
+        model.mixer=attention                              # one attention control run
 
 One process = one run = one JSON under ``runs/<task>/<run_id>.json``.
 The task is a config group whose file names its harness via ``defaults``;
