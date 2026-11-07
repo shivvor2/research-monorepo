@@ -15,7 +15,7 @@ from __future__ import annotations
 import inspect
 from typing import Any
 
-from omegaconf import DictConfig
+from omegaconf import DictConfig, ListConfig, OmegaConf
 
 # Dotted config keys excluded from the run identity (config_hash). Each
 # one is safe because it cannot change a result:
@@ -50,7 +50,16 @@ def _cfg_value(cfg: Any, dotted: str) -> Any:
 
 
 def _join(value: Any) -> str:
-    """One run-ID fragment for a value: sequences dot-joined, else str."""
+    """One run-ID fragment for a value: sequences dot-joined, else str.
+
+    The fragment may only carry ``[A-Za-z0-9._-]`` (it names the run's
+    artifact), so a list of numbers becomes ``2.4``, not ``[2, 4]``.
+    """
+    value = (
+        OmegaConf.to_container(value, resolve=True)
+        if isinstance(value, (DictConfig, ListConfig))
+        else value
+    )
     if isinstance(value, (tuple, list)) and value:
         return ".".join(str(item) for item in value)
     return str(value)

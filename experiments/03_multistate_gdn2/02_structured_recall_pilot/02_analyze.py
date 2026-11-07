@@ -71,22 +71,22 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
             }
         )
     df = pd.DataFrame(rows)
-    if not df.empty:
-        metric = _protocol.SCREENING_CELLS.get(df["task"].iloc[0])
-        cells = (
-            table[table["layout"] == "single"][["task", "layout", "gate_mode", metric]]
-            if metric and metric in table
-            else pd.DataFrame()
-        )
-        if metric and metric in table:
-            cells = table[["task", "layout", "gate_mode", metric]].dropna(
-                subset=[metric]
-            )
-            gap = gap_column(cells, metric)
-            cells["gap_full_kda"] = gap.reindex(cells.index).values
-        (out_dir / "calibration.csv").write_text(
-            df.to_csv(index=False), encoding="utf-8"
-        )
+    # The gap column (full - kda, single-state, per the screening cell).
+    partners = []
+    for task, metric in _protocol.SCREENING_CELLS.items():
+        if metric not in table:
+            continue
+        cells = table[table["task"] == task][
+            ["layout", "gate_mode", "seed", metric]
+        ].copy()
+        cells["task"] = task
+        gap = gap_column(cells, metric)
+        cells["gap_full_kda"] = gap.reindex(cells.index).values
+        partners.append(cells[["task", "layout", "gate_mode", metric, "gap_full_kda"]])
+    if partners:
+        gaps = pd.concat(partners, ignore_index=True).dropna(subset=["gap_full_kda"])
+        df = pd.concat([df, gaps], ignore_index=True) if not df.empty else gaps
+    (out_dir / "calibration.csv").write_text(df.to_csv(index=False), encoding="utf-8")
 
 
 def _lr_of(best: pd.Series, group: pd.DataFrame) -> float | None:
