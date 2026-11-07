@@ -20,7 +20,7 @@ truth for every experimental setting.
 | folder | experiment |
 |---|---|
 | [`01_synthetic_pilot/`](01_synthetic_pilot/README.md) | MQAR + repeated-key overwrite pilot: calibration, then the Δ_int grid (tiers 1–6) and the long-T tier |
-| [`02_structured_recall_pilot/`](02_structured_recall_pilot/README.md) | new synthetic recall tasks run through the shared machinery; the task PRs add the entity–field and MAD fuzzy tasks |
+| [`02_structured_recall_pilot/`](02_structured_recall_pilot/README.md) | runs new synthetic recall tasks through the shared machinery (currently MQAR structured recall) |
 
 ## Shared project package
 

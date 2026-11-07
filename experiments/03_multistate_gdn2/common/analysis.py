@@ -214,16 +214,17 @@ def missing_runs(
         ``missing``, ``known``.
     """
     tiers = list(expected_counts)
-    if "tier" in table.columns:
+    present = (
+        set(table["tier"].dropna().astype(str)) if "tier" in table.columns else set()
+    )
+    if "tier" in table.columns and "status" in table.columns:
         observed = (
             table[table["status"].fillna("").astype(str) == done_status]
             .groupby("tier")["run_id"]
             .nunique()
         )
-        present = set(table["tier"].dropna().astype(str))
     else:
         observed = pd.Series(dtype=int)
-        present = set()
     # Tiers present in the runs but not declared expected: report them.
     for tier in sorted(present - set(tiers)):
         tiers.append(tier)

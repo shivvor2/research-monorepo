@@ -9,6 +9,13 @@ loaded run table; ``02_analyze.py`` is the command-line entry point
 that writes each report's tables (CSV) and section (markdown).
 
 The registry order is the summary order.
+
+This package is self-contained and predates ``common.analysis``. It
+keeps its own loader and report code so the first pilot's reports stay
+reproducible as published; the loader still reads the pre-change
+pooled-accuracy records through its two repairs. New pilots build their
+reports on ``common.analysis`` and
+``research_lib.training.record_table.load_records``.
 """
 
 from pilot_analysis.base import Report, ReportFn, ReportOptions
