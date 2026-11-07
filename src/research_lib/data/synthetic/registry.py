@@ -8,6 +8,7 @@ this registry instead of an ``if task == ...`` ladder, so a new task is
 added here once. The slice values of a config always come from its
 ``slices`` property, per the config convention.
 """
+
 from __future__ import annotations
 
 import logging
@@ -40,6 +41,7 @@ class TaskSpec:
     config_type: type
     generator: Callable[..., dict[str, Any]]
     slice_kwarg: str | None = None
+    class_names: tuple[str, ...] | None = None
 
     def slice_values(self, config: Any) -> tuple[int, ...]:
         """The task's slice values from a config (via ``config.slices``)."""
@@ -55,9 +57,15 @@ def _mqar_spec():
 
 
 def _overwrite_spec():
-    from .overwrite import OverwriteConfig, generate_overwrite
+    from .overwrite import OVERWRITE_CLASSES, OverwriteConfig, generate_overwrite
 
-    return TaskSpec("overwrite", OverwriteConfig, generate_overwrite, slice_kwarg="num_keys")
+    return TaskSpec(
+        "overwrite",
+        OverwriteConfig,
+        generate_overwrite,
+        slice_kwarg="num_keys",
+        class_names=OVERWRITE_CLASSES,
+    )
 
 
 TASKS: dict[str, TaskSpec] = {

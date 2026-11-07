@@ -37,10 +37,14 @@ LAMBDA_MODES: tuple[str, ...] = ("mlp", "static", "lin")
 # --------------------------------------------------------------------------- #
 
 TIER_NONE = "none"
-"""The group name for tier-less runs (e.g. the smoke config)."""
+"""The group name for a tier-less run (e.g. the smoke config)."""
 
-DEFAULT_SEED_RANGE = range(10)
-"""The default per-cell seeds of a tier, 0-9."""
+
+def group_name(value) -> str:
+    """The group name of an unset value: ``TIER_NONE`` for a null or empty
+    tier. The one place a missing group becomes ``"none"``; metadata,
+    records and the W&B group all go through it, so they agree."""
+    return str(value) if value else TIER_NONE
 
 
 def tier_of_config(config: dict) -> str:
@@ -50,13 +54,12 @@ def tier_of_config(config: dict) -> str:
         config: A resolved config dict (``experiment.tier``).
 
     Returns:
-        The tier name, or ``TIER_NONE`` when absent or empty.
+        The tier name, normalised through :func:`group_name`.
     """
-    tier = ((config.get("experiment") or {}).get("tier")) or TIER_NONE
-    return str(tier) if tier else TIER_NONE
+    return group_name((config.get("experiment") or {}).get("tier"))
 
 
 def group_of_metadata(metadata: dict) -> str:
-    """The group of an artifact's metadata: its tier (``TIER_NONE`` when
-    unset)."""
-    return str(metadata.get("tier")) if metadata.get("tier") else TIER_NONE
+    """The group of an artifact's metadata: its tier, normalised through
+    :func:`group_name`."""
+    return group_name(metadata.get("tier"))

@@ -50,19 +50,11 @@ from torch.utils.data import DataLoader, Dataset, IterableDataset
 
 from .mqar import MQARConfig
 from .overwrite import OverwriteConfig
-from .registry import TASKS, config_types, generators, require_task
+from .registry import require_task
 
 logger = logging.getLogger(__name__)
 
 TaskConfig = MQARConfig | OverwriteConfig
-
-# Backwards-compatible aliases for existing call sites; the registry in
-# :mod:`research_lib.data.synthetic.registry` is the single source of
-# truth (each task is registered once with its config type, generator
-# and slice convention).
-_GENERATORS = generators()
-CONFIG_TYPES = config_types()
-TASKS = tuple(sorted(TASKS))
 
 
 def _batch_seed(train_seed: int, index: int) -> int:
@@ -135,7 +127,7 @@ class _SyntheticTrainDataset(IterableDataset):
         DataModule's ``on_before_batch_transfer`` uses to track the stream
         position for any worker count.
         """
-        batch = _GENERATORS[self.task](
+        batch = require_task(self.task).generator(
             self.config,  # type: ignore[arg-type]
             num_examples=self.batch_size,
             seed=_batch_seed(self.train_seed, index),
@@ -284,9 +276,8 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         num_workers: int = 0,
     ) -> None:
         super().__init__()
-        if task not in TASKS:
-            raise ValueError(f"task must be one of {TASKS}, got {task!r}")
-        expected_type = CONFIG_TYPES[task]
+        spec = require_task(task)  # raises ValueError for an unknown task
+        expected_type = spec.config_type
         if not isinstance(task_config, expected_type):
             raise TypeError(
                 f"task {task!r} requires a {expected_type.__name__}, "

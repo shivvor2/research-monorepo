@@ -16,7 +16,17 @@ same way they add the library's ``src``; its ``conftest.py`` does the
 same for pytest.
 """
 
-from . import analysis, layout, launch, protocol, pull, records, registries, run_id
+from . import (
+    analysis,
+    launch,
+    layout,
+    protocol,
+    pull,
+    records,
+    registries,
+    run_id,
+    run_lifecycle,
+)
 
 __all__ = [
     "analysis",
@@ -27,4 +37,5 @@ __all__ = [
     "records",
     "registries",
     "run_id",
+    "run_lifecycle",
 ]

@@ -10,6 +10,7 @@ convention, the identity-extraction pieces the general pull needs, the
 metadata extras (``task``, ``tier``), and the mapping from our Hydra
 config to :func:`research_lib.training.wandb_transport.wandb_logger_kwargs`.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -19,7 +20,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from research_lib.training.wandb_transport import wandb_logger_kwargs
 
-from .protocol import TIER_NONE, group_of_metadata, tier_of_config
+from .protocol import TIER_NONE, group_name, tier_of_config
 
 
 class ProjectLayout:
@@ -68,9 +69,8 @@ LAYOUT = ProjectLayout()
 
 
 def group_of(metadata: Mapping[str, Any]) -> str:
-    """The group of an artifact's metadata: its tier (``TIER_NONE`` when
-    unset)."""
-    return group_of_metadata(dict(metadata))
+    """The group of an artifact's metadata: its tier, normalised."""
+    return group_name(metadata.get("tier"))
 
 
 def metadata_extras() -> dict[str, str]:
@@ -80,7 +80,8 @@ def metadata_extras() -> dict[str, str]:
 
 def metadata_identity_fields() -> dict[str, Any]:
     """The identity fields :func:`staged_record_problem` checks, each a
-    ``{metadata_key: record_extractor}`` entry."""
+    ``{metadata_key: record_extractor}`` entry (the tier is normalised
+    through :func:`common.protocol.group_name`, matching the metadata)."""
     return {
         "run_id": lambda record: record.get("run_id"),
         "config_hash": lambda record: record.get("config_hash"),
@@ -93,11 +94,27 @@ def metadata_identity_fields() -> dict[str, Any]:
 
 
 def group_of_record(record: Mapping[str, Any]) -> str:
-    """The group of a run record: its tier from its config (``TIER_NONE``
-    when unset)."""
+    """The group of a run record: its tier from its config, normalised."""
     config = record.get("config") or {}
-    tier = (config.get("experiment") or {}).get("tier")
-    return str(tier) if tier else TIER_NONE
+    return tier_of_config(config)
+
+
+def record_metadata(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The artifact metadata of a run record, with the group fields
+    normalised (the tier through :func:`common.protocol.group_name`).
+
+    Args:
+        record: The parsed run JSON.
+
+    Returns:
+        The metadata dict for a ``run_record`` artifact.
+    """
+    from research_lib.training.run_records import run_record_metadata
+
+    metadata = run_record_metadata(record, metadata_extras())
+    if "tier" in metadata:
+        metadata["tier"] = group_name(metadata.get("tier"))
+    return metadata
 
 
 def wandb_kwargs(cfg: DictConfig, run_id: str) -> dict[str, Any]:
@@ -143,16 +160,18 @@ def record_files(cfg: DictConfig, run_id: str) -> list[tuple[Path, str]]:
     """The ``(local_path, artifact_relative_name)`` files of one run's
     record artifact (the record, its curve and, when saved, its
     checkpoint)."""
+    from research_lib.training.run_control import RUN_DONE_STATUS
     from research_lib.training.run_records import read_record
 
     metadata = {"task": str(cfg.task.name), "run_id": run_id}
     files: list[tuple[Path, str]] = []
     record_path = Path(cfg.output.runs_dir) / f"{run_id}.json"
-    if record_path.exists() and ((read_record(record_path) or {}).get("status") == "test_done"):
+    if (
+        read_record(record_path) is not None
+        and (read_record(record_path) or {}).get("status") == RUN_DONE_STATUS
+    ):
         files.append((record_path, LAYOUT.record_path(metadata)))
-    curves = (
-        Path(cfg.logging.csv.save_dir) / run_id / "version_0" / "metrics.csv"
-    )
+    curves = Path(cfg.logging.csv.save_dir) / run_id / "version_0" / "metrics.csv"
     if curves.exists():
         files.append((curves, LAYOUT.curve_path(metadata)))
     if bool(cfg.logging.wandb.upload_checkpoint):

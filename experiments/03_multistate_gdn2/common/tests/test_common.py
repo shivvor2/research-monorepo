@@ -8,17 +8,12 @@ Run with: pytest experiments/03_multistate_gdn2/common/tests/test_common.py -v
 
 import pandas as pd
 import pytest
-from omegaconf import OmegaConf
-
 from common.analysis import delta_int_table, gap_column, paired_gap_report
 from common.registries import config_type_of_task, require_harness
 from common.run_id import make_run_id
-from research_lib.data.synthetic import (
-    MQARConfig,
-    OverwriteConfig,
-    require_task,
-)
-from research_lib.data.synthetic.datamodule import CONFIG_TYPES, _GENERATORS
+from omegaconf import OmegaConf
+
+from research_lib.data.synthetic import MQARConfig, OverwriteConfig, require_task
 
 
 def _cfg(*, reserved_filler=0, tier=None):
@@ -62,15 +57,20 @@ class TestRunIdTaskKeys:
 
 
 class TestRegistries:
-    def test_config_types_match_the_general_registry(self):
+    def test_config_types_come_from_the_general_registry(self):
         for name in ("mqar", "overwrite"):
-            assert config_type_of_task(name) is CONFIG_TYPES[name]
+            assert config_type_of_task(name) is require_task(name).config_type
         assert config_type_of_task("overwrite") is OverwriteConfig
         assert config_type_of_task("mqar") is MQARConfig
 
-    def test_generators_resolve_through_the_general_registry(self):
-        for name in ("mqar", "overwrite"):
-            assert require_task(name).generator is _GENERATORS[name]
+    def test_task_spec_carries_class_names(self):
+        assert require_task("overwrite").class_names == (
+            "same",
+            "adjacent",
+            "distant",
+            "single",
+        )
+        assert require_task("mqar").class_names is None
 
     def test_unknown_task_raises(self):
         with pytest.raises(ValueError):

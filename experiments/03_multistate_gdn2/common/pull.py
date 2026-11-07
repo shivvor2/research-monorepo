@@ -7,6 +7,7 @@ artifacts and runs the general :func:`research_lib.training.run_records.pull`
 with this project's :class:`~...common.layout.ProjectLayout` and tier
 grouping, reporting per tier. A pilot passes its expected counts.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -24,7 +25,7 @@ from research_lib.training.run_records import (
     render_report,
 )
 
-from .layout import LAYOUT, group_of, metadata_identity_fields
+from .layout import LAYOUT, group_of, group_of_record, metadata_identity_fields
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +44,10 @@ def default_entity_project(
         leaves it empty (the API key's default entity then applies).
     """
     conf_config_path = conf_config_path or (
-        Path(__file__).resolve().parent.parent / "01_synthetic_pilot" / "conf" / "config.yaml"
+        Path(__file__).resolve().parent.parent
+        / "01_synthetic_pilot"
+        / "conf"
+        / "config.yaml"
     )
     wandb_conf = OmegaConf.select(
         OmegaConf.load(conf_config_path), "logging.wandb", default={}
@@ -137,6 +141,7 @@ def main(
         LAYOUT,
         metadata_identity_fields(),
         group_of=group_of,
+        group_of_record=group_of_record,
         expected_counts=expected_counts,
         include_checkpoints=args.include_checkpoints,
         dry_run=args.check,
