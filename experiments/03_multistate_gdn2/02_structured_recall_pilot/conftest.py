@@ -3,6 +3,7 @@
 launch directory: the project folder (for ``common``), the pilot folder
 (for ``structured_recall_analysis``) and the repository's ``src`` (for
 ``research_lib``)."""
+
 import sys
 from pathlib import Path
 

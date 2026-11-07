@@ -2,6 +2,7 @@
 common package's tests, the same way the pilots' scripts and their
 conftests do: the project folder (for ``common``) and the repository's
 ``src`` (for ``research_lib``)."""
+
 import sys
 from pathlib import Path
 

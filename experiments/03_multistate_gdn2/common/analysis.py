@@ -14,6 +14,7 @@ them into the report-level readings: a gap column at a gate pair, a
 paired gap over seeds with a bootstrap CI, and Δ_int tables over an
 arbitrary layout list.
 """
+
 from __future__ import annotations
 
 import pandas as pd
