@@ -42,6 +42,41 @@ def _cfg(*, reserved_filler=0, tier=None):
     )
 
 
+def _ef_cfg(**task_overrides):
+    """A default entity-field config (the real task config's values)."""
+    task = {
+        "name": "entity_field",
+        "vocab_size": 8192,
+        "seq_len": 256,
+        "num_fields": 4,
+        "num_entities": [2, 4, 8],
+        "update_fraction": 0.75,
+        "placement_probs": [0.3333333333, 0.3333333333, 0.3333333334],
+        "block_size": 16,
+        "distant_min_blocks": 4,
+        "reserved_filler": 512,
+        "max_placement_attempts": 100,
+    }
+    task.update(task_overrides)
+    return OmegaConf.create(
+        {
+            "task": task,
+            "model": {
+                "layout": "single",
+                "gate_mode": "full",
+                "lambda_mode": "mlp",
+                "d_model": 32,
+                "layer_pattern": "zoology",
+                "state_mixer": "none",
+                "expand_v": 1.0,
+            },
+            "optimizer": {"decay_scheme": "grouped"},
+            "experiment": {"tier": None},
+            "seed": 0,
+        }
+    )
+
+
 class TestRunIdTaskKeys:
     def test_off_reproduce_same_id_for_task_key_difference(self):
         a = make_run_id(_cfg(reserved_filler=0), 0.003, include_task_keys=False)
@@ -71,6 +106,20 @@ class TestRunIdTaskKeys:
         run_id = make_run_id(cfg, 0.003, include_task_keys=True)
         assert "-mix-attention" in run_id
         assert "-h-mad" in run_id
+
+    def test_default_entity_field_config_has_no_task_suffix(self):
+        # A YAML decimal that rounds the default (1/3) and a ListConfig
+        # that equals the dataclass tuple are not changes.
+        run_id = make_run_id(_ef_cfg(), 0.003, include_task_keys=True)
+        assert "placement_probs" not in run_id
+        assert "num_entities" not in run_id
+        assert run_id == "entity_field-single-full-mlp-d32-lr0.003-s0"
+
+    def test_changed_update_fraction_adds_a_suffix(self):
+        run_id = make_run_id(
+            _ef_cfg(update_fraction=0.5), 0.003, include_task_keys=True
+        )
+        assert "-update_fraction-0.5" in run_id
 
 
 class TestRegistries:

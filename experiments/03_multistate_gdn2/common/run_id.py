@@ -13,6 +13,7 @@ the first pilot's builder exactly.
 from __future__ import annotations
 
 import inspect
+import math
 from typing import Any
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -65,6 +66,38 @@ def _join(value: Any) -> str:
     return str(value)
 
 
+def _normalize(value: Any) -> Any:
+    """A comparable form of a config value: containers become tuples
+    (recursively), everything else is unchanged."""
+    value = (
+        OmegaConf.to_container(value, resolve=True)
+        if isinstance(value, (DictConfig, ListConfig))
+        else value
+    )
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalize(item) for item in value)
+    return value
+
+
+def _values_differ(value: Any, default: Any) -> bool:
+    """Whether a configured task value differs from its dataclass default.
+
+    Containers are compared as tuples (a Hydra ``ListConfig`` and the
+    dataclass's tuple are the same value), and floats with a relative
+    tolerance so a YAML decimal that rounds the default (e.g. ``1/3``)
+    does not count as a change.
+    """
+    a = _normalize(value)
+    b = _normalize(default)
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        if len(a) != len(b):
+            return True
+        return any(_values_differ(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return not math.isclose(a, b, rel_tol=1e-9)
+    return a != b
+
+
 def _task_suffixes(cfg: DictConfig) -> list[str]:
     """The non-default task-config fields of this run's task.
 
@@ -92,7 +125,7 @@ def _task_suffixes(cfg: DictConfig) -> list[str]:
             continue
         value = _cfg_value(cfg, f"task.{leaf}")
         try:
-            differs = value != default
+            differs = _values_differ(value, default)
         except (ValueError, TypeError):
             differs = False
         if value is not None and differs:
