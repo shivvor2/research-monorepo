@@ -15,12 +15,14 @@ Reports
     single-state the screening cell at each gate's selected LR with the
     ``full - kda`` gap. Attention runs get their own row per
     (task, layout) — they have no gate. A ``frozen_protocol_snippet.yaml``
-    is written from the single-state selection.
+    is written from the grouped-decay selection.
 ``positive_control``
     The paired ``full - kda`` gap on each task's screening cell,
-    single-state gated-delta runs in the tier-1 tier, over the selection
-    seeds, with a percentile bootstrap CI. A duplicated (task, seed) row
-    after filtering raises naming the run IDs.
+    single-state gated-delta runs in the tier it declares, across the
+    tier-1 seeds (no seed filter), with a percentile bootstrap CI. A
+    duplicated (task, seed) row after filtering raises naming the run
+    IDs. A task with a screening cell but no tiers entry is skipped with
+    a log line.
 ``completeness``
     Per tier, expected vs observed done runs, plus tiers with runs but no
     expected count (via ``common.analysis.missing_runs``).
@@ -56,12 +58,19 @@ from common.records import flatten  # noqa: E402
 from structured_recall_analysis import protocol as _protocol  # noqa: E402
 
 from research_lib.training.record_table import load_records  # noqa: E402
+from research_lib.training.run_control import RUN_DONE_STATUS  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
 
 def _load(runs_dir: Path) -> pd.DataFrame:
-    return load_records(runs_dir, flatten)
+    table = load_records(runs_dir, flatten)
+    if table.empty:
+        # No finished records: still carry the schema ``flatten`` produces
+        # so the reports (column access, ``.get``) behave like on an
+        # empty-but-typed table instead of raising ``AttributeError``.
+        return pd.DataFrame(columns=list(flatten({}).keys()))
+    return table
 
 
 def _gated(table: pd.DataFrame) -> pd.DataFrame:
@@ -70,7 +79,7 @@ def _gated(table: pd.DataFrame) -> pd.DataFrame:
 
 def _selection(table: pd.DataFrame) -> pd.DataFrame:
     return table[
-        (table["status"].fillna("").astype(str) == "test_done")
+        (table["status"].fillna("").astype(str) == RUN_DONE_STATUS)
         & table["best_value"].notna()
         & table["tier"].isin(_protocol.CALIBRATION_TIERS)
         & table["seed"].isin(_protocol.SELECTION_SEEDS)
@@ -243,31 +252,58 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
 
 
 def _frozen_snippet(rows: list[dict], out_dir: Path) -> None:
-    """A frozen-protocol LR-table snippet from the single-state selection.
+    """A frozen-protocol LR-table snippet from the grouped-decay selection.
 
-    The gated-delta LRs come from the single-state gated-delta rows at
-    the harness's configured decay scheme (``grouped``) only, so a cell
-    never holds two LRs; the attention LR is the first attention reading
-    per task. A skeleton the calibration step can grow into the full
-    ``lr_table``.
+    The gated-delta LRs come from the ``grouped``-decay rows, single and
+    multi-state, in the shape :func:`run._frozen_lr` reads:
+    ``lr_table.<task>.gated_delta.<layout>.<gate>``. The attention rate
+    comes only from ``grouped``-decay attention rows and is a single
+    flat value per task; a task with more than one such row (attention
+    runs at different ``model.layout`` values) is an error rather than a
+    silently-picked first. A skeleton the calibration step can grow into
+    the full ``lr_table``.
     """
-    single = [r for r in rows if r.get("kind") == "single"]
-    single = [r for r in single if r.get("decay_scheme") == "grouped"]
-    attention = [r for r in rows if r.get("kind") == "attention"]
+    gated = [
+        r
+        for r in rows
+        if r.get("kind") in ("single", "multi")
+        and r.get("decay_scheme") == "grouped"
+        and r.get("selected_lr") is not None
+    ]
+    attention = [
+        r
+        for r in rows
+        if r.get("kind") == "attention"
+        and r.get("decay_scheme") == "grouped"
+        and r.get("selected_lr") is not None
+    ]
     lines = ["lr_table:"]
-    tasks = sorted({r["task"] for r in single} | {r["task"] for r in attention})
+    tasks = sorted({r["task"] for r in gated} | {r["task"] for r in attention})
     for task in tasks:
         lines.append(f"  {task}:")
-        gd = [r for r in single if r["task"] == task and r.get("selected_lr")]
-        if gd:
+        by_layout: dict[str, dict[str, float]] = {}
+        for r in gated:
+            if r["task"] != task:
+                continue
+            layout = r.get("layout") or "single"
+            by_layout.setdefault(layout, {})[r["gate_mode"]] = r["selected_lr"]
+        if by_layout:
             lines.append("    gated_delta:")
-            by_gate = {r["gate_mode"]: r["selected_lr"] for r in gd}
-            lines.append("      single:")
-            for gate in ("full", "kda"):
-                if gate in by_gate:
-                    lines.append(f"        {gate}: {by_gate[gate]:g}")
-        attn = [r for r in attention if r["task"] == task and r.get("selected_lr")]
-        if attn:
+            for layout in sorted(by_layout):
+                lines.append(f"      {layout}:")
+                for gate in ("full", "kda"):
+                    if gate in by_layout[layout]:
+                        lines.append(f"        {gate}: {by_layout[layout][gate]:g}")
+        attn = [r for r in attention if r["task"] == task]
+        if len(attn) > 1:
+            raise RuntimeError(
+                "task %s has more than one grouped attention reading (attention "
+                "runs at different model.layout values): %s; refusing to pick "
+                "the first",
+                task,
+                sorted({r.get("layout") for r in attn}),
+            )
+        if len(attn) == 1:
             lines.append(f"    attention: {attn[0]['selected_lr']:g}")
     (out_dir / "frozen_protocol_snippet.yaml").write_text(
         "".join(line + "\n" for line in lines), encoding="utf-8"
@@ -275,37 +311,37 @@ def _frozen_snippet(rows: list[dict], out_dir: Path) -> None:
 
 
 def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
-    """The paired gap over seeds on each task's screening cell, single-state
-    gated-delta runs in the tier-1 tier."""
-    subset = table[
-        (table["tier"] == _protocol.POSITIVE_CONTROL_TIER)
-        & (table["layout"] == "single")
+    """The paired gap on each task's screening cell, single-state
+    gated-delta runs in the tier the task declares."""
+    base = table[
+        (table["layout"] == "single")
         & (table["mixer"].fillna("gated_delta") == "gated_delta")
     ]
-    if subset.empty:
-        (out_dir / "positive_control.csv").write_text(
-            pd.DataFrame().to_csv(index=False), encoding="utf-8"
-        )
-        return
-    dup = subset.groupby(["task", "seed", "gate_mode"])["run_id"].nunique()
-    dup = dup[dup > 1]
-    if not dup.empty:
-        run_ids = subset[
-            subset.set_index(["task", "seed", "gate_mode"]).index.isin(dup.index)
-        ]["run_id"].tolist()
-        raise RuntimeError(
-            "positive control has duplicate (task, seed) rows; refusing to drop "
-            f"them silently. Runs: {sorted(set(run_ids))}"
-        )
     rows = []
     for task, metric in _protocol.SCREENING_CELLS.items():
-        if metric not in subset:
+        tiers = _protocol.TASK_TIERS.get(task)
+        if tiers is None:
+            logger.info("skipping positive control for %s: no TASK_TIERS entry", task)
             continue
-        by_task = subset[(subset["task"] == task) & subset[metric].notna()]
+        by_task = base[
+            (base["task"] == task)
+            & (base["tier"] == tiers.positive_control)
+            & base[metric].notna()
+        ]
+        dup = by_task.groupby(["seed", "gate_mode"])["run_id"].nunique()
+        dup = dup[dup > 1]
+        if not dup.empty:
+            run_ids = by_task[
+                by_task.set_index(["seed", "gate_mode"]).index.isin(dup.index)
+            ]["run_id"].tolist()
+            raise RuntimeError(
+                "positive control has duplicate (task, seed) rows; refusing to "
+                f"drop them silently. Runs: {sorted(set(run_ids))}"
+            )
         report = paired_gap_report(by_task, metric)
         report.insert(0, "task", task)
         report.insert(1, "metric", metric)
-        report["tier"] = _protocol.POSITIVE_CONTROL_TIER
+        report["tier"] = tiers.positive_control
         rows.append(report)
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     (out_dir / "positive_control.csv").write_text(
