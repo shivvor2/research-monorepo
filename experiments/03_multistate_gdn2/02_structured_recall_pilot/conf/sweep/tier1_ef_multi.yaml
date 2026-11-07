@@ -1,0 +1,18 @@
+# @package _global_
+# Entity-field tier 1, multi-state: layout {ws, ll} x gate {kda, full}
+# x seeds 0-9 at the frozen rates, 40 runs. Runs only after the
+# positive control passes. Seed-major order, as in the first pilot.
+# Run: python 01_train.py +sweep=tier1_ef_multi --multirun
+
+experiment:
+  phase: 2
+  tier: tier1_ef_multi
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: entity_field
+      seed: range(0,10)
+      model.gate_mode: kda,full
+      model.layout: ws,ll

@@ -1,0 +1,24 @@
+# =============================================================================
+# Entity-field task config for the structured-recall pilot.
+# =============================================================================
+# E entities each holding M fields, a share of them updated once; the
+# screening class is the sibling (a non-updated pair of an updated entity
+# written before the update). The vocab size is defined here, once (the
+# harness reads ${task.vocab_size}).
+
+defaults:
+  - /harness: zoology
+
+name: entity_field
+vocab_size: 8192
+seq_len: 256
+num_fields: 4
+num_entities: [2, 4, 8]
+update_fraction: 0.75
+placement_probs: [0.3333333333, 0.3333333333, 0.3333333334]
+block_size: 16
+distant_min_blocks: 4
+reserved_filler: 512
+max_seq_len: 256
+val_seed: 1000003
+test_seed: 2000003

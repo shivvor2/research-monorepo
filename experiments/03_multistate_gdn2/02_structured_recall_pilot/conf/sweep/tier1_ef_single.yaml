@@ -1,0 +1,19 @@
+# @package _global_
+# Entity-field tier 1, single-state: gate {kda, full} x seeds 0-9 at the
+# frozen rates, 20 runs. The positive-control tier: the paired
+# full - kda gap on the sibling screening cell. Requires phase 2
+# (frozen protocol). Seed-major order, as in the first pilot.
+# Run: python 01_train.py +sweep=tier1_ef_single --multirun
+
+experiment:
+  phase: 2
+  tier: tier1_ef_single
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: entity_field
+      seed: range(0,10)
+      model.gate_mode: kda,full
+      model.layout: single

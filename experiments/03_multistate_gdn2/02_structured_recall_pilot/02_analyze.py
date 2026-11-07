@@ -23,6 +23,11 @@ Reports
     duplicated (task, seed) row after filtering raises naming the run
     IDs. A task with a screening cell but no tiers entry is skipped with
     a log line.
+
+Tasks that declare a damage pair in the protocol get a ``damage`` column
+(``calibration``, at each gate's selected point) and per-gate
+``damage_full`` / ``damage_kda`` columns (``positive_control``): the
+mean of the high metric minus the low metric over the cell's runs.
 ``completeness``
     Per tier, expected vs observed done runs, plus tiers with runs but no
     expected count (via ``common.analysis.missing_runs``).
@@ -114,6 +119,29 @@ def _cell_mean(grp: pd.DataFrame, metric: str, lr: float) -> float | None:
     return float(sub.mean()) if len(sub) else None
 
 
+def _damage_at(grp: pd.DataFrame, task: str, lr: float) -> float | None:
+    """The task's damage reading at ``lr``: the mean of ``high - low``
+    over the runs where both columns are present (per protocol).
+
+    Args:
+        grp: The gated-delta runs of one (task, layout, gate) cell.
+        task: The task name (looks up the high/low pair in the protocol).
+        lr: The selected learning rate.
+
+    Returns:
+        The mean per-run ``high - low`` difference, or ``None`` when the
+        task has no damage pair or no run measured both columns.
+    """
+    pair = _protocol.TASK_DAMAGE_PAIRS.get(task)
+    if pair is None:
+        return None
+    high, low = pair
+    sub = grp[(grp["lr"] == lr) & grp[high].notna() & grp[low].notna()]
+    if sub.empty:
+        return None
+    return float((sub[high] - sub[low]).mean())
+
+
 def calibration(table: pd.DataFrame, out_dir: Path) -> None:
     """The LR reading (and the single-state gap on the screening cell).
 
@@ -168,6 +196,8 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 "cell": cell,
             }
             gaps[gate] = cell
+            if task in _protocol.TASK_DAMAGE_PAIRS:
+                row["damage"] = _damage_at(by_gate, task, chosen)
             rows.append(row)
         # Attach the full - kda gap to the single-state rows of this cell.
         if (
@@ -323,6 +353,14 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
         if tiers is None:
             logger.info("skipping positive control for %s: no TASK_TIERS entry", task)
             continue
+        if metric not in base.columns:
+            logger.info(
+                "skipping positive control for %s: screening cell %r not "
+                "in the run table",
+                task,
+                metric,
+            )
+            continue
         by_task = base[
             (base["task"] == task)
             & (base["tier"] == tiers.positive_control)
@@ -342,6 +380,20 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
         report.insert(0, "task", task)
         report.insert(1, "metric", metric)
         report["tier"] = tiers.positive_control
+        # The task's damage reading per gate (the mean ``high - low`` over
+        # the tier's runs, when the task declares a damage pair).
+        pair = _protocol.TASK_DAMAGE_PAIRS.get(task)
+        if pair is not None:
+            high, low = pair
+            for gate in ("full", "kda"):
+                sub = by_task[
+                    (by_task["gate_mode"] == gate)
+                    & by_task[high].notna()
+                    & by_task[low].notna()
+                ]
+                report[f"damage_{gate}"] = (
+                    float((sub[high] - sub[low]).mean()) if not sub.empty else None
+                )
         rows.append(report)
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     (out_dir / "positive_control.csv").write_text(

@@ -1,0 +1,21 @@
+# @package _global_
+# Entity-field calibration, multi-state: layout {ws, ll} x gate {kda,
+# full} x LR {1e-3, 3e-3, 1e-2} x selection seeds {100, 101}, 24 short
+# runs. Runs only after a go reading off the calib_ef_single gap
+# column. Per config, pick the LR with the best validation accuracy on
+# seeds 100-101.
+# Run: python 01_train.py +sweep=calib_ef_multi --multirun
+
+experiment:
+  phase: 1
+  tier: calib_ef_multi
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: entity_field
+      model.gate_mode: kda,full
+      model.layout: ws,ll
+      optimizer.lr: 0.001,0.003,0.01
+      seed: range(100,102)
