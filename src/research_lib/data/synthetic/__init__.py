@@ -12,6 +12,15 @@ Public names:
 """
 
 from .datamodule import SyntheticRecallDataModule
+from .fixed_set import FixedSetRecallDataModule
+from .mad_fuzzy import (
+    MadFuzzyConfig,
+    fuzzy_recall_dataset,
+    fuzzy_recall_instance,
+    mad_batch_row,
+    mad_reference_split,
+)
+from .mad_metrics import MacroTokenAccuracy, TokenAccuracy
 from .metrics import OVERWRITE_CLASSES, RecallMetrics, answer_predictions
 from .mqar import MQARConfig, generate_mqar
 from .overwrite import OverwriteClass, OverwriteConfig, generate_overwrite
@@ -25,19 +34,27 @@ from .registry import (
 )
 
 __all__ = [
+    "OVERWRITE_CLASSES",
+    "TASKS",
+    "FixedSetRecallDataModule",
     "MQARConfig",
+    "MacroTokenAccuracy",
+    "MadFuzzyConfig",
     "OverwriteClass",
     "OverwriteConfig",
-    "OVERWRITE_CLASSES",
     "RecallMetrics",
     "SyntheticRecallDataModule",
-    "TASKS",
     "TaskSpec",
+    "TokenAccuracy",
     "answer_predictions",
     "config_types",
+    "fuzzy_recall_dataset",
+    "fuzzy_recall_instance",
     "generate_mqar",
     "generate_overwrite",
     "generators",
+    "mad_batch_row",
+    "mad_reference_split",
     "require_task",
     "slice_values_of",
 ]

@@ -12,7 +12,7 @@ added here once. The slice values of a config always come from its
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,9 +68,16 @@ def _overwrite_spec():
     )
 
 
+def _mad_fuzzy_spec():
+    from .mad_fuzzy import MadFuzzyConfig, fuzzy_recall_dataset
+
+    return TaskSpec("mad_fuzzy", MadFuzzyConfig, fuzzy_recall_dataset)
+
+
 TASKS: dict[str, TaskSpec] = {
     "mqar": _mqar_spec(),
     "overwrite": _overwrite_spec(),
+    "mad_fuzzy": _mad_fuzzy_spec(),
 }
 """The registered synthetic tasks, keyed by name."""
 

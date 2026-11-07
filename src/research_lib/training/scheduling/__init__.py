@@ -88,13 +88,19 @@ See Also:
 
 from . import utils, validation, wrappers
 from .scheduler import ParamScheduler
-from .schedules import ParamSchedule, WarmupStableDecaySchedule
+from .schedules import (
+    EpochCosineSchedule,
+    ParamSchedule,
+    WarmupStableDecaySchedule,
+)
 
 __all__ = [
     # Core classes
+    "EpochCosineSchedule",
     "ParamSchedule",
-    "WarmupStableDecaySchedule",
     "ParamScheduler",
+    "WarmupStableDecaySchedule", 
+
     # Submodules
     "utils",
     "validation",

@@ -1,0 +1,26 @@
+# =============================================================================
+# MAD fuzzy in-context recall task config.
+# =============================================================================
+# The generator and the fixed training/validation/test sizes (MAD's fuzzy
+# in-context recall setting). ``max_seq_len`` is seq_len + 1 rounded up to
+# a multiple of the chunk size (16): 512 -> 528. The seed is the run's
+# ``seed`` (it sets the init and the fixed training set); validation and
+# test use distinct fixed seeds, the same across runs.
+
+defaults:
+  - /harness: mad
+
+name: mad_fuzzy
+vocab_size: 16
+seq_len: 512
+max_seq_len: 528
+k_motif_size: 3
+v_motif_size: 3
+multi_query: true
+noise_vocab_size: 0
+frac_noise: 0.0
+num_train: 12800
+num_val: 1280
+num_test: 1280
+val_seed: 1000003
+test_seed: 2000003

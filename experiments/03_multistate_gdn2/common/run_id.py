@@ -120,10 +120,12 @@ def make_run_id(cfg: DictConfig, lr: float, *, include_task_keys: bool = False) 
     scheme = str(_cfg_value(cfg, "optimizer.decay_scheme") or "grouped")
     if scheme != "grouped":
         run_id += f"-wd-{scheme}"
-    if str(cfg.model.layer_pattern) != "zoology":
-        run_id += f"-pat-{cfg.model.layer_pattern}"
-    if str(cfg.model.state_mixer) != "none":
-        run_id += f"-sm-{cfg.model.state_mixer}"
+    layer_pattern = str(_cfg_value(cfg, "model.layer_pattern") or "zoology")
+    if layer_pattern != "zoology":
+        run_id += f"-pat-{layer_pattern}"
+    state_mixer = str(_cfg_value(cfg, "model.state_mixer") or "none")
+    if state_mixer != "none":
+        run_id += f"-sm-{state_mixer}"
     if (
         _cfg_value(cfg, "model.expand_v") is not None
         and float(cfg.model.expand_v) != 1.0

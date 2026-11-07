@@ -22,13 +22,7 @@ from research_lib.training.scheduling.utils import (
 from research_lib.training.scheduling.validation import (
     check_finite,
     check_in_range,
-    check_in_set,
-    check_monotonic_decreasing,
-    check_monotonic_increasing,
-    check_monotonic_non_decreasing,
-    check_monotonic_non_increasing,
     check_non_negative,
-    check_positive,
     validate_schedule,
 )
 
@@ -720,3 +714,50 @@ class TestWarmRestarts:
                 initial_cycle_steps=100,
                 cycle_mult=0.5,
             )
+
+
+class TestEpochCosineSchedule:
+    """A per-epoch cosine: constant inside an epoch, decaying from peak at
+    epoch 0 to near-minimum at the last epoch."""
+
+    def _sch(self):
+        from research_lib.training.scheduling import EpochCosineSchedule
+
+        return EpochCosineSchedule(
+            steps_per_epoch=10, epochs=200, max_value=1e-3, min_value=1e-6
+        )
+
+    def test_epoch_zero_is_peak(self):
+        s = self._sch()
+        assert s(0, 2000) == 1e-3
+        # whole epoch 0 is constant at the peak
+        assert s(9, 2000) == 1e-3
+
+    def test_midpoint_epoch_halves(self):
+        s = self._sch()
+        # epoch 100: progress 1/2 -> (max+min)/2
+        assert s(1000, 2000) == pytest.approx((1e-3 + 1e-6) / 2)
+        assert s(1009, 2000) == s(1000, 2000)
+
+    def test_constant_within_an_epoch(self):
+        s = self._sch()
+        vals = {s(step, 2000) for step in range(500, 510)}
+        assert len(vals) == 1
+        # but the next epoch differs
+        assert s(509, 2000) != s(510, 2000)
+
+    def test_last_epoch_near_minimum(self):
+        s = self._sch()
+        last = s(1999, 2000)
+        assert last == pytest.approx(1e-6, abs=1e-6)
+        # monotone non-increasing from peak to floor
+        earlier = s(0, 2000)
+        assert earlier >= last
+
+    def test_picklable(self):
+        import pickle
+
+        s = self._sch()
+        clone = pickle.loads(pickle.dumps(s))
+        assert clone(0, 2000) == s(0, 2000)
+        assert clone(1000, 2000) == s(1000, 2000)
