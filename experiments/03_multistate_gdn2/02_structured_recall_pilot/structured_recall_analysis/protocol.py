@@ -50,7 +50,7 @@ class TaskTiers:
 # positive-control tier (the tier-1 single-state cells).
 TASK_TIERS: dict[str, TaskTiers] = {
     "entity_field": TaskTiers(
-        calibration=("calib_ef_single", "calib_ef_multi"),
+        calibration=("calib_ef_single", "calib_ef_multi", "calib_ef_attention"),
         positive_control="tier1_ef_single",
     ),
 }
@@ -58,10 +58,12 @@ TASK_TIERS: dict[str, TaskTiers] = {
 # Expected done-count per tier, added alongside a task's tiers
 # (12 = 1 layout x 2 gates x 3 LRs x 2 seeds; 24 = 2 layouts x 2 gates
 # x 3 LRs x 2 seeds; 20 = 1 layout x 2 gates x seeds 0-9; 40 = 2
-# layouts x 2 gates x seeds 0-9).
+# layouts x 2 gates x seeds 0-9; 6 = 3 LRs x 2 seeds, no gate for the
+# attention control).
 EXPECTED_RUNS: dict[str, int] = {
     "calib_ef_single": 12,
     "calib_ef_multi": 24,
+    "calib_ef_attention": 6,
     "tier1_ef_single": 20,
     "tier1_ef_multi": 40,
 }

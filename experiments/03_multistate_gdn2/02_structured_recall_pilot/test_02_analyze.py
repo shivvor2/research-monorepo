@@ -1035,6 +1035,45 @@ class TestFrozenSnippet:
         assert _frozen_lr(_lr_cfg(layout="ws", gate="full"), frozen) == 0.005
         assert _frozen_lr(_lr_cfg(mixer="attention"), frozen) == 0.006
 
+    def test_snippet_writes_an_attention_entry_per_task(
+        self, tmp_path, protocol, monkeypatch
+    ):
+        # The attention calibration tier feeds lr_table.<task>.attention for
+        # every task that runs it, each under its own task heading.
+        monkeypatch.setattr(
+            protocol,
+            "CALIBRATION_TIERS",
+            frozenset((*TOY_CALIBRATION, "calib_ef_attention")),
+        )
+        rows = [
+            _row(
+                "ea0",
+                task="entity_field",
+                layout="single",
+                mixer="attention",
+                lr=0.003,
+                seed=100,
+                best=0.8,
+                tier="calib_ef_attention",
+            ),
+            _row(
+                "a0",
+                task="toy",
+                layout="single",
+                mixer="attention",
+                lr=0.006,
+                seed=100,
+                best=0.8,
+                tier="calib_ws",
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        snippet = (out / "frozen_protocol_snippet.yaml").read_text()
+        assert "  entity_field:\n    attention: 0.003" in snippet
+        assert "  toy:\n    attention: 0.006" in snippet
+
     def test_multiple_attention_rows_raise_naming_layouts(self, tmp_path, protocol):
         rows = [
             _row(

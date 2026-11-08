@@ -46,7 +46,10 @@ overwrite task's `K` (`N = E * M` in {8, 16, 32}).
 ## Screening workflow
 
 1. Single-state calibration (per task, layout, gate) — read the `full − kda`
-   gap column off the calibration report at each gate's selected point.
+   gap column off the calibration report at each gate's selected point. The
+   attention control is calibrated alongside it (`calib_ef_single` +
+   `calib_ef_attention`); the attention LR feeds
+   `lr_table.<task>.attention` in the frozen protocol.
 2. Multi-state calibration and freeze of `conf/frozen_protocol.yaml`.
 3. Tier-1 single-state cells — `positive_control` reports the paired gap
    over seeds with a bootstrap CI.
