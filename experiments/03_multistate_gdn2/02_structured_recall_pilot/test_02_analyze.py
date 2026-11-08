@@ -634,6 +634,22 @@ class TestScreeningCell:
         # The protocol fixture registers a screening cell but no fallback.
         assert protocol.screening_cell("toy", {"full": 0.0, "kda": 0.0}) == METRIC
 
+    def test_exactly_at_floor_keeps_primary(self, fallback_protocol):
+        # The rule is strictly below the floor: a gate reading exactly 0.15
+        # (one gate or both) keeps the primary cell.
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.15, "kda": 0.05})
+            == PRIMARY
+        )
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.1, "kda": 0.15})
+            == PRIMARY
+        )
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.15, "kda": 0.15})
+            == PRIMARY
+        )
+
 
 class TestScreeningFallback:
     @pytest.fixture
