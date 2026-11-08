@@ -255,6 +255,52 @@ class EntityFieldConfig:
         return tuple(sorted(e * self.num_fields for e in self.num_entities))
 
 
+def _validate_placement_geometry(
+    config: EntityFieldConfig, n_entities: int, num_slots: int, u: int
+) -> None:
+    """Reject class mixtures the write region's slot grid cannot place.
+
+    Slot ``i``'s value token is at ``3i + 2``, so it falls in block
+    ``(3i + 2) // B``. A ``same`` pair needs two slots in one block, so
+    a block with ``c`` slots offers ``c // 2`` disjoint pairs; an
+    ``adjacent`` pair needs a slot in some block and another in the next
+    block (any slot there has a larger position). The ``distant`` class
+    is covered by the block-span check in :func:`_validate_entity_count`.
+
+    Args:
+        config: task configuration.
+        n_entities: the entity count ``E`` of this slice.
+        num_slots: the write-region slot count.
+        u: the number of updated pairs ``U``.
+
+    Raises:
+        ValueError: If a class with a positive probability cannot be
+            placed for this slice and block size.
+    """
+    p_same, p_adjacent, _ = config.placement_probs
+    slot_blocks = [(3 * i + 2) // config.block_size for i in range(num_slots)]
+    if p_same > 0:
+        counts: dict[int, int] = {}
+        for b in slot_blocks:
+            counts[b] = counts.get(b, 0) + 1
+        same_pairs = sum(c // 2 for c in counts.values())
+        if same_pairs < u:
+            raise ValueError(
+                f"infeasible num_entities entry {n_entities} with block_size "
+                f"{config.block_size}: the {num_slots}-slot write region offers "
+                f"only {same_pairs} disjoint same-block slot pairs, fewer than "
+                f"the U = {u} updated pairs the 'same' class needs"
+            )
+    if p_adjacent > 0:
+        blocks = set(slot_blocks)
+        if not any(b + 1 in blocks for b in blocks):
+            raise ValueError(
+                f"infeasible num_entities entry {n_entities} with block_size "
+                f"{config.block_size}: no two consecutive blocks hold a value "
+                f"slot, so the 'adjacent' class cannot be placed"
+            )
+
+
 def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
     """Feasibility and sampler checks for a fixed entity count ``e``.
 
@@ -263,7 +309,9 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
     taking two slots each) within ``(T - 3N) // 3`` slots; the write
     region must span ``distant_min_blocks + 1`` blocks; ``e`` distinct
     entity tokens must fit in ``[1, V/2 - F - M)``; and ``N + U``
-    distinct values must fit in the value half ``[V/2, V)``. The two
+    distinct values must fit in the value half ``[V/2, V)``. The slot
+    grid must also be able to place every class with a positive
+    probability (see :func:`_validate_placement_geometry`). The two
     without-replacement draws (``e`` entity ids, ``N + U`` values) must
     also clear the 1% per-round success floor, so a valid config never
     stalls the redraw loop.
@@ -302,6 +350,7 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
             f"region spans fewer than distant_min_blocks + 1 = "
             f"{config.distant_min_blocks + 1} blocks"
         )
+    _validate_placement_geometry(config, n_entities, num_slots, u)
     n_entity_pool = (
         config.vocab_size // 2 - config.reserved_filler - config.num_fields - 1
     )

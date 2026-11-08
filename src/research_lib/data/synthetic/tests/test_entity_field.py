@@ -468,6 +468,24 @@ def test_infeasible_config_raises():
         EntityFieldConfig(vocab_size=32, seq_len=64, num_fields=2, num_entities=(24,))
 
 
+def test_same_class_needs_same_block_pairs():
+    """With one value slot per block (block_size = 3) the 'same' class can
+    never be placed, so a config that asks for it is rejected up front."""
+    with pytest.raises(ValueError, match="'same' class needs"):
+        # The default probabilities include a positive 'same' share.
+        EntityFieldConfig(block_size=3)
+
+
+def test_adjacent_only_config_generates_when_placeable():
+    """With one value slot per block, an adjacent pair is a consecutive
+    slot pair, so an adjacent/distant mixture still constructs and runs."""
+    config = EntityFieldConfig(block_size=3, placement_probs=(0.0, 0.5, 0.5))
+    batch = generate_entity_field(config, num_examples=8, seed=3)
+    assert batch["input_ids"].shape == (8, config.seq_len)
+    codes = set(batch["key_class"].reshape(-1).tolist())
+    assert SAME not in codes, "no 'same' share was requested"
+
+
 # =============================================================================
 # Sampler safeguards
 # =============================================================================
