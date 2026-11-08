@@ -367,6 +367,27 @@ class TestCalibrationDamage:
                     },
                 )
             )
+            # A competing LR with lower accuracy and a different damage
+            # reading: it must not be selected, so its values must not leak
+            # into the reported damage.
+            rows.append(
+                _row(
+                    f"m{seed}old",
+                    layout="ws",
+                    gate="full",
+                    lr=0.003,
+                    seed=seed,
+                    best=0.2,
+                    step=10,
+                    **{
+                        METRIC: 0.1,
+                        "test/acc/slice=16/class=untouched": 1.0,
+                        "test/acc/slice=16/class=sibling": 0.0,
+                        "test/acc/slice=32/class=untouched": 1.0,
+                        "test/acc/slice=32/class=sibling": 0.0,
+                    },
+                )
+            )
         out = tmp_path / "out"
         out.mkdir()
         _analyze.calibration(_table(rows), out)
