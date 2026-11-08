@@ -442,9 +442,9 @@ def test_infeasible_config_raises():
         EntityFieldConfig(
             vocab_size=2048, seq_len=256, num_fields=4, num_entities=(16,)
         )
-    with pytest.raises(ValueError, match="spans fewer than distant_min_blocks"):
-        # Region too short for distant_min_blocks + 1 blocks (the 160-token
-        # write region spans 10 blocks, too few for 11).
+    with pytest.raises(ValueError, match="disjoint 'distant' slot pairs"):
+        # No pair of blocks is 10 apart, so the distant capacity is zero
+        # (the 160-token write region spans only blocks 0-9).
         EntityFieldConfig(
             vocab_size=2048,
             seq_len=256,
@@ -497,6 +497,54 @@ def test_non_finite_placement_probs_raise():
     for probs in ((float("nan"), 0.5, 0.5), (float("inf"), 0.0, 0.0)):
         with pytest.raises(ValueError, match="placement_probs entries must be finite"):
             EntityFieldConfig(placement_probs=probs)
+
+
+def test_distant_capacity_checked_at_construction():
+    """The region spans blocks 0-9, which holds at most 5 disjoint distant
+    pairs at distant_min_blocks = 9, but E = 8 needs U = 6: rejected up
+    front instead of after 100 restarts."""
+    with pytest.raises(ValueError, match="offers only 5 disjoint 'distant'"):
+        EntityFieldConfig(
+            num_entities=(8,), distant_min_blocks=9, placement_probs=(0.0, 0.0, 1.0)
+        )
+    with pytest.raises(ValueError, match="disjoint 'distant' slot pairs"):
+        # The default probabilities also include the all-distant worst case.
+        EntityFieldConfig(num_entities=(8,), distant_min_blocks=9)
+
+
+def test_placement_capacity_helpers():
+    """The per-class capacity helpers count disjoint pairs on hand-made
+    slot-block lists mirroring a write region."""
+    from .. import entity_field as ef
+
+    assert ef._max_same_pairs({0: 5, 1: 3, 2: 2}) == 2 + 1 + 1
+    # Adjacent pairs join consecutive blocks; a gap drops the carried slots.
+    assert ef._max_adjacent_pairs({0: 2, 1: 2, 2: 1, 4: 3}) == 2
+    assert ef._max_adjacent_pairs({0: 3, 1: 3}) == 3
+    assert ef._max_adjacent_pairs({0: 5, 3: 5}) == 0
+    assert ef._max_adjacent_pairs({1: 1, 2: 3, 3: 1}) == 2
+    # Distant: a span of 9 offers one pair here (the two 9-slots share it),
+    # a fully-clustered region offers none, two 0/9 pairs fit fully.
+    assert ef._max_distant_pairs([0, 1, 9, 9], 9) == 1
+    assert ef._max_distant_pairs([0, 1, 2, 3], 9) == 0
+    assert ef._max_distant_pairs([0, 0, 9, 9], 9) == 2
+
+
+def test_update_fraction_zero_skips_geometry():
+    """With no updates at all, class geometry is unconstrained: a distant
+    gap the region cannot span, or one slot per block, constructs and
+    generates."""
+    config = EntityFieldConfig(
+        num_entities=(8,),
+        distant_min_blocks=9,
+        placement_probs=(0.0, 0.0, 1.0),
+        update_fraction=0.0,
+    )
+    batch = generate_entity_field(config, num_examples=6, seed=13)
+    assert batch["input_ids"].shape == (6, config.seq_len)
+    config = EntityFieldConfig(block_size=3, update_fraction=0.0)
+    batch = generate_entity_field(config, num_examples=6, seed=14)
+    assert batch["input_ids"].shape == (6, config.seq_len)
 
 
 # =============================================================================

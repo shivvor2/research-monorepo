@@ -162,8 +162,8 @@ class EntityFieldConfig:
         ``num_entities`` at construction: the largest ``E`` with every
         update ``distant`` must fit (``N + U`` write slots, ``U`` =
         ``round_half_up(update_fraction * E)``, within ``(T - 3N) // 3``
-        slots), the write region must span at least
-        ``distant_min_blocks + 1`` blocks, ``E`` distinct entity tokens
+        slots), every class with a positive probability must have room
+        for ``U`` disjoint slot pairs, ``E`` distinct entity tokens
         must remain and ``N + U`` distinct values must fit in the value
         half.
     """
@@ -260,17 +260,68 @@ class EntityFieldConfig:
         return tuple(sorted(e * self.num_fields for e in self.num_entities))
 
 
+def _max_same_pairs(slots_per_block: dict[int, int]) -> int:
+    """Maximum number of disjoint same-block slot pairs: a block with
+    ``c`` slots contributes ``c // 2`` pairs."""
+    return sum(c // 2 for c in slots_per_block.values())
+
+
+def _max_adjacent_pairs(slots_per_block: dict[int, int]) -> int:
+    """Maximum number of disjoint (block, block + 1) slot pairs.
+
+    A greedy left-to-right pass is optimal on the chain of consecutive
+    blocks: carry the current block's unmatched slots forward, pair as
+    many as possible with the next block, then carry that block's own
+    remainder. A gap in the block indices drops the carried slots (they
+    can only pair with the next block).
+    """
+    total = 0
+    carry = 0
+    prev: int | None = None
+    for block in sorted(slots_per_block):
+        if prev is not None and block != prev + 1:
+            carry = 0  # a gap: the earlier block's unmatched slots are lost
+        slots = slots_per_block[block]
+        matched = min(carry, slots)
+        total += matched
+        carry = slots - matched
+        prev = block
+    return total
+
+
+def _max_distant_pairs(blocks: list[int], distant_min_blocks: int) -> int:
+    """Maximum number of disjoint slot pairs whose blocks differ by at
+    least ``distant_min_blocks``.
+
+    Pairing the ``k`` earliest slots with the ``k`` latest (in order) is
+    optimal, so ``k`` pairs fit iff
+    ``blocks[-k + i] - blocks[i] >= distant_min_blocks`` for every
+    ``i < k``; scan upward while that holds. This is the capacity form of
+    the block-span check (the ``k = 1`` case is exactly the region's
+    span)."""
+    best = 0
+    n = len(blocks)
+    for k in range(1, n // 2 + 1):
+        if all(
+            blocks[n - k + i] - blocks[i] >= distant_min_blocks for i in range(k)
+        ):
+            best = k
+        else:
+            break
+    return best
+
+
 def _validate_placement_geometry(
     config: EntityFieldConfig, n_entities: int, num_slots: int, u: int
 ) -> None:
     """Reject class mixtures the write region's slot grid cannot place.
 
     Slot ``i``'s value token is at ``3i + 2``, so it falls in block
-    ``(3i + 2) // B``. A ``same`` pair needs two slots in one block, so
-    a block with ``c`` slots offers ``c // 2`` disjoint pairs; an
-    ``adjacent`` pair needs a slot in some block and another in the next
-    block (any slot there has a larger position). The ``distant`` class
-    is covered by the block-span check in :func:`_validate_entity_count`.
+    ``(3i + 2) // B``. Each class's capacity is the maximum number of
+    disjoint slot pairs its geometry admits (see the ``_max_*_pairs``
+    helpers); every class with a positive probability must fit ``U``
+    updated pairs, the all-one-class worst case. Nothing is checked when
+    ``U == 0``.
 
     Args:
         config: task configuration.
@@ -279,30 +330,43 @@ def _validate_placement_geometry(
         u: the number of updated pairs ``U``.
 
     Raises:
-        ValueError: If a class with a positive probability cannot be
-            placed for this slice and block size.
+        ValueError: If a class with a positive probability cannot fit
+            its ``U`` pairs in this slice's slot grid.
     """
-    p_same, p_adjacent, _ = config.placement_probs
+    if u == 0:
+        return
+    p_same, p_adjacent, p_distant = config.placement_probs
     slot_blocks = [(3 * i + 2) // config.block_size for i in range(num_slots)]
+    counts: dict[int, int] = {}
+    for b in slot_blocks:
+        counts[b] = counts.get(b, 0) + 1
     if p_same > 0:
-        counts: dict[int, int] = {}
-        for b in slot_blocks:
-            counts[b] = counts.get(b, 0) + 1
-        same_pairs = sum(c // 2 for c in counts.values())
-        if same_pairs < u:
+        capacity = _max_same_pairs(counts)
+        if capacity < u:
             raise ValueError(
                 f"infeasible num_entities entry {n_entities} with block_size "
-                f"{config.block_size}: the {num_slots}-slot write region offers "
-                f"only {same_pairs} disjoint same-block slot pairs, fewer than "
-                f"the U = {u} updated pairs the 'same' class needs"
+                f"{config.block_size}: the write region offers only {capacity} "
+                f"disjoint same-block slot pairs, fewer than the U = {u} "
+                f"updated pairs the 'same' class needs"
             )
     if p_adjacent > 0:
-        blocks = set(slot_blocks)
-        if not any(b + 1 in blocks for b in blocks):
+        capacity = _max_adjacent_pairs(counts)
+        if capacity < u:
             raise ValueError(
                 f"infeasible num_entities entry {n_entities} with block_size "
-                f"{config.block_size}: no two consecutive blocks hold a value "
-                f"slot, so the 'adjacent' class cannot be placed"
+                f"{config.block_size}: the write region offers only {capacity} "
+                f"disjoint adjacent-block slot pairs, fewer than the U = {u} "
+                f"updated pairs the 'adjacent' class needs"
+            )
+    if p_distant > 0:
+        capacity = _max_distant_pairs(slot_blocks, config.distant_min_blocks)
+        if capacity < u:
+            raise ValueError(
+                f"infeasible num_entities entry {n_entities} with block_size "
+                f"{config.block_size}: the write region offers only {capacity} "
+                f"disjoint 'distant' slot pairs (distant_min_blocks = "
+                f"{config.distant_min_blocks}), fewer than the U = {u} updated "
+                f"pairs"
             )
 
 
@@ -311,15 +375,15 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
 
     The all-distant worst case needs ``N + U`` write slots (``N = e *
     M`` pairs, ``U = round_half_up(update_fraction * e)`` updated pairs
-    taking two slots each) within ``(T - 3N) // 3`` slots; the write
-    region must span ``distant_min_blocks + 1`` blocks; ``e`` distinct
+    taking two slots each) within ``(T - 3N) // 3`` slots; ``e`` distinct
     entity tokens must fit in ``[1, V/2 - F - M)``; and ``N + U``
     distinct values must fit in the value half ``[V/2, V)``. The slot
-    grid must also be able to place every class with a positive
-    probability (see :func:`_validate_placement_geometry`). The two
-    without-replacement draws (``e`` entity ids, ``N + U`` values) must
-    also clear the 1% per-round success floor, so a valid config never
-    stalls the redraw loop.
+    grid must also be able to place ``U`` disjoint slot pairs of every
+    class with a positive probability (see
+    :func:`_validate_placement_geometry`). The two without-replacement
+    draws (``e`` entity ids, ``N + U`` values) must also clear the 1%
+    per-round success floor, so a valid config never stalls the redraw
+    loop.
     """
     if n_entities < 1:
         raise ValueError(f"num_entities entries must be >= 1, got {n_entities}")
@@ -348,13 +412,9 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
             f"infeasible num_entities entry {n_entities}: the write region "
             f"holds no slots"
         )
-    last_value_pos = 3 * (num_slots - 1) + 2
-    if last_value_pos // config.block_size + 1 < config.distant_min_blocks + 1:
-        raise ValueError(
-            f"infeasible num_entities entry {n_entities}: the {r}-token write "
-            f"region spans fewer than distant_min_blocks + 1 = "
-            f"{config.distant_min_blocks + 1} blocks"
-        )
+    # Class capacity (the distant capacity subsumes the old block-span
+    # check: a region that cannot span distant_min_blocks + 1 blocks offers
+    # no distant pair at all).
     _validate_placement_geometry(config, n_entities, num_slots, u)
     n_entity_pool = (
         config.vocab_size // 2 - config.reserved_filler - config.num_fields - 1
