@@ -35,6 +35,9 @@ class TaskSpec:
         slice_kwarg: The generator keyword for one explicit slice value
             in a fixed evaluation set (``None`` when slices are always
             taken from ``config.slices``).
+        class_names: The task's metric key fragments per ``key_class``
+            code, for :class:`~research_lib.data.synthetic.RecallMetrics`
+            (``None`` uses the overwrite names).
         slice_arg_of: Optional map from a slice value (as returned by
             ``config.slices``) to the fixed argument the generator
             takes for that slice, ``callable(slice_value, config)``. A
@@ -42,17 +45,14 @@ class TaskSpec:
             entity-field task's ``N = E * M`` pairs, whose generator
             takes ``num_entities`` ``= N // M``) supplies this;
             ``None`` means the slice value is the argument as is.
-        class_names: The task's metric key fragments per ``key_class``
-            code, for :class:`~research_lib.data.synthetic.RecallMetrics`
-            (``None`` uses the overwrite names).
     """
 
     name: str
     config_type: type
     generator: Callable[..., dict[str, Any]]
     slice_kwarg: str | None = None
-    slice_arg_of: Callable[[int, Any], int] | None = None
     class_names: tuple[str, ...] | None = None
+    slice_arg_of: Callable[[int, Any], int] | None = None
 
     def slice_values(self, config: Any) -> tuple[int, ...]:
         """The task's slice values from a config (via ``config.slices``)."""
