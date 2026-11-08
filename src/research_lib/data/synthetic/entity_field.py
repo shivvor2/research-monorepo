@@ -302,9 +302,7 @@ def _max_distant_pairs(blocks: list[int], distant_min_blocks: int) -> int:
     best = 0
     n = len(blocks)
     for k in range(1, n // 2 + 1):
-        if all(
-            blocks[n - k + i] - blocks[i] >= distant_min_blocks for i in range(k)
-        ):
+        if all(blocks[n - k + i] - blocks[i] >= distant_min_blocks for i in range(k)):
             best = k
         else:
             break

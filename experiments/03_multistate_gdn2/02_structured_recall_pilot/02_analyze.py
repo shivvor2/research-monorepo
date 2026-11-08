@@ -244,9 +244,7 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                         primary,
                     )
                 else:
-                    logger.info(
-                        "screening fallback for %s: reading %s", task, metric
-                    )
+                    logger.info("screening fallback for %s: reading %s", task, metric)
                     for gate, row in gate_rows.items():
                         row["cell"] = fallback_cells[gate]
                         row["cell_metric"] = metric
