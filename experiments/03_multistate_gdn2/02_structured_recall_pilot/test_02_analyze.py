@@ -1058,7 +1058,8 @@ class TestFrozenSnippet:
         ]
         out = tmp_path / "out"
         out.mkdir()
-        with pytest.raises(RuntimeError, match="ws"):
+        # The message names the task and the two layouts, not a %-tuple.
+        with pytest.raises(RuntimeError, match="task toy.*\\['ll', 'ws'\\]"):
             _analyze.calibration(_table(rows), out)
 
 

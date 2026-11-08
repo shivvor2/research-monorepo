@@ -383,11 +383,10 @@ def _frozen_snippet(rows: list[dict], out_dir: Path) -> None:
         attn = [r for r in attention if r["task"] == task]
         if len(attn) > 1:
             raise RuntimeError(
-                "task %s has more than one grouped attention reading (attention "
-                "runs at different model.layout values): %s; refusing to pick "
-                "the first",
-                task,
-                sorted({r.get("layout") for r in attn}),
+                f"task {task} has more than one grouped attention reading "
+                f"(attention runs at different model.layout values): "
+                f"{sorted({r.get('layout') for r in attn})}; refusing to pick "
+                f"the first"
             )
         if len(attn) == 1:
             lines.append(f"    attention: {attn[0]['selected_lr']:g}")
