@@ -685,6 +685,39 @@ class TestScreeningFallback:
             )
         return rows
 
+    def _gap_cell_rows(self):
+        """An ordinary cell (both gates above the floor, so no fallback
+        triggers) that does produce a gap: a table with this cell has a
+        ``gap_full_kda`` column even when the fallback cell's gap is
+        unreported."""
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"g{seed}",
+                    gate="full",
+                    lam="gated",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.9,
+                    step=10,
+                    **{PRIMARY: 0.4, FALLBACK: 0.6},
+                )
+            )
+            rows.append(
+                _row(
+                    f"kg{seed}",
+                    gate="kda",
+                    lam="gated",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.7,
+                    step=10,
+                    **{PRIMARY: 0.3, FALLBACK: 0.4},
+                )
+            )
+        return rows
+
     def test_calibration_fallback_triggers_when_both_below(
         self, tmp_path, fallback_protocol
     ):
@@ -735,49 +768,73 @@ class TestScreeningFallback:
         assert full["cell_metric"] == PRIMARY
         assert full["cell"] == pytest.approx(0.1)
 
+    def _no_gap_rows(self, *, drop_fallback_column):
+        """The unreadable-fallback cell (both gates below the floor, mlp)
+        plus an ordinary gap-producing cell (gated), for the no-gap tests.
+        With ``drop_fallback_column`` the fallback metric is removed from
+        every row, so the column is absent from the table."""
+        rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
+        rows += self._gap_cell_rows()
+        if drop_fallback_column:
+            for row in rows:
+                row.pop(FALLBACK)
+        else:
+            for row in rows:
+                if row["lambda_mode"] == "mlp" and row["gate_mode"] == "kda":
+                    row[FALLBACK] = float("nan")
+        return rows
+
+    def _assert_unreadable_fallback_cell_no_gap(self, df):
+        single = df[df["kind"] == "single"]
+        mlp = single[single["lambda_mode"] == "mlp"]
+        full = mlp[mlp["gate_mode"] == "full"].iloc[0]
+        kda = mlp[mlp["gate_mode"] == "kda"].iloc[0]
+        assert full["cell_metric"] == PRIMARY
+        assert kda["cell_metric"] == PRIMARY
+        assert full["cell"] == pytest.approx(0.1)
+        assert kda["cell"] == pytest.approx(0.05)
+        # The column exists (the ordinary cell below set it) and these rows
+        # hold NaN: per-row, this cell has NO gap, not a whole-CSV absence.
+        assert pd.isna(full.get("gap_full_kda", float("nan")))
+        assert pd.isna(kda.get("gap_full_kda", float("nan")))
+        gated = single[single["lambda_mode"] == "gated"]
+        gd_full = gated[gated["gate_mode"] == "full"].iloc[0]
+        gd_kda = gated[gated["gate_mode"] == "kda"].iloc[0]
+        assert gd_full["gap_full_kda"] == pytest.approx(0.1)
+        assert gd_kda["gap_full_kda"] == pytest.approx(0.1)
+        assert gd_full["cell_metric"] == PRIMARY
+
     def test_calibration_fallback_missing_column_reports_no_gap(
         self, tmp_path, fallback_protocol
     ):
         # Both gates are below the floor, but the fallback column is absent:
-        # the report keeps the primary cells for inspection and reports NO
-        # gap (the primary gap would be noise the protocol flagged as
-        # uninformative).
-        rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
-        for row in rows:
-            row.pop(FALLBACK)
+        # the report keeps the primary cells for inspection and this cell
+        # reports NO gap (the primary gap would be noise the protocol flagged
+        # as uninformative). The ordinary cell in the same table has its gap.
         out = tmp_path / "out"
         out.mkdir()
-        _analyze.calibration(_table(rows), out)
+        _analyze.calibration(
+            _table(self._no_gap_rows(drop_fallback_column=True)), out
+        )
         df = pd.read_csv(out / "calibration.csv")
-        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
-        assert full["cell_metric"] == PRIMARY
-        assert full["cell"] == pytest.approx(0.1)
-        assert "gap_full_kda" not in df.columns
+        assert "gap_full_kda" in df.columns
+        self._assert_unreadable_fallback_cell_no_gap(df)
 
     def test_calibration_fallback_missing_reading_reports_no_gap(
         self, tmp_path, fallback_protocol
     ):
         # Both gates are below the floor and the fallback column exists, but
         # the kda gate has no fallback value at its selected LR: both cells
-        # stay on the primary metric (never a primary/fallback mix) and the
-        # gap is not reported.
-        rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
-        for row in rows:
-            if row["gate_mode"] == "kda":
-                row[FALLBACK] = float("nan")
+        # stay on the primary metric (never a primary/fallback mix) and this
+        # cell reports no gap, while the ordinary cell keeps its own.
         out = tmp_path / "out"
         out.mkdir()
-        _analyze.calibration(_table(rows), out)
+        _analyze.calibration(
+            _table(self._no_gap_rows(drop_fallback_column=False)), out
+        )
         df = pd.read_csv(out / "calibration.csv")
-        single = df[(df["kind"] == "single")]
-        full = single[single["gate_mode"] == "full"].iloc[0]
-        kda = single[single["gate_mode"] == "kda"].iloc[0]
-        assert full["cell_metric"] == PRIMARY
-        assert kda["cell_metric"] == PRIMARY
-        assert full["cell"] == pytest.approx(0.1)
-        assert kda["cell"] == pytest.approx(0.05)
-        assert "gap_full_kda" not in full
-        assert "gap_full_kda" not in kda
+        assert "gap_full_kda" in df.columns
+        self._assert_unreadable_fallback_cell_no_gap(df)
 
     def test_positive_control_fallback_missing_column_skips_task(
         self, tmp_path, fallback_protocol
