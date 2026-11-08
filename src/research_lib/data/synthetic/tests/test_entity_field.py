@@ -533,18 +533,35 @@ def test_placement_capacity_helpers():
 def test_update_fraction_zero_skips_geometry():
     """With no updates at all, class geometry is unconstrained: a distant
     gap the region cannot span, or one slot per block, constructs and
-    generates."""
-    config = EntityFieldConfig(
-        num_entities=(8,),
-        distant_min_blocks=9,
-        placement_probs=(0.0, 0.0, 1.0),
-        update_fraction=0.0,
+    generates. The examples are structurally normal and every pair is
+    untouched: no update fields are ever set."""
+    configs = (
+        EntityFieldConfig(
+            num_entities=(8,),
+            distant_min_blocks=9,
+            placement_probs=(0.0, 0.0, 1.0),
+            update_fraction=0.0,
+        ),
+        EntityFieldConfig(block_size=3, update_fraction=0.0),
     )
-    batch = generate_entity_field(config, num_examples=6, seed=13)
-    assert batch["input_ids"].shape == (6, config.seq_len)
-    config = EntityFieldConfig(block_size=3, update_fraction=0.0)
-    batch = generate_entity_field(config, num_examples=6, seed=14)
-    assert batch["input_ids"].shape == (6, config.seq_len)
+    for config in configs:
+        batch = generate_entity_field(config, num_examples=6, seed=13)
+        assert batch["input_ids"].shape == (6, config.seq_len)
+        for ex in range(6):
+            n_entities = int(batch["slice_id"][ex]) // config.num_fields
+            _check_example(
+                config,
+                batch["input_ids"][ex],
+                batch["labels"][ex],
+                batch["old_labels"][ex],
+                batch["key_class"][ex],
+                batch["write_distance"][ex],
+                n_entities,
+            )
+            answers = batch["labels"][ex] != IGNORE
+            assert (batch["key_class"][ex][answers] == UNTOUCHED).all()
+            assert (batch["old_labels"][ex][answers] == IGNORE).all()
+            assert (batch["write_distance"][ex][answers] == NO_DISTANCE).all()
 
 
 # =============================================================================
