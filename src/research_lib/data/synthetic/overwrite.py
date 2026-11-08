@@ -75,6 +75,7 @@ from __future__ import annotations
 
 import enum
 import logging
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -210,6 +211,10 @@ class OverwriteConfig:
             raise ValueError(
                 f"class_probs must have 4 entries "
                 f"(same, adjacent, distant, single), got {self.class_probs}"
+            )
+        if any(not math.isfinite(p) for p in self.class_probs):
+            raise ValueError(
+                f"class_probs entries must be finite, got {self.class_probs}"
             )
         if any(p < 0 for p in self.class_probs):
             raise ValueError(

@@ -172,6 +172,8 @@ def test_overwrite_config_validation():
     with pytest.raises(ValueError):
         # Intentionally invalid length (validation test).
         OverwriteConfig(class_probs=(0.5, 0.5))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="class_probs entries must be finite"):
+        OverwriteConfig(class_probs=(float("nan"), 0.25, 0.25, 0.5))
     with pytest.raises(ValueError):
         OverwriteConfig(block_size=1)  # < 2
     with pytest.raises(ValueError):

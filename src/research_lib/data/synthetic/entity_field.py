@@ -226,6 +226,11 @@ class EntityFieldConfig:
                 f"placement_probs must have 3 entries "
                 f"(same, adjacent, distant), got {self.placement_probs}"
             )
+        if any(not math.isfinite(p) for p in self.placement_probs):
+            raise ValueError(
+                f"placement_probs entries must be finite, got "
+                f"{self.placement_probs}"
+            )
         if any(p < 0 for p in self.placement_probs):
             raise ValueError(
                 f"placement_probs entries must be >= 0, got {self.placement_probs}"

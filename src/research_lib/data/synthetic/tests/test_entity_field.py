@@ -486,6 +486,12 @@ def test_adjacent_only_config_generates_when_placeable():
     assert SAME not in codes, "no 'same' share was requested"
 
 
+def test_non_finite_placement_probs_raise():
+    for probs in ((float("nan"), 0.5, 0.5), (float("inf"), 0.0, 0.0)):
+        with pytest.raises(ValueError, match="placement_probs entries must be finite"):
+            EntityFieldConfig(placement_probs=probs)
+
+
 # =============================================================================
 # Sampler safeguards
 # =============================================================================
