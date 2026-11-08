@@ -6,13 +6,17 @@ Target: experiments/03_multistate_gdn2/common/
 Run with: pytest experiments/03_multistate_gdn2/common/tests/test_common.py -v
 """
 
+import json
+
 import pandas as pd
 import pytest
 from common.analysis import delta_int_table, gap_column, paired_gap_report
 from common.harnesses import build_zoology
 from common.registries import config_type_of_task, require_harness
-from common.run_id import make_run_id
+from common.run_id import HASH_EXCLUDE, make_run_id
 from omegaconf import OmegaConf
+
+from research_lib.training.callbacks import config_hash
 
 from research_lib.architectures.zoology_lm import BaseConv
 from research_lib.data.synthetic import MQARConfig, OverwriteConfig, require_task
@@ -120,6 +124,73 @@ class TestRunIdTaskKeys:
             _ef_cfg(update_fraction=0.5), 0.003, include_task_keys=True
         )
         assert "-update_fraction-0.5" in run_id
+
+    def test_attention_config_drops_the_gated_delta_segment(self):
+        cfg = _ef_cfg()
+        cfg.model.mixer = "attention"
+        run_id = make_run_id(cfg, 0.003, include_task_keys=True)
+        assert run_id == "entity_field-d32-lr0.003-mix-attention-s0"
+
+    def test_attention_ignores_layout_gate_and_lambda_in_the_id(self):
+        base = _ef_cfg()
+        base.model.mixer = "attention"
+        base_id = make_run_id(base, 0.003, include_task_keys=True)
+        for key, value in (("layout", "ws"), ("gate_mode", "kda"), ("lambda_mode", "gated")):
+            cfg = _ef_cfg()
+            cfg.model.mixer = "attention"
+            cfg.model[key] = value
+            assert make_run_id(cfg, 0.003, include_task_keys=True) == base_id
+
+    def test_attention_ignores_expand_v_in_the_id(self):
+        cfg = _ef_cfg()
+        cfg.model.mixer = "attention"
+        cfg.model.expand_v = 2.0
+        assert make_run_id(cfg, 0.003, include_task_keys=True) == (
+            "entity_field-d32-lr0.003-mix-attention-s0"
+        )
+
+    def test_attention_same_id_different_identity_is_refused(self, tmp_path):
+        # Two attention runs that differ only in a gated-delta setting share
+        # a run ID; their config hashes still differ, so the identity check
+        # refuses the second loudly instead of overwriting the record.
+        from common.run_lifecycle import create_callbacks_reset_curves
+
+        a = _ef_cfg()
+        a.model.mixer = "attention"
+        b = _ef_cfg()
+        b.model.mixer = "attention"
+        b.model.gate_mode = "kda"
+        run_id = make_run_id(a, 0.003, include_task_keys=True)
+        assert run_id == make_run_id(b, 0.003, include_task_keys=True)
+
+        runs = tmp_path / "runs"
+        curves = tmp_path / "curves"
+        runs.mkdir(parents=True)
+        curves_dir = curves / run_id
+        curves_dir.mkdir(parents=True)
+        (curves_dir / "metrics.csv").write_text("step,val/acc\n0,0.5\n")
+        identity = (
+            config_hash(OmegaConf.to_container(a, resolve=True), HASH_EXCLUDE),
+            a.seed,
+        )
+        (runs / f"{run_id}.json").write_text(
+            json.dumps({"config_hash": identity[0], "seed": identity[1]})
+        )
+        c = OmegaConf.create(
+            {
+                "seed": 0,
+                "output": {"runs_dir": str(runs)},
+                "training": {
+                    "early_stop_threshold": 0.99,
+                    "collect_mixer_stats": False,
+                },
+                "logging": {"csv": {"enabled": True, "save_dir": str(curves)}},
+                "optimizer": {"decay_scheme": "grouped"},
+                "experiment": {"name": "t", "tier": "tier_x"},
+            }
+        )
+        with pytest.raises(FileExistsError):
+            create_callbacks_reset_curves(c, run_id, {}, lr=0.003)
 
 
 class TestRegistries:
