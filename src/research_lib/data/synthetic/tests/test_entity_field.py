@@ -544,6 +544,29 @@ def test_zero_probability_sampler_floor_raises():
         )
 
 
+def test_default_config_generates_without_restarts(monkeypatch):
+    """At the default settings no example is ever restarted: 2,000
+    examples per slice return without a single ``None`` from the per-example
+    builder."""
+    from .. import entity_field as ef
+
+    original = ef._try_example
+    none_count = 0
+
+    def wrapped(*args, **kwargs):
+        nonlocal none_count
+        example = original(*args, **kwargs)
+        if example is None:
+            none_count += 1
+        return example
+
+    monkeypatch.setattr(ef, "_try_example", wrapped)
+    config = EntityFieldConfig()
+    for e in config.num_entities:
+        generate_entity_field(config, num_examples=2000, seed=e, num_entities=e)
+    assert none_count == 0
+
+
 # =============================================================================
 # Datamodule
 # =============================================================================

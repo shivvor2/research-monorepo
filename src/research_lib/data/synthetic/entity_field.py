@@ -473,6 +473,7 @@ def _try_example(
     slots: dict[int, tuple[int, ...]] = {}
 
     def _class_ok(b1: int, b2: int, cls: int) -> bool:
+        """Whether write blocks ``b1 < b2`` satisfy class ``cls``."""
         if cls == int(EntityFieldClass.SAME):
             return b2 == b1
         if cls == int(EntityFieldClass.ADJACENT):
