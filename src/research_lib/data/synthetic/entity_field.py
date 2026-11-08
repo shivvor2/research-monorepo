@@ -428,10 +428,9 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
     _check_sampler_floor(
         n_entity_pool,
         n_entities,
-        f"num_entities entry {n_entities}",
-        "entity",
-        "",
-        "increase vocab_size or reduce reserved_filler",
+        entry=f"num_entities entry {n_entities}",
+        pool="entity",
+        remedy="increase vocab_size or reduce reserved_filler",
     )
     n_values = n + u
     n_value_pool = config.vocab_size // 2
@@ -444,10 +443,9 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
     _check_sampler_floor(
         n_value_pool,
         n_values,
-        f"num_entities entry {n_entities}",
-        "value",
-        "",
-        "increase vocab_size",
+        entry=f"num_entities entry {n_entities}",
+        pool="value",
+        remedy="increase vocab_size",
     )
 
 

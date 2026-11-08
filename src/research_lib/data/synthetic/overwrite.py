@@ -271,10 +271,9 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
     _check_sampler_floor(
         n_key,
         k,
-        f"num_keys entry {k}",
-        "key",
-        f"{n_key}! / (({n_key} - {k})! * {n_key}^{k})",
-        "increase vocab_size or reduce reserved_filler",
+        entry=f"num_keys entry {k}",
+        pool="key",
+        remedy="increase vocab_size or reduce reserved_filler",
     )
     n_val = config.vocab_size // 2
     if n_val < 2 * k:
@@ -287,10 +286,9 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
     _check_sampler_floor(
         n_val,
         d_val,
-        f"num_keys entry {k}",
-        "value",
-        f"{n_val}! / (({n_val} - {d_val})! * {n_val}^{d_val})",
-        "increase vocab_size",
+        entry=f"num_keys entry {k}",
+        pool="value",
+        remedy="increase vocab_size",
     )
 
 
