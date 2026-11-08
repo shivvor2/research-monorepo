@@ -714,6 +714,30 @@ class TestScreeningFallback:
         assert full["cell_metric"] == PRIMARY
         assert full["cell"] == pytest.approx(0.1)
 
+    def test_calibration_fallback_missing_reading_keeps_both_primary_cells(
+        self, tmp_path, fallback_protocol
+    ):
+        # Both gates are below the floor and the fallback column exists, but
+        # the kda gate has no fallback value at its selected LR: both cells
+        # stay on the primary metric and the gap is preserved (never a
+        # primary/fallback mix).
+        rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
+        for row in rows:
+            if row["gate_mode"] == "kda":
+                row[FALLBACK] = float("nan")
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        single = df[(df["kind"] == "single")]
+        full = single[single["gate_mode"] == "full"].iloc[0]
+        kda = single[single["gate_mode"] == "kda"].iloc[0]
+        assert full["cell_metric"] == PRIMARY
+        assert kda["cell_metric"] == PRIMARY
+        assert full["cell"] == pytest.approx(0.1)
+        assert kda["cell"] == pytest.approx(0.05)
+        assert full["gap_full_kda"] == pytest.approx(0.05)
+
     def _control_rows(self, full_primary, kda_primary):
         rows = []
         for seed in (0, 1):

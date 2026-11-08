@@ -211,6 +211,12 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
         # at the primary cell, read the shorter slice instead.
         metric = _protocol.screening_cell(task, primary_cells) if primary else None
         if metric is not None and metric != primary:
+            # Read the fallback cell for BOTH gates at their selected LRs
+            # before touching the rows: applying it gate by gate could leave
+            # one gate on the primary cell and the other on the fallback (or
+            # None), mixing metrics and losing the gap. A missing fallback
+            # column at one gate keeps both primary cells (this also covers
+            # a fallback column absent from the table).
             if metric not in grp.columns:
                 logger.info(
                     "screening fallback cell %r missing for %s; keeping %r",
@@ -219,11 +225,31 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                     primary,
                 )
             else:
-                logger.info("screening fallback for %s: reading %s", task, metric)
-                for gate, row in gate_rows.items():
-                    by_gate = grp[grp["gate_mode"] == gate]
-                    row["cell"] = _cell_mean(by_gate, metric, gate_lr[gate])
-                    row["cell_metric"] = metric
+                fallback_cells = {
+                    gate: _cell_mean(
+                        grp[grp["gate_mode"] == gate], metric, gate_lr[gate]
+                    )
+                    for gate in gate_rows
+                }
+                missing = [
+                    gate for gate, cell in fallback_cells.items() if cell is None
+                ]
+                if missing:
+                    logger.info(
+                        "screening fallback reading %r missing for %s (%s); "
+                        "keeping %r",
+                        metric,
+                        task,
+                        ", ".join(missing),
+                        primary,
+                    )
+                else:
+                    logger.info(
+                        "screening fallback for %s: reading %s", task, metric
+                    )
+                    for gate, row in gate_rows.items():
+                        row["cell"] = fallback_cells[gate]
+                        row["cell_metric"] = metric
         # Per-slice damage at each gate's selected point.
         reading = _protocol.TASK_DAMAGE.get(task)
         if reading is not None:
