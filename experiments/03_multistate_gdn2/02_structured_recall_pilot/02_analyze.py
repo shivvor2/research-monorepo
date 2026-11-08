@@ -210,11 +210,19 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
         # at the primary cell, read the shorter slice instead.
         metric = _protocol.screening_cell(task, primary_cells) if primary else None
         if metric is not None and metric != primary:
-            logger.info("screening fallback for %s: reading %s", task, metric)
-            for gate, row in gate_rows.items():
-                by_gate = grp[grp["gate_mode"] == gate]
-                row["cell"] = _cell_mean(by_gate, metric, gate_lr[gate])
-                row["cell_metric"] = metric
+            if metric not in grp.columns:
+                logger.info(
+                    "screening fallback cell %r missing for %s; keeping %r",
+                    metric,
+                    task,
+                    primary,
+                )
+            else:
+                logger.info("screening fallback for %s: reading %s", task, metric)
+                for gate, row in gate_rows.items():
+                    by_gate = grp[grp["gate_mode"] == gate]
+                    row["cell"] = _cell_mean(by_gate, metric, gate_lr[gate])
+                    row["cell_metric"] = metric
         # Per-slice damage at each gate's selected point.
         reading = _protocol.TASK_DAMAGE.get(task)
         if reading is not None:

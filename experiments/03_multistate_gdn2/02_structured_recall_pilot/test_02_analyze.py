@@ -595,6 +595,22 @@ class TestScreeningFallback:
         assert full["cell_metric"] == PRIMARY
         assert full["cell"] == pytest.approx(0.1)
 
+    def test_calibration_fallback_missing_column_keeps_primary(
+        self, tmp_path, fallback_protocol
+    ):
+        # Both gates are below the floor, but the fallback column is absent:
+        # the report keeps the primary cells instead of raising KeyError.
+        rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
+        for row in rows:
+            row.pop(FALLBACK)
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["cell_metric"] == PRIMARY
+        assert full["cell"] == pytest.approx(0.1)
+
     def _control_rows(self, full_primary, kda_primary):
         rows = []
         for seed in (0, 1):
