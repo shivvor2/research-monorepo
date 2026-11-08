@@ -437,12 +437,12 @@ def test_updated_class_proportions_match_placement_probs():
 
 
 def test_infeasible_config_raises():
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="write slots needed"):
         # Too many entities: writes cannot fit the write-region slots.
         EntityFieldConfig(
             vocab_size=2048, seq_len=256, num_fields=4, num_entities=(16,)
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="spans fewer than distant_min_blocks"):
         # Region too short for distant_min_blocks + 1 blocks (the 160-token
         # write region spans 10 blocks, too few for 11).
         EntityFieldConfig(
@@ -452,20 +452,27 @@ def test_infeasible_config_raises():
             num_entities=(8,),
             distant_min_blocks=10,
         )
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="reserved_filler must be >= 1"):
         # No reserved filler allowed (the layout needs it).
         EntityFieldConfig(vocab_size=2048, seq_len=256, reserved_filler=0)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="num_entities must be non-empty"):
         EntityFieldConfig(num_entities=())
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="duplicate num_entities entries"):
         EntityFieldConfig(num_entities=(2, 4, 4))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="must sum to 1"):
         EntityFieldConfig(placement_probs=(0.5, 0.5, 0.5))
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="block_size must be >= 2"):
         EntityFieldConfig(block_size=1)
-    with pytest.raises(ValueError):
-        # Too few entity ids for the requested count.
-        EntityFieldConfig(vocab_size=32, seq_len=64, num_fields=2, num_entities=(24,))
+    with pytest.raises(ValueError, match="only 27 ids, fewer than 28"):
+        # Passes the vocab-layout guard (V/2 - F - M = 28 >= 2) but has one
+        # fewer entity id than the requested count.
+        EntityFieldConfig(
+            vocab_size=64,
+            seq_len=512,
+            num_fields=2,
+            num_entities=(28,),
+            reserved_filler=2,
+        )
 
 
 def test_same_class_needs_same_block_pairs():

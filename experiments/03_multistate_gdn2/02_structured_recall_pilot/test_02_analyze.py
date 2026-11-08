@@ -306,6 +306,44 @@ class TestCalibrationDamage:
         assert full["damage/slice=32"] == pytest.approx(0.3)
         assert "damage" not in df.columns  # no pooled column
 
+    def test_damage_uses_only_the_selected_lr(self, tmp_path, damage_protocol):
+        # The selected LR is 0.01; an unselected LR carries a wildly
+        # different damage reading that must not leak into the value.
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                self._rows(
+                    seed,
+                    **{
+                        "test/acc/slice=16/class=untouched": 0.9,
+                        "test/acc/slice=16/class=sibling": 0.7,
+                    },
+                )
+            )
+            rows.append(
+                _row(
+                    f"old{seed}",
+                    gate="full",
+                    lr=0.003,
+                    seed=seed,
+                    best=0.2,
+                    step=10,
+                    **{
+                        METRIC: 0.1,
+                        "test/acc/slice=16/class=untouched": 1.0,
+                        "test/acc/slice=16/class=sibling": 0.0,
+                    },
+                )
+            )
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["selected_lr"] == pytest.approx(0.01)
+        assert full["damage/slice=16"] == pytest.approx(0.2)
+        assert pd.isna(full["damage/slice=32"])
+
     def test_multi_state_rows_get_damage_at_their_selected_lr(
         self, tmp_path, damage_protocol
     ):
@@ -543,6 +581,39 @@ class TestPositiveControl:
         assert (out / "positive_control.csv").read_text().strip() == ""
 
 
+class TestScreeningCell:
+    """Direct unit tests of the pure fallback rule."""
+
+    @pytest.fixture
+    def fallback_protocol(self, protocol, monkeypatch):
+        monkeypatch.setattr(protocol, "SCREENING_CELLS", {"toy": PRIMARY})
+        monkeypatch.setattr(protocol, "SCREENING_FALLBACKS", {"toy": (FALLBACK, 0.15)})
+        return protocol
+
+    def test_both_below_floor_returns_fallback(self, fallback_protocol):
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.1, "kda": 0.05})
+            == FALLBACK
+        )
+
+    def test_one_above_floor_keeps_primary(self, fallback_protocol):
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.2, "kda": 0.05})
+            == PRIMARY
+        )
+
+    def test_missing_gate_keeps_primary(self, fallback_protocol):
+        assert fallback_protocol.screening_cell("toy", {"full": 0.1}) == PRIMARY
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.1, "kda": None})
+            == PRIMARY
+        )
+
+    def test_task_without_fallback_keeps_primary(self, protocol):
+        # The protocol fixture registers a screening cell but no fallback.
+        assert protocol.screening_cell("toy", {"full": 0.0, "kda": 0.0}) == METRIC
+
+
 class TestScreeningFallback:
     @pytest.fixture
     def fallback_protocol(self, protocol, monkeypatch):
@@ -697,22 +768,35 @@ class TestScreeningFallback:
     def test_positive_control_no_fallback_when_one_gate_missing(
         self, tmp_path, fallback_protocol
     ):
-        # Only the full gate is present: the fallback rule needs both gates,
-        # so it does not trigger. With no paired gap the report has no row
-        # (a triggered fallback would have produced one from the fallback
-        # cell, which both gates carry).
-        rows = [
-            _row(
-                f"f{seed}",
-                gate="full",
-                seed=seed,
-                tier=TOY_CONTROL,
-                best=0.6,
-                step=5,
-                **{PRIMARY: 0.1, FALLBACK: 0.6},
+        # The full gate has only the primary cell; the kda gate has only the
+        # fallback cell (its primary value is missing). The rule needs both
+        # gates' primary readings, so it does not trigger and there is no
+        # paired gap: the report is empty. A wrongly triggered fallback would
+        # see both gates' fallback cells and produce a row.
+        rows = []
+        for seed in (0, 1):
+            rows.append(
+                _row(
+                    f"f{seed}",
+                    gate="full",
+                    seed=seed,
+                    tier=TOY_CONTROL,
+                    best=0.6,
+                    step=5,
+                    **{PRIMARY: 0.1, FALLBACK: 0.6},
+                )
             )
-            for seed in (0, 1)
-        ]
+            rows.append(
+                _row(
+                    f"k{seed}",
+                    gate="kda",
+                    seed=seed,
+                    tier=TOY_CONTROL,
+                    best=0.4,
+                    step=5,
+                    **{PRIMARY: float("nan"), FALLBACK: 0.4},
+                )
+            )
         out = tmp_path / "out"
         out.mkdir()
         _analyze.positive_control(_table(rows), out)
