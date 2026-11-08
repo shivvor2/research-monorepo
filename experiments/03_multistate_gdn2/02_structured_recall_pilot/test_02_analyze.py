@@ -813,9 +813,7 @@ class TestScreeningFallback:
         # as uninformative). The ordinary cell in the same table has its gap.
         out = tmp_path / "out"
         out.mkdir()
-        _analyze.calibration(
-            _table(self._no_gap_rows(drop_fallback_column=True)), out
-        )
+        _analyze.calibration(_table(self._no_gap_rows(drop_fallback_column=True)), out)
         df = pd.read_csv(out / "calibration.csv")
         assert "gap_full_kda" in df.columns
         self._assert_unreadable_fallback_cell_no_gap(df)
@@ -829,9 +827,7 @@ class TestScreeningFallback:
         # cell reports no gap, while the ordinary cell keeps its own.
         out = tmp_path / "out"
         out.mkdir()
-        _analyze.calibration(
-            _table(self._no_gap_rows(drop_fallback_column=False)), out
-        )
+        _analyze.calibration(_table(self._no_gap_rows(drop_fallback_column=False)), out)
         df = pd.read_csv(out / "calibration.csv")
         assert "gap_full_kda" in df.columns
         self._assert_unreadable_fallback_cell_no_gap(df)

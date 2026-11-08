@@ -16,11 +16,10 @@ from common.registries import config_type_of_task, require_harness
 from common.run_id import HASH_EXCLUDE, make_run_id
 from omegaconf import OmegaConf
 
-from research_lib.training.callbacks import config_hash
-
 from research_lib.architectures.zoology_lm import BaseConv
 from research_lib.data.synthetic import MQARConfig, OverwriteConfig, require_task
 from research_lib.layers.attention import CausalSelfAttention, MultistateGatedDelta
+from research_lib.training.callbacks import config_hash
 
 
 def _cfg(*, reserved_filler=0, tier=None):
@@ -135,7 +134,11 @@ class TestRunIdTaskKeys:
         base = _ef_cfg()
         base.model.mixer = "attention"
         base_id = make_run_id(base, 0.003, include_task_keys=True)
-        for key, value in (("layout", "ws"), ("gate_mode", "kda"), ("lambda_mode", "gated")):
+        for key, value in (
+            ("layout", "ws"),
+            ("gate_mode", "kda"),
+            ("lambda_mode", "gated"),
+        ):
             cfg = _ef_cfg()
             cfg.model.mixer = "attention"
             cfg.model[key] = value
