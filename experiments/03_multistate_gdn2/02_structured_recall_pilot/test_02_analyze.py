@@ -735,11 +735,13 @@ class TestScreeningFallback:
         assert full["cell_metric"] == PRIMARY
         assert full["cell"] == pytest.approx(0.1)
 
-    def test_calibration_fallback_missing_column_keeps_primary(
+    def test_calibration_fallback_missing_column_reports_no_gap(
         self, tmp_path, fallback_protocol
     ):
         # Both gates are below the floor, but the fallback column is absent:
-        # the report keeps the primary cells instead of raising KeyError.
+        # the report keeps the primary cells for inspection and reports NO
+        # gap (the primary gap would be noise the protocol flagged as
+        # uninformative).
         rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
         for row in rows:
             row.pop(FALLBACK)
@@ -750,14 +752,15 @@ class TestScreeningFallback:
         full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
         assert full["cell_metric"] == PRIMARY
         assert full["cell"] == pytest.approx(0.1)
+        assert "gap_full_kda" not in df.columns
 
-    def test_calibration_fallback_missing_reading_keeps_both_primary_cells(
+    def test_calibration_fallback_missing_reading_reports_no_gap(
         self, tmp_path, fallback_protocol
     ):
         # Both gates are below the floor and the fallback column exists, but
         # the kda gate has no fallback value at its selected LR: both cells
-        # stay on the primary metric and the gap is preserved (never a
-        # primary/fallback mix).
+        # stay on the primary metric (never a primary/fallback mix) and the
+        # gap is not reported.
         rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
         for row in rows:
             if row["gate_mode"] == "kda":
@@ -773,7 +776,22 @@ class TestScreeningFallback:
         assert kda["cell_metric"] == PRIMARY
         assert full["cell"] == pytest.approx(0.1)
         assert kda["cell"] == pytest.approx(0.05)
-        assert full["gap_full_kda"] == pytest.approx(0.05)
+        assert "gap_full_kda" not in full
+        assert "gap_full_kda" not in kda
+
+    def test_positive_control_fallback_missing_column_skips_task(
+        self, tmp_path, fallback_protocol
+    ):
+        # Both gates are below the floor, but the fallback column is absent:
+        # there is no valid screening reading, so the task gets no row at
+        # all instead of a primary-gap row.
+        rows = self._control_rows(full_primary=0.1, kda_primary=0.05)
+        for row in rows:
+            row.pop(FALLBACK)
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out)
+        assert (out / "positive_control.csv").read_text().strip() == ""
 
     def _control_rows(self, full_primary, kda_primary):
         rows = []
@@ -861,6 +879,8 @@ class TestScreeningFallback:
         out = tmp_path / "out"
         out.mkdir()
         _analyze.positive_control(_table(rows), out)
+        # The no-row case still carries the report schema, so read_csv works
+        # and yields an empty frame.
         df = pd.read_csv(out / "positive_control.csv")
         assert df.empty
 

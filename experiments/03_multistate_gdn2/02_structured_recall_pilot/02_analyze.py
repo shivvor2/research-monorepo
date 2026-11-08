@@ -34,6 +34,11 @@ per-gate ``damage_full/slice={n}`` / ``damage_kda/slice={n}`` columns
 (``positive_control``): the mean of the high-class accuracy minus the
 low-class accuracy over the cell's runs. A task with a screening
 fallback reads the shorter slice when both gates fall below its floor.
+An unreadable fallback (its column missing from the table, or a gate
+with no fallback value at its selected point) leaves the gap
+unreported: the calibration rows keep the primary cells without a gap
+column and the positive control skips the task, both logged at warning
+level.
 
 Usage:
     python 02_analyze.py calibration positive_control completeness
@@ -208,22 +213,25 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
             primary_cells[gate] = cell
             rows.append(row)
         # Apply the screening fallback: if both gates read below the floor
-        # at the primary cell, read the shorter slice instead.
+        # at the primary cell, read the shorter slice instead. The fallback
+        # only fires when the primary gap is uninformative by protocol, so an
+        # unreadable fallback leaves NO gap at all (the primary cells are
+        # kept for inspection only).
         metric = _protocol.screening_cell(task, primary_cells) if primary else None
+        unreadable_fallback = False
         if metric is not None and metric != primary:
             # Read the fallback cell for BOTH gates at their selected LRs
             # before touching the rows: applying it gate by gate could leave
             # one gate on the primary cell and the other on the fallback (or
-            # None), mixing metrics and losing the gap. A missing fallback
-            # column at one gate keeps both primary cells (this also covers
-            # a fallback column absent from the table).
+            # None), mixing metrics.
             if metric not in grp.columns:
-                logger.info(
-                    "screening fallback cell %r missing for %s; keeping %r",
+                logger.warning(
+                    "screening fallback cell %r missing for %s; reporting "
+                    "no gap",
                     metric,
                     task,
-                    primary,
                 )
+                unreadable_fallback = True
             else:
                 fallback_cells = {
                     gate: _cell_mean(
@@ -235,14 +243,14 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                     gate for gate, cell in fallback_cells.items() if cell is None
                 ]
                 if missing:
-                    logger.info(
+                    logger.warning(
                         "screening fallback reading %r missing for %s (%s); "
-                        "keeping %r",
+                        "reporting no gap",
                         metric,
                         task,
-                        ", ".join(missing),
-                        primary,
+                        ", ".join(sorted(missing)),
                     )
+                    unreadable_fallback = True
                 else:
                     logger.info("screening fallback for %s: reading %s", task, metric)
                     for gate, row in gate_rows.items():
@@ -255,10 +263,13 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                 at_lr = grp[(grp["gate_mode"] == gate) & (grp["lr"] == gate_lr[gate])]
                 for n in reading.slices:
                     row[f"damage/slice={n}"] = _damage(at_lr, task, n)
-        # Attach the full - kda gap to the single-state rows of this cell.
+        # Attach the full - kda gap to the single-state rows of this cell --
+        # never after an unreadable fallback, which leaves no valid screening
+        # reading.
         cells = {gate: row["cell"] for gate, row in gate_rows.items()}
         if (
-            "full" in cells
+            not unreadable_fallback
+            and "full" in cells
             and "kda" in cells
             and cells["full"] is not None
             and cells["kda"] is not None
@@ -424,13 +435,12 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
             readings[gate] = float(sub.mean()) if not sub.empty else None
         metric = _protocol.screening_cell(task, readings)
         if metric != primary and metric not in base.columns:
-            logger.info(
-                "screening fallback cell %r missing for %s; keeping %r",
+            logger.warning(
+                "screening fallback cell %r missing for %s; skipping the task",
                 metric,
                 task,
-                primary,
             )
-            metric = primary
+            continue
         if metric != primary:
             logger.info("screening fallback for %s: reading %s", task, metric)
         by_task = tier_rows[tier_rows[metric].notna()]
