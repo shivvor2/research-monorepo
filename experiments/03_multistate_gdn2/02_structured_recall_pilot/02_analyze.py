@@ -226,8 +226,7 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
             # None), mixing metrics.
             if metric not in grp.columns:
                 logger.warning(
-                    "screening fallback cell %r missing for %s; reporting "
-                    "no gap",
+                    "screening fallback cell %r missing for %s; reporting no gap",
                     metric,
                     task,
                 )
