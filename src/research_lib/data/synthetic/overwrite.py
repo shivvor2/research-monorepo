@@ -75,13 +75,12 @@ from __future__ import annotations
 
 import enum
 import logging
-import math
 from dataclasses import dataclass
 
 import numpy as np
 import torch
 
-from ._sampling import _SAMPLER_LOG_FLOOR, _distinct_ints, _sampler_log_prob
+from ._sampling import _check_sampler_floor, _distinct_ints
 
 logger = logging.getLogger(__name__)
 
@@ -264,17 +263,14 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"[1, vocab_size // 2 - reserved_filler) = [1, {n_key + 1}), "
             f"which has only {n_key} ids, fewer than {k} distinct keys"
         )
-    log_key = _sampler_log_prob(n_key, k)
-    if log_key < _SAMPLER_LOG_FLOOR:
-        prob = math.exp(log_key)
-        raise ValueError(
-            f"num_keys entry {k} would stall the key sampler: drawing "
-            f"{k} distinct ids from the {n_key}-id key pool succeeds with "
-            f"exact probability {n_key}! / (({n_key} - {k})! * "
-            f"{n_key}^{k}) = {prob:.3%}, below the 1% floor (expected "
-            f"redraws ~{1.0 / prob:.0f} per row); increase vocab_size or "
-            f"reduce reserved_filler"
-        )
+    _check_sampler_floor(
+        n_key,
+        k,
+        f"num_keys entry {k}",
+        "key",
+        f"{n_key}! / (({n_key} - {k})! * {n_key}^{k})",
+        "increase vocab_size or reduce reserved_filler",
+    )
     n_val = config.vocab_size // 2
     if n_val < 2 * k:
         raise ValueError(
@@ -283,17 +279,14 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"has only V/2 = {n_val} ids"
         )
     d_val = 2 * k
-    log_value = _sampler_log_prob(n_val, d_val)
-    if log_value < _SAMPLER_LOG_FLOOR:
-        prob = math.exp(log_value)
-        raise ValueError(
-            f"num_keys entry {k} would stall the value sampler: drawing "
-            f"2K = {d_val} distinct values from the {n_val}-id value pool "
-            f"succeeds with exact probability {n_val}! / (({n_val} - "
-            f"{d_val})! * {n_val}^{d_val}) = {prob:.3%}, below the 1% "
-            f"floor (expected redraws ~{1.0 / prob:.0f} per row); "
-            f"increase vocab_size"
-        )
+    _check_sampler_floor(
+        n_val,
+        d_val,
+        f"num_keys entry {k}",
+        "value",
+        f"{n_val}! / (({n_val} - {d_val})! * {n_val}^{d_val})",
+        "increase vocab_size",
+    )
 
 
 def _generate_example_batch(

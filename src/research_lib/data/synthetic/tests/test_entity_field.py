@@ -500,6 +500,19 @@ def test_value_sampler_floor_raises():
         )
 
 
+def test_zero_probability_sampler_floor_raises():
+    """A draw whose success probability underflows to zero is rejected with
+    a finite message (no division by zero)."""
+    with pytest.raises(ValueError, match="effectively unbounded"):
+        EntityFieldConfig(
+            vocab_size=5028,
+            seq_len=13000,
+            num_fields=1,
+            num_entities=(2000,),
+            update_fraction=0.0,
+        )
+
+
 # =============================================================================
 # Datamodule
 # =============================================================================

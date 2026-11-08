@@ -34,6 +34,53 @@ def _sampler_log_prob(n: int, d: int) -> float:
     return math.lgamma(n + 1) - math.lgamma(n - d + 1) - d * math.log(n)
 
 
+def _check_sampler_floor(
+    n: int,
+    d: int,
+    subject: str,
+    sampler: str,
+    formula: str,
+    hint: str,
+) -> None:
+    """Raise when a without-replacement draw would stall the redraw loop.
+
+    The per-round success probability of drawing ``d`` distinct ids from
+    an ``n``-id pool must clear the 1% floor; otherwise the rejection loop
+    is expected to redraw a row too often (or, when the probability
+    underflows to zero, never succeed).
+
+    Args:
+        n: The number of ids in the pool.
+        d: The number of distinct ids drawn per row.
+        subject: The leading description, e.g. ``"num_keys entry 16"``.
+        sampler: The pool name used in the message (``"key"``,
+            ``"value"`` or ``"entity"``).
+        formula: The exact probability expression to show before the
+            numeric value (``""`` to omit it).
+        hint: The remedy appended to the message.
+
+    Raises:
+        ValueError: If the probability is below the floor. When it
+            underflows to ``0`` the expected redraws are reported as
+            "effectively unbounded" instead of dividing by zero.
+    """
+    log_prob = _sampler_log_prob(n, d)
+    if log_prob >= _SAMPLER_LOG_FLOOR:
+        return
+    prob = math.exp(log_prob)
+    prob_clause = f"{formula} = {prob:.3%}" if formula else f"{prob:.3%}"
+    if prob > 0.0:
+        redraws = f"~{1.0 / prob:.0f} per row"
+    else:
+        redraws = "effectively unbounded per row"
+    raise ValueError(
+        f"{subject} would stall the {sampler} sampler: drawing {d} distinct "
+        f"ids from the {n}-id {sampler} pool succeeds with exact probability "
+        f"{prob_clause}, below the 1% floor (expected redraws {redraws}); "
+        f"{hint}"
+    )
+
+
 def _distinct_ints(
     rng: np.random.Generator, low: int, high: int, shape: tuple[int, int]
 ) -> np.ndarray:

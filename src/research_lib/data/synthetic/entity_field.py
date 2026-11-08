@@ -78,7 +78,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from ._sampling import _SAMPLER_LOG_FLOOR, _distinct_ints, _sampler_log_prob
+from ._sampling import _check_sampler_floor, _distinct_ints
 
 logger = logging.getLogger(__name__)
 
@@ -311,16 +311,14 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
             f"from [1, {n_entity_pool + 1}), which has only {n_entity_pool} "
             f"ids, fewer than {n_entities} distinct entities"
         )
-    log_entity = _sampler_log_prob(n_entity_pool, n_entities)
-    if log_entity < _SAMPLER_LOG_FLOOR:
-        prob = math.exp(log_entity)
-        raise ValueError(
-            f"num_entities entry {n_entities} would stall the entity sampler: "
-            f"drawing {n_entities} distinct ids from the {n_entity_pool}-id "
-            f"entity pool succeeds with exact probability {prob:.3%}, below "
-            f"the 1% floor (expected redraws ~{1.0 / prob:.0f} per row); "
-            f"increase vocab_size or reduce reserved_filler"
-        )
+    _check_sampler_floor(
+        n_entity_pool,
+        n_entities,
+        f"num_entities entry {n_entities}",
+        "entity",
+        "",
+        "increase vocab_size or reduce reserved_filler",
+    )
     n_values = n + u
     n_value_pool = config.vocab_size // 2
     if n_values > n_value_pool:
@@ -329,16 +327,14 @@ def _validate_entity_count(config: EntityFieldConfig, n_entities: int) -> None:
             f"distinct values are needed but the value pool "
             f"[vocab_size // 2, vocab_size) has only {n_value_pool} ids"
         )
-    log_value = _sampler_log_prob(n_value_pool, n_values)
-    if log_value < _SAMPLER_LOG_FLOOR:
-        prob = math.exp(log_value)
-        raise ValueError(
-            f"num_entities entry {n_entities} would stall the value sampler: "
-            f"drawing N + U = {n_values} distinct values from the "
-            f"{n_value_pool}-id value pool succeeds with exact probability "
-            f"{prob:.3%}, below the 1% floor (expected redraws "
-            f"~{1.0 / prob:.0f} per row); increase vocab_size"
-        )
+    _check_sampler_floor(
+        n_value_pool,
+        n_values,
+        f"num_entities entry {n_entities}",
+        "value",
+        "",
+        "increase vocab_size",
+    )
 
 
 def _block_of(position: int, block_size: int) -> int:
