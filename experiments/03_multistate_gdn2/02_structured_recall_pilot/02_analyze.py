@@ -28,10 +28,11 @@ Reports
     expected count (via ``common.analysis.missing_runs``).
 
 Tasks that declare a damage reading in the protocol get per-slice
-``damage/slice={n}`` columns (``calibration``, at each gate's selected
-point) and per-gate ``damage_full/slice={n}`` / ``damage_kda/slice={n}``
-columns (``positive_control``): the mean of the high-class accuracy minus
-the low-class accuracy over the cell's runs. A task with a screening
+``damage/slice={n}`` columns (``calibration``, at each single-state
+gate's selected point and at each multi-state row's selected LR) and
+per-gate ``damage_full/slice={n}`` / ``damage_kda/slice={n}`` columns
+(``positive_control``): the mean of the high-class accuracy minus the
+low-class accuracy over the cell's runs. A task with a screening
 fallback reads the shorter slice when both gates fall below its floor.
 
 Usage:
@@ -250,27 +251,31 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
         if per_lr.empty:
             continue
         chosen = select_lr(per_lr)
-        rows.append(
-            {
-                "kind": "multi",
-                "task": task,
-                "layout": layout,
-                "gate_mode": gate,
-                "lambda_mode": lam,
-                "decay_scheme": decay,
-                "mixer": "gated_delta",
-                "n_seeds": _n_seeds(per_lr, chosen),
-                "d_model": (
-                    int(grp["d_model"].dropna().iloc[0])
-                    if grp["d_model"].notna().any()
-                    else None
-                ),
-                "selected_lr": chosen,
-                "mean_best_value": (
-                    float(per_lr.loc[chosen, "mean_acc"]) if not per_lr.empty else None
-                ),
-            }
-        )
+        row = {
+            "kind": "multi",
+            "task": task,
+            "layout": layout,
+            "gate_mode": gate,
+            "lambda_mode": lam,
+            "decay_scheme": decay,
+            "mixer": "gated_delta",
+            "n_seeds": _n_seeds(per_lr, chosen),
+            "d_model": (
+                int(grp["d_model"].dropna().iloc[0])
+                if grp["d_model"].notna().any()
+                else None
+            ),
+            "selected_lr": chosen,
+            "mean_best_value": (
+                float(per_lr.loc[chosen, "mean_acc"]) if not per_lr.empty else None
+            ),
+        }
+        reading = _protocol.TASK_DAMAGE.get(task)
+        if reading is not None:
+            at_lr = grp[grp["lr"] == chosen]
+            for n in reading.slices:
+                row[f"damage/slice={n}"] = _damage(at_lr, task, n)
+        rows.append(row)
     # --- attention: one row per (task, decay, layout); no gate ---
     attn = sel[sel["mixer"].fillna("gated_delta") == "attention"]
     for keys, grp in attn.groupby(["task", "decay_scheme", "layout"]):

@@ -306,6 +306,38 @@ class TestCalibrationDamage:
         assert full["damage/slice=32"] == pytest.approx(0.3)
         assert "damage" not in df.columns  # no pooled column
 
+    def test_multi_state_rows_get_damage_at_their_selected_lr(
+        self, tmp_path, damage_protocol
+    ):
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"m{seed}",
+                    layout="ws",
+                    gate="full",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.8,
+                    step=10,
+                    **{
+                        METRIC: 0.9,
+                        "test/acc/slice=16/class=untouched": 0.9,
+                        "test/acc/slice=16/class=sibling": 0.7,
+                        "test/acc/slice=32/class=untouched": 0.8,
+                        "test/acc/slice=32/class=sibling": 0.5,
+                    },
+                )
+            )
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        multi = df[df["kind"] == "multi"].iloc[0]
+        assert multi["selected_lr"] == pytest.approx(0.01)
+        assert multi["damage/slice=16"] == pytest.approx(0.2)
+        assert multi["damage/slice=32"] == pytest.approx(0.3)
+
     def test_missing_slice_columns_give_none(self, tmp_path, damage_protocol):
         rows = [
             self._rows(
