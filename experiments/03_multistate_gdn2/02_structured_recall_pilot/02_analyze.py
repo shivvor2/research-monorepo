@@ -778,6 +778,14 @@ def positive_control(
     )
 
 
+def _order_lengths(lengths: set) -> list:
+    """Lengths in ascending order, the missing length (``pd.NA``) last."""
+    ordered = sorted(l for l in lengths if l is not pd.NA)
+    if any(l is pd.NA for l in lengths):
+        ordered.append(pd.NA)
+    return ordered
+
+
 def _completeness_rows(
     table: pd.DataFrame, expected: dict[str, int], overrides: dict[str, int]
 ) -> list[dict]:
@@ -786,21 +794,29 @@ def _completeness_rows(
     The length rerun reuses the same tier, so completeness reads one cell
     per length: the tier's expected count applies to each length present,
     and an override limits a task to the given length (other lengths of
-    that task are ignored). A tier with no done runs gets a single row with
-    the expected count.
+    that task are ignored). Runs without a length (a missing ``seq_len``
+    column value, or an absent column at all) are counted in their own
+    ``(tier, <NA>)`` row rather than dropped, and that row's ``seq_len`` is
+    written empty. A tier with no done runs gets a single row with the
+    expected count.
     """
     table = table.copy()
     if "seq_len" in table.columns:
-        table["_seq"] = table["seq_len"]
+        table["_seq"] = pd.to_numeric(table["seq_len"], errors="coerce").astype("Int64")
     else:
-        table["_seq"] = pd.NA
+        table["_seq"] = pd.Series(pd.NA, index=table.index, dtype="Int64")
     keep = pd.Series(True, index=table.index)
     for task, length in overrides.items():
-        keep &= ~((table["task"] == task) & (table["_seq"].astype(str) != str(length)))
+        # Numeric comparison (never str, which would float-truncate): a row
+        # at the task's own other length, or without a length, is dropped;
+        # rows of other tasks are untouched.
+        own = table["task"] == task
+        at_length = table["_seq"].fillna(-1) == int(length)
+        keep &= ~(own & ~at_length)
     table = table[keep]
     done = table[table["status"].fillna("").astype(str) == RUN_DONE_STATUS]
     observed: dict[tuple[str, object], int] = {}
-    for (tier, length), grp in done.groupby(["tier", "_seq"]):
+    for (tier, length), grp in done.groupby(["tier", "_seq"], dropna=False):
         observed[(str(tier), length)] = int(grp["run_id"].nunique())
     present_lengths: dict[str, set] = {}
     for tier_s, length in observed:
@@ -820,12 +836,12 @@ def _completeness_rows(
                 }
             )
             continue
-        for length in sorted(lengths):
+        for length in _order_lengths(lengths):
             obs = observed.get((tier_s, length), 0)
             rows.append(
                 {
                     "tier": tier_s,
-                    "seq_len": length,
+                    "seq_len": "" if length is pd.NA else length,
                     "expected": exp,
                     "observed": obs,
                     "missing": max(0, exp - obs),
@@ -837,11 +853,11 @@ def _completeness_rows(
     for tier_s in sorted(present_lengths):
         if tier_s in expected:
             continue
-        for length in sorted(present_lengths[tier_s]):
+        for length in _order_lengths(present_lengths[tier_s]):
             rows.append(
                 {
                     "tier": tier_s,
-                    "seq_len": length,
+                    "seq_len": "" if length is pd.NA else length,
                     "expected": 0,
                     "observed": observed.get((tier_s, length), 0),
                     "missing": 0,

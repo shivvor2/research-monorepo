@@ -1872,6 +1872,79 @@ class TestCompletenessPerLength:
         assert (df["expected"] == 2).all()
 
 
+class TestCompletenessMissingLength:
+    def test_missing_length_task_counts_beside_another_tasks_override(
+        self, tmp_path, monkeypatch
+    ):
+        # Task ``a`` has no seq_len at all (the column is float / NA); the
+        # override is for task ``b``. Both tasks' done runs are counted and
+        # the override filters only ``b``.
+        monkeypatch.setattr(
+            _analyze._protocol, "EXPECTED_RUNS", {"a_tier": 1, "b_tier": 1}
+        )
+        rows = [
+            _row("a0", task="a", tier="a_tier", best=0.6, step=5, seq_len=None),
+            _row("b0", task="b", tier="b_tier", best=0.6, step=5, seq_len=512),
+            _row("b1", task="b", tier="b_tier", best=0.6, step=5, seq_len=512),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.completeness(_table(rows), out, {"b": 512})
+        # keep_default_na=False: the empty seq_len in the CSV must stay empty
+        # instead of being read back as NaN in a mixed column.
+        df = pd.read_csv(out / "completeness.csv", keep_default_na=False)
+        a_row = df[df["tier"] == "a_tier"].iloc[0]
+        assert a_row["observed"] == 1
+        assert a_row["seq_len"] == ""  # the missing length writes empty
+        b_row = df[df["tier"] == "b_tier"].iloc[0]
+        assert b_row["observed"] == 2
+        assert b_row["seq_len"] == "512"
+
+    def test_float_seq_len_column_override_keeps_the_length_runs(
+        self, tmp_path, monkeypatch
+    ):
+        # One row without seq_len makes the column float ("512.0"); the
+        # override must still match the 512 rows numerically and drop only
+        # the not-at-512 ones.
+        monkeypatch.setattr(
+            _analyze._protocol, "EXPECTED_RUNS", {"calib_mad_single": 12}
+        )
+        rows = [
+            _row(
+                "x0",
+                task="mad_fuzzy",
+                tier="calib_mad_single",
+                best=0.6,
+                step=5,
+                seq_len=512,
+            ),
+            _row(
+                "x1",
+                task="mad_fuzzy",
+                tier="calib_mad_single",
+                best=0.6,
+                step=5,
+                seq_len=512,
+            ),
+            _row(
+                "y0",
+                task="mad_fuzzy",
+                tier="calib_mad_single",
+                best=0.6,
+                step=5,
+                seq_len=None,
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.completeness(_table(rows), out, {"mad_fuzzy": 512})
+        df = pd.read_csv(out / "completeness.csv")
+        assert len(df) == 1
+        cell = df.iloc[0]
+        assert cell["seq_len"] == 512
+        assert cell["observed"] == 2
+
+
 class TestOwnTierCalibration:
     def test_mismatched_tier_row_excluded_not_silent(
         self, tmp_path, protocol, monkeypatch, caplog
