@@ -58,6 +58,7 @@ def flatten(record: Mapping[str, Any]) -> dict[str, Any]:
             else (cfg.get("optimizer") or {}).get("weight_decay")
         ),
         "seq_len": task_config.get("seq_len"),
+        "monitor_key": (cfg.get("training") or {}).get("monitor_key"),
         "seed": record.get("seed"),
         "tier": (cfg.get("experiment") or {}).get("tier"),
         "phase": (cfg.get("experiment") or {}).get("phase"),

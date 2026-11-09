@@ -72,7 +72,6 @@ for _path in (_PILOT, _PROJECT, _SRC):
         sys.path.insert(0, str(_path))
 
 from common.analysis import (  # noqa: E402
-    missing_runs,
     paired_gap_report,
     per_seed_mean,
     select_hyperparams,
@@ -199,6 +198,55 @@ def _near_edge(value: float | None, band: _protocol.SettingBand) -> bool | None:
     )
 
 
+def _own_task_tiers(sel: pd.DataFrame) -> pd.DataFrame:
+    """Keep only selected rows whose tier belongs to their own task's
+    calibration tiers; log any excluded run IDs (a mismatched row would
+    otherwise form a spurious calibration group)."""
+    if sel.empty:
+        return sel
+    keep: list[str] = []
+    exclude: list[str] = []
+    for _, r in sel.iterrows():
+        task = str(r.get("task"))
+        tiers = _protocol.TASK_TIERS.get(task)
+        if tiers is not None and str(r.get("tier")) in tiers.calibration:
+            keep.append(str(r.get("run_id")))
+        else:
+            exclude.append(str(r.get("run_id")))
+    if exclude:
+        logger.warning(
+            "calibration: excluding runs whose tier is not in their task's "
+            "calibration tiers: %s",
+            sorted(exclude),
+        )
+    return sel[sel["run_id"].isin(keep)]
+
+
+def _validate_seq_len_overrides(
+    table: pd.DataFrame, seq_len_overrides: dict[str, int]
+) -> None:
+    """Refuse a ``--seq-len`` override that names no task in the table or a
+    length with no rows for that task (an ignored override must not pass)."""
+    if not seq_len_overrides:
+        return
+    present_tasks = (
+        set(table["task"].dropna().astype(str)) if "task" in table.columns else set()
+    )
+    for task, length in seq_len_overrides.items():
+        if task not in present_tasks:
+            raise RuntimeError(
+                f"--seq-len names task {task!r}, which has no rows in the run "
+                "table; refusing an ignored override"
+            )
+        if "seq_len" in table.columns:
+            lengths = set(table[table["task"] == task]["seq_len"].dropna().astype(int))
+            if length not in lengths:
+                raise RuntimeError(
+                    f"--seq-len {task}={length} matches no rows; readings "
+                    f"exist at {sorted(lengths)}"
+                )
+
+
 def _looks_stuck(row: pd.Series) -> bool | None:
     """A per-run look-stuck flag from the recorded monitored metric.
 
@@ -240,20 +288,36 @@ def calibration(
     table["decay_scheme"] = table.get("decay_scheme").fillna("grouped")
     seq = table.get("seq_len")
     table["seq_len"] = 0 if seq is None else seq.fillna(0).astype(int)
+    _validate_seq_len_overrides(table, seq_len_overrides or {})
     rows: list[dict] = []
-    sel = _selection(table)
+    sel = _own_task_tiers(_selection(table))
     gated_sel = _gated(sel)
     attn = sel[sel["mixer"].fillna("gated_delta") == "attention"]
     # --- Refuse a silent drop: a selected gated/attention run must name a
-    # weight decay (from the record field or the config), or the (lr,
-    # weight_decay) grouping would drop it silently.
+    # weight decay and a learning rate (from the record or the config), or
+    # the (lr, weight_decay) grouping would drop it silently.
     for label, chosen in (("gated", gated_sel), ("attention", attn)):
-        missing = chosen[chosen["weight_decay"].isna()]["run_id"].dropna()
-        if not missing.empty:
+        for column, name in (("weight_decay", "weight decay"), ("lr", "learning rate")):
+            missing = chosen[chosen[column].isna()]["run_id"].dropna()
+            if not missing.empty:
+                raise RuntimeError(
+                    f"calibration: {label} runs have no {name} (neither the "
+                    f"record field nor config.optimizer.{column}); refusing a "
+                    f"silent drop. Runs: {sorted(missing.tolist())}"
+                )
+    # --- Refuse a task's band rows recorded on another monitor key: their
+    # best validation value would be classified under the wrong metric.
+    for task, band in _protocol.TASK_SETTING_BANDS.items():
+        band_rows = sel[sel["task"] == task]
+        if "monitor_key" not in band_rows.columns:
+            continue
+        has = band_rows["monitor_key"].notna()
+        wrong = band_rows[has & (band_rows["monitor_key"] != band.metric)]["run_id"]
+        if not wrong.empty:
             raise RuntimeError(
-                f"calibration: {label} runs have no weight decay (neither the "
-                "record field nor config.optimizer.weight_decay); refusing a "
-                f"silent drop. Runs: {sorted(missing.tolist())}"
+                f"calibration: task {task!r} has a band on {band.metric}, but "
+                f"runs were monitored on another key. Runs: "
+                f"{sorted(wrong.tolist())}"
             )
     # --- gated-delta: single-state (the gap) and multi-state ---
     single = gated_sel[gated_sel["layout"] == "single"]
@@ -467,6 +531,14 @@ def _stuck_report(sel: pd.DataFrame, out_dir: Path) -> None:
     )
 
 
+def _scalar_value(row: dict, key: str) -> float | None:
+    """The row's selected value for ``key`` (``None`` when absent / NaN)."""
+    try:
+        return float(row.get(key))
+    except (TypeError, ValueError):
+        return None
+
+
 def _frozen_snippet(
     rows: list[dict], out_dir: Path, seq_len_overrides: dict[str, int]
 ) -> None:
@@ -477,15 +549,39 @@ def _frozen_snippet(
     .<gate>`` for the gated-delta cells and ``<table>.<task>.attention``
     (a single flat value per task) for the attention control.  The
     sequence length is picked once per task over the combined (gated and
-    attention) rows: without ``seq_len_overrides`` a task with rows at more
-    than one length is refused, and an override that matches no rows is an
-    error rather than a silently-empty table.
+    attention) rows, and for each task that carries a frozen setting the
+    snippet also writes ``task_settings.<task>`` with the length its tables
+    were taken from (so the length and the tables cannot disagree).  Without
+    ``seq_len_overrides`` a task with rows at more than one length is
+    refused; an override matching no rows is an error.
     """
+    entries = [
+        r
+        for r in rows
+        if r.get("decay_scheme") == "grouped"
+        and (
+            _scalar_value(r, "selected_lr") is not None
+            or _scalar_value(r, "selected_weight_decay") is not None
+        )
+    ]
+    chosen = _chosen_lengths(entries, "length", seq_len_overrides)
     tables = "".join(
-        _frozen_table_section(rows, name, seq_len_overrides)
-        for name in ("lr", "weight_decay")
+        _frozen_table_section(rows, name, chosen) for name in ("lr", "weight_decay")
     )
-    (out_dir / "frozen_protocol_snippet.yaml").write_text(tables, encoding="utf-8")
+    blocks = [tables.rstrip("\n")]
+    task_names = sorted(
+        {r["task"] for r in entries} & set(_protocol.FROZEN_TASK_KEYS)
+    )
+    if task_names:
+        block = ["task_settings:"]
+        for task in task_names:
+            block.append(f"  {task}:")
+            for key in _protocol.FROZEN_TASK_KEYS[task]:
+                block.append(f"    {key}: {chosen[task]}")
+        blocks.append("\n".join(block))
+    (out_dir / "frozen_protocol_snippet.yaml").write_text(
+        "\n\n".join(blocks) + "\n", encoding="utf-8"
+    )
 
 
 def _chosen_lengths(
@@ -525,27 +621,25 @@ def _chosen_lengths(
 
 
 def _frozen_table_section(
-    rows: list[dict], scalar: str, seq_len_overrides: dict[str, int]
+    rows: list[dict], scalar: str, chosen: dict[str, int]
 ) -> str:
-    """One frozen table's YAML block (``lr`` or ``weight_decay``)."""
+    """One frozen table's YAML block (``lr`` or ``weight_decay``), limited to
+    the frozen length ``chosen`` per task. Two grouped rows at the same
+    (task, layout, gate) with different values are refused (identical values
+    may coexist)."""
     key = "selected_lr" if scalar == "lr" else "selected_weight_decay"
     gated = []
     attention = []
     for r in rows:
         if r.get("decay_scheme") != "grouped":
             continue
-        try:
-            value = float(r.get(key))
-        except (TypeError, ValueError):
-            value = None
+        value = _scalar_value(r, key)
         if value is None:
             continue
         if r.get("kind") == "attention":
             attention.append({**r, "_selected": value})
         elif r.get("kind") in ("single", "multi"):
             gated.append({**r, "_selected": value})
-    # One length per task over the combined rows, then split by kind.
-    chosen = _chosen_lengths([*gated, *attention], scalar, seq_len_overrides)
     gated = [r for r in gated if r.get("seq_len") == chosen.get(r["task"])]
     attention = [r for r in attention if r.get("seq_len") == chosen.get(r["task"])]
     table_name = f"{scalar}_table"
@@ -558,7 +652,15 @@ def _frozen_table_section(
             if r["task"] != task:
                 continue
             layout = r.get("layout") or "single"
-            by_layout.setdefault(layout, {})[r["gate_mode"]] = r["_selected"]
+            gate = r["gate_mode"]
+            existing = by_layout.get(layout, {}).get(gate)
+            if existing is not None and existing != r["_selected"]:
+                raise RuntimeError(
+                    f"task {task!r} has conflicting frozen {scalar} values at "
+                    f"({layout}, {gate}): {existing!r} and {r['_selected']!r}; "
+                    "refusing to overwrite one with the other"
+                )
+            by_layout.setdefault(layout, {})[gate] = r["_selected"]
         if by_layout:
             lines.append("    gated_delta:")
             for layout in sorted(by_layout):
@@ -611,6 +713,7 @@ def positive_control(
     """The paired gap on each task's screening cell, single-state
     gated-delta runs in the tier the task declares."""
     overrides = seq_len_overrides or {}
+    _validate_seq_len_overrides(table, overrides)
     base = table[
         (table["layout"] == "single")
         & (table["mixer"].fillna("gated_delta") == "gated_delta")
@@ -679,17 +782,92 @@ def positive_control(
     )
 
 
+def _completeness_rows(
+    table: pd.DataFrame, expected: dict[str, int], overrides: dict[str, int]
+) -> list[dict]:
+    """Per-``(tier, seq_len)`` expected / observed done counts.
+
+    The length rerun reuses the same tier, so completeness reads one cell
+    per length: the tier's expected count applies to each length present,
+    and an override limits a task to the given length (other lengths of
+    that task are ignored). A tier with no done runs gets a single row with
+    the expected count.
+    """
+    table = table.copy()
+    if "seq_len" in table.columns:
+        table["_seq"] = table["seq_len"]
+    else:
+        table["_seq"] = pd.NA
+    keep = pd.Series(True, index=table.index)
+    for task, length in overrides.items():
+        keep &= ~(
+            (table["task"] == task) & (table["_seq"].astype(str) != str(length))
+        )
+    table = table[keep]
+    done = table[table["status"].fillna("").astype(str) == RUN_DONE_STATUS]
+    observed: dict[tuple[str, object], int] = {}
+    for (tier, length), grp in done.groupby(["tier", "_seq"]):
+        observed[(str(tier), length)] = int(grp["run_id"].nunique())
+    present_lengths: dict[str, set] = {}
+    for (tier_s, length) in observed:
+        present_lengths.setdefault(tier_s, set()).add(length)
+    rows: list[dict] = []
+    for tier_s, exp in expected.items():
+        lengths = present_lengths.get(tier_s)
+        if not lengths:
+            rows.append(
+                {
+                    "tier": tier_s,
+                    "seq_len": "",
+                    "expected": exp,
+                    "observed": 0,
+                    "missing": exp,
+                    "known": True,
+                }
+            )
+            continue
+        for length in sorted(lengths):
+            obs = observed.get((tier_s, length), 0)
+            rows.append(
+                {
+                    "tier": tier_s,
+                    "seq_len": length,
+                    "expected": exp,
+                    "observed": obs,
+                    "missing": max(0, exp - obs),
+                    "known": True,
+                }
+            )
+    # Unexpected tiers present in the done runs (a tier with runs but no
+    # expected count) are reported per length.
+    for tier_s in sorted(present_lengths):
+        if tier_s in expected:
+            continue
+        for length in sorted(present_lengths[tier_s]):
+            rows.append(
+                {
+                    "tier": tier_s,
+                    "seq_len": length,
+                    "expected": 0,
+                    "observed": observed.get((tier_s, length), 0),
+                    "missing": 0,
+                    "known": False,
+                }
+            )
+    return rows
+
+
 def completeness(
     table: pd.DataFrame,
     out_dir: Path,
     seq_len_overrides: dict[str, int] | None = None,
 ) -> None:
-    """Per tier, expected vs observed done runs (and unexpected tiers).
-
-    ``seq_len_overrides`` is accepted for a uniform report signature (the
-    completeness reading is per tier and ignores it).
-    """
-    df = missing_runs(table, dict(_protocol.EXPECTED_RUNS))
+    """Per ``(tier, seq_len)`` expected vs observed done runs (and unexpected
+    tiers). ``seq_len_overrides`` limits a task to the given length."""
+    overrides = seq_len_overrides or {}
+    _validate_seq_len_overrides(table, overrides)
+    rows = _completeness_rows(table, dict(_protocol.EXPECTED_RUNS), overrides)
+    df = pd.DataFrame(rows)
     (out_dir / "completeness.csv").write_text(df.to_csv(index=False), encoding="utf-8")
 
 
