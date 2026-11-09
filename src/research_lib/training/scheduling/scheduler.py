@@ -237,7 +237,7 @@ class ParamScheduler:
         Restores the step count and re-applies the scheduled value for the
         restored step, so a resumed run continues with the exact value its
         next ``optimizer.step()`` should use.  When the saved count is a
-        finished schedule (``>_total_steps``), the schedule is applied at
+        finished schedule (``>= total_steps``), the schedule is applied at
         ``total_steps - 1`` - the last step that actually ran - instead of
         evaluating a step that never runs.
 
