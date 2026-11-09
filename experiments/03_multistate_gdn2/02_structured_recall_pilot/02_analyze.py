@@ -569,9 +569,7 @@ def _frozen_snippet(
         _frozen_table_section(rows, name, chosen) for name in ("lr", "weight_decay")
     )
     blocks = [tables.rstrip("\n")]
-    task_names = sorted(
-        {r["task"] for r in entries} & set(_protocol.FROZEN_TASK_KEYS)
-    )
+    task_names = sorted({r["task"] for r in entries} & set(_protocol.FROZEN_TASK_KEYS))
     if task_names:
         block = ["task_settings:"]
         for task in task_names:
@@ -620,9 +618,7 @@ def _chosen_lengths(
     return chosen
 
 
-def _frozen_table_section(
-    rows: list[dict], scalar: str, chosen: dict[str, int]
-) -> str:
+def _frozen_table_section(rows: list[dict], scalar: str, chosen: dict[str, int]) -> str:
     """One frozen table's YAML block (``lr`` or ``weight_decay``), limited to
     the frozen length ``chosen`` per task. Two grouped rows at the same
     (task, layout, gate) with different values are refused (identical values
@@ -800,16 +796,14 @@ def _completeness_rows(
         table["_seq"] = pd.NA
     keep = pd.Series(True, index=table.index)
     for task, length in overrides.items():
-        keep &= ~(
-            (table["task"] == task) & (table["_seq"].astype(str) != str(length))
-        )
+        keep &= ~((table["task"] == task) & (table["_seq"].astype(str) != str(length)))
     table = table[keep]
     done = table[table["status"].fillna("").astype(str) == RUN_DONE_STATUS]
     observed: dict[tuple[str, object], int] = {}
     for (tier, length), grp in done.groupby(["tier", "_seq"]):
         observed[(str(tier), length)] = int(grp["run_id"].nunique())
     present_lengths: dict[str, set] = {}
-    for (tier_s, length) in observed:
+    for tier_s, length in observed:
         present_lengths.setdefault(tier_s, set()).add(length)
     rows: list[dict] = []
     for tier_s, exp in expected.items():

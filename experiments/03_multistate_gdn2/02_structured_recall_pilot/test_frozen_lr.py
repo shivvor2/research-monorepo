@@ -218,7 +218,10 @@ class TestFrozenCompleteness:
 
     def test_frozen_true_missing_task_settings_raises(self):
         frozen = OmegaConf.create(
-            {"frozen": True, "harness_choices": {"mad": {"d_model": 128, "num_mixers": 2}}}
+            {
+                "frozen": True,
+                "harness_choices": {"mad": {"d_model": 128, "num_mixers": 2}},
+            }
         )
         with pytest.raises(RuntimeError, match="task_settings"):
             _01.check_frozen_choices(_task_cfg(), frozen)
@@ -246,7 +249,9 @@ class TestFrozenCompleteness:
         # unfrozen (the key is set, so it is compared).
         frozen = _complete_frozen_mad()
         with pytest.raises(RuntimeError, match="num_mixers"):
-            _01.check_frozen_choices(_harness_cfg("mad", d_model=128, num_mixers=1), frozen)
+            _01.check_frozen_choices(
+                _harness_cfg("mad", d_model=128, num_mixers=1), frozen
+            )
         _01.check_frozen_choices(_harness_cfg("mad", d_model=128, num_mixers=2), frozen)
 
     def test_frozen_entity_field_with_no_entry_passes(self):
@@ -274,7 +279,10 @@ class TestFrozenCompleteness:
         # MAD has FROZEN_TASK_KEYS, so a frozen phase-2 run with no entry is
         # refused (an unfilled entry would otherwise never be checked).
         frozen = OmegaConf.create(
-            {"frozen": True, "harness_choices": {"mad": {"d_model": 128, "num_mixers": 2}}}
+            {
+                "frozen": True,
+                "harness_choices": {"mad": {"d_model": 128, "num_mixers": 2}},
+            }
         )
         with pytest.raises(RuntimeError, match="task_settings"):
             _01.check_frozen_choices(_task_cfg(), frozen)

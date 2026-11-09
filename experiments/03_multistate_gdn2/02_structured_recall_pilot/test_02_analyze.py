@@ -1791,7 +1791,15 @@ class TestPositiveControlSeqLen:
 class TestSeqLenOverrideValidation:
     def test_unknown_task_key_refused(self, tmp_path, protocol):
         rows = [
-            _row("a0", gate="full", lr=1e-3, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.8})
+            _row(
+                "a0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            )
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1800,7 +1808,16 @@ class TestSeqLenOverrideValidation:
 
     def test_single_length_nonmatching_override_refused(self, tmp_path, protocol):
         rows = [
-            _row("p0", gate="full", seed=0, tier=TOY_CONTROL, best=0.6, step=5, **{METRIC: 0.6}, seq_len=512)
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=512,
+            )
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1809,8 +1826,26 @@ class TestSeqLenOverrideValidation:
 
     def test_multi_length_nonmatching_override_refused(self, tmp_path, protocol):
         rows = [
-            _row("p0", gate="full", seed=0, tier=TOY_CONTROL, best=0.6, step=5, **{METRIC: 0.6}, seq_len=512),
-            _row("p1", gate="full", seed=0, tier=TOY_CONTROL, best=0.6, step=5, **{METRIC: 0.6}, seq_len=256),
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=512,
+            ),
+            _row(
+                "p1",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=256,
+            ),
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1838,7 +1873,9 @@ class TestCompletenessPerLength:
 
 
 class TestOwnTierCalibration:
-    def test_mismatched_tier_row_excluded_not_silent(self, tmp_path, protocol, monkeypatch, caplog):
+    def test_mismatched_tier_row_excluded_not_silent(
+        self, tmp_path, protocol, monkeypatch, caplog
+    ):
         monkeypatch.setattr(
             protocol,
             "TASK_TIERS",
@@ -1857,8 +1894,28 @@ class TestOwnTierCalibration:
             frozenset(("calib_lr", "calib_ws", "calib_ef_single")),
         )
         rows = [
-            _row("good", task="toy", gate="full", lr=1e-3, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.8}, tier="calib_lr"),
-            _row("stray", task="toy", gate="kda", lr=1e-3, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.8}, tier="calib_ef_single"),
+            _row(
+                "good",
+                task="toy",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+                tier="calib_lr",
+            ),
+            _row(
+                "stray",
+                task="toy",
+                gate="kda",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+                tier="calib_ef_single",
+            ),
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1870,14 +1927,25 @@ class TestOwnTierCalibration:
 
 
 class TestBandMetric:
-    def test_band_rows_on_another_monitor_refused(self, tmp_path, protocol, monkeypatch):
+    def test_band_rows_on_another_monitor_refused(
+        self, tmp_path, protocol, monkeypatch
+    ):
         monkeypatch.setattr(
             protocol,
             "TASK_SETTING_BANDS",
             {"toy": protocol.SettingBand(0.15, 0.75, 0.05, "val/acc_toy")},
         )
         rows = [
-            _row("a", gate="full", lr=1e-3, weight_decay=0.0, seed=100, best=0.18, **{METRIC: 0.18}, monitor_key="val/loss")
+            _row(
+                "a",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.18,
+                **{METRIC: 0.18},
+                monitor_key="val/loss",
+            )
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1891,7 +1959,16 @@ class TestBandMetric:
             {"toy": protocol.SettingBand(0.15, 0.75, 0.05, "val/acc_toy")},
         )
         rows = [
-            _row("a", gate="full", lr=1e-3, weight_decay=0.0, seed=100, best=0.18, **{METRIC: 0.18}, monitor_key="val/acc_toy")
+            _row(
+                "a",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.18,
+                **{METRIC: 0.18},
+                monitor_key="val/acc_toy",
+            )
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1901,7 +1978,15 @@ class TestBandMetric:
 class TestMissingLearningRate:
     def test_no_lr_raises_naming_runs(self, tmp_path, protocol):
         rows = [
-            _row("w0", gate="full", lr=None, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.8})
+            _row(
+                "w0",
+                gate="full",
+                lr=None,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            )
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1912,8 +1997,25 @@ class TestMissingLearningRate:
 class TestFrozenConflict:
     def test_conflicting_values_at_a_cell_refused(self, tmp_path, protocol):
         rows = [
-            _row("x", gate="full", lr=0.003, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.8}),
-            _row("y", gate="full", lr=0.004, weight_decay=0.0, seed=100, best=0.8, lam="gated", **{METRIC: 0.8}),
+            _row(
+                "x",
+                gate="full",
+                lr=0.003,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            ),
+            _row(
+                "y",
+                gate="full",
+                lr=0.004,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                lam="gated",
+                **{METRIC: 0.8},
+            ),
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1922,8 +2024,25 @@ class TestFrozenConflict:
 
     def test_identical_values_at_a_cell_coexist(self, tmp_path, protocol):
         rows = [
-            _row("x", gate="full", lr=0.003, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.8}),
-            _row("y", gate="full", lr=0.003, weight_decay=0.0, seed=100, best=0.8, lam="gated", **{METRIC: 0.8}),
+            _row(
+                "x",
+                gate="full",
+                lr=0.003,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            ),
+            _row(
+                "y",
+                gate="full",
+                lr=0.003,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                lam="gated",
+                **{METRIC: 0.8},
+            ),
         ]
         out = tmp_path / "out"
         out.mkdir()
@@ -1934,12 +2053,33 @@ class TestFrozenLengthWritten:
     def test_snippet_writes_the_frozen_length(self, tmp_path, protocol, monkeypatch):
         monkeypatch.setattr(protocol, "FROZEN_TASK_KEYS", {"toy": ("seq_len",)})
         rows = [
-            _row("x0", gate="full", lr=1e-3, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.82}, **{"seq_len": 512}),
-            _row("y0", gate="full", lr=5e-4, weight_decay=0.0, seed=100, best=0.7, **{METRIC: 0.72}, **{"seq_len": 256}),
+            _row(
+                "x0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+            _row(
+                "y0",
+                gate="full",
+                lr=5e-4,
+                weight_decay=0.0,
+                seed=100,
+                best=0.7,
+                **{METRIC: 0.72},
+                **{"seq_len": 256},
+            ),
         ]
         out = tmp_path / "out"
         out.mkdir()
         _analyze.calibration(_table(rows), out, {"toy": 512})
         snippet = (out / "frozen_protocol_snippet.yaml").read_text()
         assert "task_settings:\n  toy:\n    seq_len: 512" in snippet
-        assert "lr_table:\n  toy:\n    gated_delta:\n      single:\n        full: 0.001" in snippet
+        assert (
+            "lr_table:\n  toy:\n    gated_delta:\n      single:\n        full: 0.001"
+            in snippet
+        )

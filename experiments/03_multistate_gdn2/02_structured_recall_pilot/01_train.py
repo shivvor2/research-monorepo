@@ -162,7 +162,12 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
                     "conf/frozen_protocol.yaml"
                 )
     _check_entry_values(
-        cfg, entry, keys=harness_keys, node="model", label=f"harness {harness!r}", tier=tier
+        cfg,
+        entry,
+        keys=harness_keys,
+        node="model",
+        label=f"harness {harness!r}",
+        tier=tier,
     )
 
     # ---- the task's frozen settings (e.g. the sequence length) ----
@@ -184,7 +189,12 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
                     "conf/frozen_protocol.yaml"
                 )
     _check_entry_values(
-        cfg, task_settings, keys=task_keys, node="task", label=f"task {task!r}", tier=tier
+        cfg,
+        task_settings,
+        keys=task_keys,
+        node="task",
+        label=f"task {task!r}",
+        tier=tier,
     )
 
 
