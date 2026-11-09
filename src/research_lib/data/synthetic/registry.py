@@ -99,10 +99,10 @@ class TaskSpec:
     generator: Generator | None = None
     slice_kwarg: str | None = None
     class_names: tuple[str, ...] | None = None
+    slice_arg_of: Callable[[int, Any], int] | None = None
     regime: TaskRegime | str = TaskRegime.STREAMING
     dataset_fn: DatasetFn | None = None
     row_fn: RowFnFactory | None = None
-    slice_arg_of: Callable[[int, Any], int] | None = None
 
     def __post_init__(self) -> None:
         regime = TaskRegime(self.regime)

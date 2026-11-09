@@ -281,6 +281,16 @@ class TestRegime:
         assert spec.slice_arg_of is not None
         assert spec.slice_kwarg == "num_entities"
 
+    def test_task_spec_field_order(self):
+        # The pre-regime fields keep the streaming order (slice_arg_of right
+        # after class_names); the regime fields come after them.
+        from ..registry import TaskSpec
+
+        names = [f.name for f in TaskSpec.__dataclass_fields__.values()]
+        at = {name: i for i, name in enumerate(names)}
+        assert at["slice_kwarg"] < at["class_names"] < at["slice_arg_of"]
+        assert at["slice_arg_of"] < at["regime"] < at["dataset_fn"] < at["row_fn"]
+
 
 class TestSingleQueryPadToken:
     def test_pad_token_is_vocab_minus_two_in_single_query(self):

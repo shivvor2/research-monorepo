@@ -404,6 +404,15 @@ class TestBuildMadAttention:
         with pytest.raises(ValueError, match="attention_num_heads"):
             build_mad(cfg)
 
+    def test_attention_builds_ignoring_undivisible_gated_heads(self):
+        # The gated-delta head count is validated only for the gated mixer;
+        # an attention run must not be refused over it.
+        from common.harnesses import build_mad
+
+        cfg = _mad_model_cfg(mixer="attention", num_heads=12)  # 128 % 12 != 0
+        model = build_mad(cfg)
+        assert isinstance(model.blocks[0].mixer, CausalSelfAttention)
+
     def test_gated_delta_ignores_undivisible_attention_heads(self):
         # d=104 is even in gated heads of width 8 but not divisible by the
         # attention count of 16; only attention validates/derives that

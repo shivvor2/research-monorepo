@@ -160,8 +160,10 @@ class ParamScheduler:
         # ``schedule(s)``.  The value for step 0 is applied here, at
         # construction, so the very first ``optimizer.step()`` already runs
         # at ``schedule(0)`` rather than at whatever LR the optimizer was
-        # constructed with.
-        self._apply_step(0)
+        # constructed with -- unless there are no steps at all, in which
+        # case step 0 is a step that never runs and must not be evaluated.
+        if self.total_steps > 0:
+            self._apply_step(0)
 
     def _validate(self) -> None:
         """Validate group_overrides against optimizer structure."""

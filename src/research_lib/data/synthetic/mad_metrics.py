@@ -79,7 +79,15 @@ class MacroTokenAccuracy:
         )
 
     def compute(self) -> dict[str, float]:
-        """The macro accuracy, as the single key ``acc_mad``."""
+        """The macro accuracy, as the single key ``acc_mad``.
+
+        Under an NCCL process group the metric is moved to the CUDA device
+        first: a rank that saw no batch keeps it on CPU, and torchmetrics'
+        cross-rank reduction rejects CPU state under NCCL.
+        """
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if torch.distributed.get_backend() == torch.distributed.Backend.NCCL:
+                self._metric.to(torch.device("cuda", torch.cuda.current_device()))
         return {"acc_mad": float(self._metric.compute())}
 
 

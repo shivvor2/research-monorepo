@@ -97,16 +97,28 @@ class TestSyncFreeUpdate:
 
 
 class TestDistributedCompute:
-    def test_compute_twice_does_not_double_count(self):
-        # No process group: compute reads copies, so two calls agree.
+    def test_compute_twice_does_not_double_count(self, monkeypatch):
+        # The mocked all-reduce adds a remote contribution in place to the
+        # COPIES (4 to correct, 5 to total on each compute); two compute()
+        # calls must return the same accuracy including that contribution. If
+        # compute mutated the local counters in place, the second call would
+        # double the remote contribution and differ.
+        calls = {"n": 0}
+        self._mock_gloo_glue(monkeypatch)
+
+        def fake_reduce(tensor, op=None):
+            calls["n"] += 1
+            tensor.add_(4 if calls["n"] % 2 == 1 else 5)
+
+        monkeypatch.setattr(torch.distributed, "all_reduce", fake_reduce)
         t = TokenAccuracy()
         preds = torch.tensor([[0, 0, 0]], dtype=torch.long)
         batch = {"labels": torch.tensor([[-100, 0, 1, 2]], dtype=torch.long)}
-        t.update(preds, batch)
+        t.update(preds, batch)  # local 1 correct / 3 scored
         first = t.compute()["acc_token"]
         second = t.compute()["acc_token"]
         assert first == pytest_float(second)
-        assert first == pytest_float(1 / 3)
+        assert first == pytest_float((1 + 4) / (3 + 5))
 
     def _mock_gloo_glue(self, monkeypatch):
         monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
@@ -182,3 +194,35 @@ class TestDistributedCompute:
         assert out["acc_token"] == pytest_float(4 / 5)
         assert state["calls"] == 2
         assert all(str(d).startswith("cuda") for d in requested)
+
+    def test_macro_nccl_moves_the_metric_to_cuda(self, monkeypatch):
+        # MacroTokenAccuracy mirrors TokenAccuracy under NCCL: a rank that saw
+        # no batch keeps the torchmetrics metric on CPU, and torchmetrics'
+        # mutual reduction rejects CPU state under NCCL, so compute must move
+        # the metric to the CUDA device first.
+        self._mock_gloo_glue(monkeypatch)
+        monkeypatch.setattr(
+            torch.distributed,
+            "get_backend",
+            lambda: torch.distributed.Backend.NCCL,
+        )
+
+        class _FakeCuda:
+            def current_device(self):
+                return 0
+
+        monkeypatch.setattr(torch, "cuda", _FakeCuda())
+        requested = []
+
+        def fake_to(self, device, *args, **kwargs):
+            requested.append(device)
+            return self  # no real move (no CUDA)
+
+        monkeypatch.setattr(torch.nn.Module, "to", fake_to)
+        metric = MacroTokenAccuracy(num_classes=5)
+        # Stub the torchmetrics reduce so no real process group is needed to
+        # exercise MacroTokenAccuracy.compute's device move.
+        metric._metric.compute = lambda: torch.tensor(0.5)
+        out = metric.compute()
+        assert out["acc_mad"] == pytest_float(0.5)
+        assert requested and all(str(d).startswith("cuda") for d in requested)

@@ -122,17 +122,22 @@ def build_mad(cfg: DictConfig) -> MadLM:
     attention_heads = int(
         OmegaConf.select(cfg, "model.attention_num_heads", default=16)
     )
-    if d % num_heads != 0:
-        raise ValueError(
-            f"model.d_model ({d}) must be a multiple of model.num_heads "
-            f"({num_heads})"
-        )
-    head_dim = d // num_heads
     num_mixers = int(c.get("num_mixers", 2))
     kind = MixerKind(OmegaConf.select(cfg, "model.mixer", default="gated_delta"))
 
     def make_mixer():
         if kind is MixerKind.GATED_DELTA:
+            # The gated-delta GLA layout's own head count and width: derive
+            # (and validate the divisibility of) them only for the gated
+            # mixer, so an attention run is not refused over a setting it
+            # does not use.
+            if d % num_heads != 0:
+                raise ValueError(
+                    f"model.d_model ({d}) must be a multiple of "
+                    "model.num_heads "
+                    f"({num_heads})"
+                )
+            head_dim = d // num_heads
             return MultistateGatedDelta(
                 hidden_size=d,
                 num_heads=num_heads,

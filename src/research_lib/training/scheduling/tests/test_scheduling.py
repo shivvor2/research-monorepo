@@ -201,6 +201,17 @@ def _raise_past_total(step: int, total: int) -> float:
     return 0.1
 
 
+def _distinct_below_total(step: int, total: int) -> float:
+    """A schedule with a distinct value per step that raises at ``total``.
+
+    Used to tell which step a restore actually applied (the values are 0.3,
+    0.4, 0.5 at steps 0, 1, 2 for ``total`` 3).
+    """
+    if step >= total:
+        raise RuntimeError(f"evaluated the schedule at step {step} >= total {total}")
+    return 0.3 + 0.1 * step
+
+
 # ParamScheduler Tests
 # =============================================================================
 
@@ -291,28 +302,40 @@ class TestParamScheduler:
     def test_load_finished_schedule_applies_the_last_step(self, simple_optimizer):
         """Loading a finished scheduler (step_count == total_steps) must not
         evaluate the schedule at a step that never runs; it applies the last
-        step that ran instead, like a fresh scheduler restoring it."""
-        schedule = ParamSchedule(param_name="lr", schedule_fn=_raise_past_total)
+        step that ran instead. The schedule has distinct values per step, so
+        the assertion tells steps 0 and 2 apart."""
+        schedule = ParamSchedule(param_name="lr", schedule_fn=_distinct_below_total)
         scheduler = ParamScheduler(simple_optimizer, [schedule], total_steps=3)
         scheduler.load_state_dict({"step_count": 3})  # total_steps == 3
-        # Applied the value for the last step that ran (2), not step 3.
+        # Applied the value for the last step that ran (2): 0.5, not step 0's
+        # 0.3 and not step 3 (which raises).
         assert scheduler.get_current_step() == 3
-        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
 
     def test_load_finished_schedule_fresh_scheduler_matches(self, simple_optimizer):
         """A fresh scheduler loading a finished state behaves the same as one
-        that ran to completion then had its state restored."""
-        schedule = ParamSchedule(param_name="lr", schedule_fn=_raise_past_total)
+        that ran to completion. The optimizer is shared, so the LR is captured
+        before ``b``'s construction (which otherwise re-applies step 0);
+        ``b``'s restored value must equal the captured one."""
+        schedule = ParamSchedule(param_name="lr", schedule_fn=_distinct_below_total)
         a = ParamScheduler(simple_optimizer, [schedule], total_steps=3)
         for _ in range(3):
-            a.step()  # run to completion: count 3, value stays at step 2
+            a.step()  # run to completion: count 3, value stays at step 2 (0.5)
+        captured = simple_optimizer.param_groups[0]["lr"]
 
         b = ParamScheduler(simple_optimizer, [schedule], total_steps=3)
         b.load_state_dict({"step_count": 3})
-        assert a.get_current_step() == b.get_current_step() == 3
-        assert a.optimizer.param_groups[0]["lr"] == pytest.approx(
-            b.optimizer.param_groups[0]["lr"]
-        )
+        assert b.get_current_step() == 3
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(captured)
+
+    def test_zero_steps_does_not_evaluate_a_schedule(self, simple_optimizer):
+        """With total_steps == 0, step 0 is a step that never runs; the
+        scheduler must not evaluate the schedule at construction."""
+        schedule = ParamSchedule(param_name="lr", schedule_fn=_raise_past_total)
+        scheduler = ParamScheduler(simple_optimizer, [schedule], total_steps=0)
+        assert scheduler.get_current_step() == 0
+        scheduler.step()  # count 1 >= total 0: skipped, no evaluation
+        assert scheduler.get_current_step() == 1
 
     def test_linear_decay(self, simple_optimizer, linear_schedule):
         """Should apply changing values over steps."""
