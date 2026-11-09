@@ -1,0 +1,21 @@
+# @package _global_
+# MAD fuzzy attention (positive control) LR calibration.
+# mixer=attention (single layout — the frozen snippet refuses more than
+# one attention layout per task) x lr {1e-4, 5e-4, 1e-3} x weight decay
+# {0, 0.1}, selection seed 100 = 6 runs.
+# Run: python 01_train.py +sweep=calib_mad_attention task=mad_fuzzy --multirun
+
+experiment:
+  phase: 1
+  tier: calib_mad_attention
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mad_fuzzy
+      model.layout: single
+      model.mixer: attention
+      optimizer.lr: 1e-4,5e-4,1e-3
+      optimizer.weight_decay: 0,0.1
+      seed: 100
