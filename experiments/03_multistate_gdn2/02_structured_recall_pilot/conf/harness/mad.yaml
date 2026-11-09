@@ -1,0 +1,58 @@
+# @package _global_
+# =============================================================================
+# MAD harness: the fuzzy in-context recall architecture and training.
+# =============================================================================
+# The architecture and training choices come from here (single source),
+# with the vocab size from the task. The mixer under test is model.mixer
+# (gated_delta | attention). MAD trains on a fixed set for a fixed number
+# of epochs with a per-epoch cosine schedule, so ``max_steps`` and
+# ``val_check_interval`` are derived from ``epochs`` and the per-epoch step
+# count by the train script (set to null below so the derivation is the
+# single source).
+
+harness:
+  name: mad
+
+model:
+  vocab_size: ${task.vocab_size}
+  d_model: 128
+  num_mixers: 2              # [mixer, swiglu] x 2 (MAD's two-mixer backbone)
+  mixer: gated_delta         # gated_delta | attention (positive control)
+  num_heads: 8               # gated-delta: 8 heads of width 16 at d=128
+  attention_num_heads: 16    # attention control: 16 heads of width 8
+  expand_v: 1.0
+  chunk_size: 16
+  window: 8
+  t_max: ${task.max_seq_len}
+  gate_mode: full
+  layout: single
+  lambda_mode: mlp
+  mixer_mode: chunk
+  output_gate_activation: silu
+
+optimizer:
+  lr: null                   # frozen protocol, per (task, layout, gate_mode)
+  weight_decay: null         # frozen protocol, per (task, layout, gate_mode)
+  betas: [0.9, 0.999]
+  eps: 1.0e-8
+  decay_scheme: grouped
+  schedule: epoch_cosine
+  min_lr: 1.0e-6
+  calibrate_weight_decay: true   # run ID carries the weight decay (swept below)
+
+training:
+  batch_size: 128
+  epochs: 200                # fixed training set, one permutation per epoch
+  val_every_epochs: 1        # validate after this many epochs
+  max_steps: null            # derived: epochs * steps_per_epoch
+  monitor_key: val/acc_mad   # drives early stopping and the best-value track
+  early_stop_threshold: 0.999
+  precision: 32-true
+  grad_clip_val: null
+  loss_on: answers
+  answer_head: true
+  compile: false
+  collect_mixer_stats: true
+  record_monitored_history: true   # first value + last-half min/max in the record
+  log_every_n_steps: 50
+  devices: 1                 # one device per job (the run lock is per-machine)

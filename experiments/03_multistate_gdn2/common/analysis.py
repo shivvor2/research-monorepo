@@ -333,6 +333,35 @@ def select_lr(per_lr: pd.DataFrame) -> float | None:
     return float(tied.index.min())
 
 
+def select_hyperparams(per: pd.DataFrame) -> tuple[float | None, float | None]:
+    """The selected ``(lr, weight_decay)`` point for one configuration.
+
+    Ties break as in :func:`select_lr`, then to the smaller weight
+    decay.  The summary carries ``lr`` and ``weight_decay`` as columns.
+
+    Args:
+        per: One row per tuning point (``lr``, ``weight_decay``,
+            ``mean_acc``, ``mean_steps``), e.g. from
+            :func:`per_seed_mean` grouped by both.
+
+    Returns:
+        The selected ``(lr, weight_decay)``, or ``(None, None)`` when
+        nothing was measured.
+    """
+    per = per[per["mean_acc"].notna()]
+    if per.empty:
+        return None, None
+    best_acc = per["mean_acc"].max()
+    tied = per[np.isclose(per["mean_acc"], best_acc, rtol=0.0, atol=_TIE_ATOL)]
+    best_steps = tied["mean_steps"].min()  # skips NaN
+    if not np.isnan(best_steps):
+        tied = tied[
+            np.isclose(tied["mean_steps"], best_steps, rtol=0.0, atol=_TIE_ATOL)
+        ]
+    picked = tied.sort_values(["lr", "weight_decay"], na_position="last").iloc[0]
+    return float(picked["lr"]), float(picked["weight_decay"])
+
+
 def gap_column(
     table: pd.DataFrame, metric: str, high_gate: str = "full", low_gate: str = "kda"
 ) -> pd.Series:

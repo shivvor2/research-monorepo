@@ -16,14 +16,20 @@ entries share: the W&B auth check up front, the job body, and
 from __future__ import annotations
 
 import logging
+import math
+from collections.abc import Callable
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import lightning as L
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
+from lightning.pytorch.trainer.states import TrainerFn
 from omegaconf import DictConfig, OmegaConf
 
+from research_lib.data.synthetic import TaskRegime
 from research_lib.layers.attention import MultistateGatedDelta
 from research_lib.training.callbacks import (
     Collector,
@@ -37,14 +43,81 @@ from research_lib.training.configs import ScheduleConfig
 from research_lib.training.modules import MGDN2SyntheticRecallModule
 from research_lib.training.presets import build_weight_decay_configs
 from research_lib.training.run_control import RUN_DONE_STATUS, assert_fit_finished
-from research_lib.training.run_records import read_record, run_record_metadata
-from research_lib.training.scheduling import WarmupStableDecaySchedule
+from research_lib.training.run_records import read_record
+from research_lib.training.scheduling import (
+    EpochCosineSchedule,
+    WarmupStableDecaySchedule,
+)
 from research_lib.utils.io import atomic_torch_save
 
 from .layout import record_files, wandb_kwargs
 from .run_id import HASH_EXCLUDE
 
 logger = logging.getLogger(__name__)
+
+
+class MonitoredValueHistory(L.Callback):
+    """Record the monitored metric's value at each fit validation, for a
+    run's stuck-cell reading.
+
+    The per-validation values live on the callback itself (a list), so a
+    resumed run keeps its series through the callback's ``state_dict`` /
+    ``load_state_dict``.  A validation is recorded only when it is part of
+    a fit (Lightning's sanity check is skipped, and validation run outside
+    a fit is skipped), so ``n`` recorded values correspond to ``n`` fit
+    validation passes.  A run-summary collector reads a small summary
+    (first value, the run-wide max, and the last-half min/max) into the
+    run record, which the calibration reading uses to flag look-stuck
+    cells.  Only when ``training.record_monitored_history`` is set (the
+    default is off, so existing runs' records are unchanged).
+    """
+
+    def __init__(self, monitor: str) -> None:
+        self.monitor = str(monitor)
+        self.history: list[float] = []
+
+    def state_dict(self) -> dict[str, Any]:
+        """The recorded values (a resumed run keeps its series)."""
+        return {"history": self.history}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore ``state_dict`` (Lightning calls this on resume)."""
+        self.history = list(state.get("history", []))
+
+    def on_validation_end(
+        self, trainer: L.Trainer, pl_module: L.LightningModule
+    ) -> None:
+        if trainer.sanity_checking or trainer.state.fn != TrainerFn.FITTING:
+            return
+        value = trainer.callback_metrics.get(self.monitor)
+        if value is not None:
+            self.history.append(float(value.detach().cpu()))
+
+
+def monitored_history_summary(
+    trainer: L.Trainer, pl_module: L.LightningModule
+) -> dict[str, float]:
+    """The monitored series' summary (first value, run-wide max, and the
+    last-half min/max), read from the :class:`MonitoredValueHistory`
+    callback among ``trainer.callbacks``."""
+    history = next(
+        (
+            cb.history
+            for cb in trainer.callbacks
+            if isinstance(cb, MonitoredValueHistory)
+        ),
+        [],
+    )
+    if len(history) < 2:
+        return {}
+    half = history[len(history) // 2 :]
+    return {
+        "monitored_first": float(history[0]),
+        "monitored_max": float(max(history)),
+        "monitored_last_half_min": float(min(half)),
+        "monitored_last_half_max": float(max(half)),
+    }
+
 
 # Parameters routed to the VECTOR optimizer (AdamW, weight decay 0):
 # embeddings, the untied LM head, every norm weight, every bias, the
@@ -64,47 +137,160 @@ VECTOR_TARGET_MODULES: list[str] = [
 ]
 
 
+class ScheduleKind(str, Enum):
+    """The LR schedule over the training run.
+
+    - ``STEP_COSINE``: a cosine decay indexed by the optimizer step (the
+      train-by-steps convention).
+    - ``EPOCH_COSINE``: a per-epoch cosine, constant within an epoch (a
+      fixed-set training regime); the per-epoch rate is stepped over the
+      epochs.
+    """
+
+    STEP_COSINE = "step_cosine"
+    EPOCH_COSINE = "epoch_cosine"
+
+
+@dataclass(frozen=True)
+class RunLength:
+    """The run length and validation cadence, derived per training regime.
+
+    Attributes:
+        steps_per_epoch: Steps per epoch for a fixed-set task (``None`` for
+            a streaming task).
+        max_steps: The trainer's ``max_steps``.
+        val_check_interval: The trainer's ``val_check_interval`` in steps.
+    """
+
+    steps_per_epoch: int | None = None
+    max_steps: int | None = None
+    val_check_interval: int | None = None
+
+
+def run_length(cfg: DictConfig, regime: TaskRegime) -> RunLength:
+    """The run length and validation cadence for a training regime.
+
+    A fixed-set task runs by ``training.epochs``: a new permutation per
+    epoch, with validation every ``training.val_every_epochs`` epochs
+    (default 1).  A streaming task runs by ``training.max_steps`` and
+    ``training.val_check_interval``.  The regime decides which keys are
+    read.
+
+    Args:
+        cfg: The resolved config (``training.*``, ``task.num_train``).
+        regime: The task's training regime.
+
+    Returns:
+        The derived :class:`RunLength`.
+
+    Raises:
+        ValueError: A fixed-set task without ``training.epochs``.
+        RuntimeError: A fixed-set task on more than one device.
+    """
+    if regime is TaskRegime.FIXED_SET:
+        devices = cfg.training.get("devices")  # keep as-is: never resolve auto
+        if devices is not None and not (isinstance(devices, int) and devices == 1):
+            # Each rank takes its own batch per optimizer step, so the
+            # steps-per-epoch (and the derived max_steps / validation
+            # interval / per-epoch schedule) would be off by the world
+            # size.  ``auto`` is not resolved (on a multi-GPU machine it can
+            # mean several devices); any non-1 value raises.  Multi-device
+            # fixed-set training is a separate follow-up, which removes this
+            # guard.
+            raise RuntimeError(
+                "fixed-set training is single-device in this version: "
+                f"training.devices must be 1 (got {devices})"
+            )
+        epochs = int(cfg.training.get("epochs") or 0)
+        if epochs < 1:
+            raise ValueError(
+                "a fixed-set task requires training.epochs to be set "
+                f"(got {cfg.training.get('epochs')!r})"
+            )
+        steps_per_epoch = math.ceil(
+            int(cfg.task.num_train) / int(cfg.training.batch_size)
+        )
+        val_every = int(cfg.training.get("val_every_epochs") or 1)
+        return RunLength(
+            steps_per_epoch=steps_per_epoch,
+            max_steps=epochs * steps_per_epoch,
+            val_check_interval=val_every * steps_per_epoch,
+        )
+    return RunLength(
+        max_steps=int(cfg.training.max_steps),
+        val_check_interval=int(cfg.training.val_check_interval),
+    )
+
+
 def build_module(
     cfg: DictConfig,
     model: L.LightningModule,
     lr: float,
     slice_values: tuple[int, ...],
     *,
+    weight_decay: float,
+    regime: TaskRegime = TaskRegime.STREAMING,
     monitor_key: str = "val/acc",
     class_names: tuple[str, ...] | None = None,
+    extra_metrics: tuple = (),
 ) -> MGDN2SyntheticRecallModule:
     """The training module with the two AdamW weight-decay groups.
 
     Args:
         cfg: The resolved config (``optimizer.*``, ``training.*``).
         model: The built model.
-        lr: The peak learning rate.
+        lr: The (resolved) peak learning rate.
         slice_values: The task's slice values.
+        weight_decay: The (resolved) weight decay for the decayed group.
+        regime: The task's training regime (a fixed-set task drives the
+            run length by epochs and schedules by epoch; a streaming task
+            by steps).
         monitor_key: The metric key that drives early stopping and the
             best value (``val/acc`` default).
         class_names: The task's class-name fragments for ``RecallMetrics``
             (``None`` uses the metric's default).
+        extra_metrics: Additional evaluation metrics receiving the same
+            answer-position predictions as ``RecallMetrics`` (the module's
+            extra-metric hook).
 
     Returns:
         An :class:`MGDN2SyntheticRecallModule`, ready to fit.
+
+    Raises:
+        ValueError: An epoch-cosine schedule on a streaming task.
     """
     matrix_optimizer_config, vector_optimizer_config = build_weight_decay_configs(
         cfg.optimizer.decay_scheme,
-        weight_decay=cfg.optimizer.weight_decay,
+        weight_decay=weight_decay,
         betas=tuple(cfg.optimizer.betas),
     )
-    schedule_config = ScheduleConfig(
-        global_schedules=[
-            WarmupStableDecaySchedule(
-                param_name="lr",
-                warmup_frac=0.0,
-                cooldown_frac=1.0,
-                min_value=0.0,
-                max_value=lr,
-                decay_type="cosine",
+    schedule_kind = ScheduleKind(cfg.optimizer.get("schedule") or "step_cosine")
+    if schedule_kind is ScheduleKind.EPOCH_COSINE:
+        if regime is not TaskRegime.FIXED_SET:
+            raise ValueError(
+                "an epoch-cosine schedule (optimizer.schedule=epoch_cosine) "
+                "requires a fixed-set task"
             )
-        ]
-    )
+        # CosineAnnealingLR(T_max=epochs) stepped once per epoch: the rate
+        # is constant within an epoch and follows the cosine over the
+        # epochs, from peak at epoch 0 to near-minimum at the last.
+        length = run_length(cfg, TaskRegime.FIXED_SET)
+        step_schedule = EpochCosineSchedule(
+            steps_per_epoch=length.steps_per_epoch,
+            epochs=int(cfg.training.epochs),
+            max_value=lr,
+            min_value=float(cfg.optimizer.min_lr),
+        )
+    else:
+        step_schedule = WarmupStableDecaySchedule(
+            param_name="lr",
+            warmup_frac=0.0,
+            cooldown_frac=1.0,
+            min_value=0.0,
+            max_value=lr,
+            decay_type="cosine",
+        )
+    schedule_config = ScheduleConfig(global_schedules=[step_schedule])
     return MGDN2SyntheticRecallModule(
         model=model,
         slice_values=slice_values,
@@ -113,6 +299,7 @@ def build_module(
         monitor_key=monitor_key,
         loss_on=cfg.training.loss_on,
         answer_head=cfg.training.answer_head,
+        extra_metrics=extra_metrics,
         matrix_optimizer_config=matrix_optimizer_config,
         vector_optimizer_config=vector_optimizer_config,
         matrix_schedule_config=schedule_config,
@@ -151,6 +338,7 @@ def create_callbacks(
     *,
     lr: float,
     monitor_key: str = "val/acc",
+    record_extra: dict[str, Any] | None = None,
 ) -> list:
     """Early stopping, the run summary and LR logging.
 
@@ -158,7 +346,9 @@ def create_callbacks(
     metrics; ``val_final`` and ``mixer_stats_final`` collectors capture
     the last validation and mixer columns that ``common.records.flatten``
     reads. The ``monitor_key`` (default ``val/acc``) drives both the early
-    stop and the best-value track.
+    stop and the best-value track.  ``record_extra`` is merged into the
+    run record's ``extra`` section (caller-owned facts such as the model
+    class and the task's regime / run length).
 
     Args:
         cfg: The resolved config (``training``, ``output.runs_dir``).
@@ -167,10 +357,44 @@ def create_callbacks(
         lr: The resolved peak learning rate.
         monitor_key: The metric key that drives early stopping and the
             best value.
+        record_extra: Extra top-level run-record fields (merged into the
+            summary's ``extra``).
 
     Returns:
         The trainer callbacks.
     """
+    record_monitored = bool(cfg.training.get("record_monitored_history"))
+    collectors = [
+        Collector(
+            "metrics",
+            lambda _trainer, _pl: {"acc": "per_sequence_mean"},
+            Stage.FIT_START,
+        ),
+        Collector(
+            "params",
+            param_counts({"lambda": ["lambda_mixer"]}),
+            Stage.FIT_START,
+        ),
+        Collector("state", state_bytes_collector, Stage.FIT_START),
+        Collector("val_final", metrics_by_prefix("val"), Stage.FIT_END),
+        Collector("mixer_stats_final", metrics_by_prefix("mixer"), Stage.FIT_END),
+        Collector("test", metrics_by_prefix("test"), Stage.TEST_END),
+    ]
+    if record_monitored:
+        collectors.append(
+            Collector("monitored", monitored_history_summary, Stage.FIT_END)
+        )
+    _extra = {
+        "lr_resolved": lr,
+        # Also recorded via the config; kept top-level so analyses need
+        # not dig for it (one JSON per run, rsync-able).
+        "decay_scheme": str(cfg.optimizer.decay_scheme),
+        "precision_flags": precision_flags,
+        # Set by post_fit() after the checkpoint is saved (before the
+        # test pass), so the test_done record names the file.
+        "final_checkpoint": None,
+    }
+    _extra.update(record_extra or {})
     callbacks = [
         EarlyStopping(
             monitor=monitor_key,
@@ -183,7 +407,7 @@ def create_callbacks(
             run_id,
             OmegaConf.to_container(cfg, resolve=True),
             # Distribution names of the packages the scripts import.
-            packages=("torch", "lightning", "hydra-core", "omegaconf"),
+            packages=("torch", "lightning", "hydra-core", "omegaconf", "torchmetrics"),
             monitor=monitor_key,
             mode="max",
             # The run identity excludes operational keys (see HASH_EXCLUDE).
@@ -191,37 +415,15 @@ def create_callbacks(
             # The lockfile hash is part of the run's provenance: a tier
             # that mixed lock versions would be visible.
             provenance_files=("uv.lock",),
-            collectors=(
-                Collector(
-                    "metrics",
-                    lambda _trainer, _pl: {"acc": "per_sequence_mean"},
-                    Stage.FIT_START,
-                ),
-                Collector(
-                    "params",
-                    param_counts({"lambda": ["lambda_mixer"]}),
-                    Stage.FIT_START,
-                ),
-                Collector("state", state_bytes_collector, Stage.FIT_START),
-                Collector("val_final", metrics_by_prefix("val"), Stage.FIT_END),
-                Collector(
-                    "mixer_stats_final", metrics_by_prefix("mixer"), Stage.FIT_END
-                ),
-                Collector("test", metrics_by_prefix("test"), Stage.TEST_END),
-            ),
+            collectors=tuple(collectors),
             extra={
-                "lr_resolved": lr,
-                # Also recorded via the config; kept top-level so analyses
-                # need not dig for it (one JSON per run, rsync-able).
-                "decay_scheme": str(cfg.optimizer.decay_scheme),
-                "precision_flags": precision_flags,
-                # Set by post_fit() after the checkpoint is saved (before
-                # the test pass), so the test_done record names the file.
-                "final_checkpoint": None,
+                **_extra,
             },
         ),
         LearningRateMonitor(logging_interval="step"),
     ]
+    if record_monitored:
+        callbacks.append(MonitoredValueHistory(monitor_key))
     if bool(cfg.training.collect_mixer_stats):
         callbacks.append(LayerStatsCallback(prefix="mixer", summarize=per_slot_summary))
     return callbacks
@@ -234,6 +436,7 @@ def create_callbacks_reset_curves(
     *,
     lr: float,
     monitor_key: str = "val/acc",
+    record_extra: dict[str, Any] | None = None,
 ) -> list:
     """Build the callbacks (the run-identity check), then reset the curves.
 
@@ -250,7 +453,12 @@ def create_callbacks_reset_curves(
         ``version_0`` directory.
     """
     callbacks = create_callbacks(
-        cfg, run_id, precision_flags, lr=lr, monitor_key=monitor_key
+        cfg,
+        run_id,
+        precision_flags,
+        lr=lr,
+        monitor_key=monitor_key,
+        record_extra=record_extra,
     )
     if bool(cfg.logging.csv.enabled):
         curves_dir = Path(cfg.logging.csv.save_dir) / run_id

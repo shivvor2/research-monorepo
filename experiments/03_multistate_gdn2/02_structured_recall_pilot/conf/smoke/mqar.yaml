@@ -1,0 +1,8 @@
+# @package task
+# MQAR's smoke sizes (test/debug selected via ``smoke: ${task}``).
+# MQAR results live in the first pilot; this config smoke-tests the shared
+# run machinery. The vocab must exceed seq_len.
+vocab_size: 128
+seq_len: 64
+max_seq_len: 64
+num_kv_pairs: [2, 4]

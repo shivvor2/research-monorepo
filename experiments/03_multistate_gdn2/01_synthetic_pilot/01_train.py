@@ -559,6 +559,7 @@ def common_run_lifecycle_build_module(cfg, model, lr):
         model,
         lr,
         slice_values(cfg),
+        weight_decay=float(cfg.optimizer.weight_decay),
         monitor_key="val/acc",
         class_names=require_task(str(cfg.task.name)).class_names,
     )

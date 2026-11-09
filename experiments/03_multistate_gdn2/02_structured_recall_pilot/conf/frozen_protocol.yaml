@@ -2,14 +2,29 @@
 # Frozen protocol: filled at the end of calibration, then committed.
 # =============================================================================
 # While ``frozen: false``, the smoke and debug configs run; an experiment
-# phase >= 2 refuses to run. Calibration fills the LR table, then the
-# screening reading picks d_model / harness and sets ``frozen: true``.
+# phase >= 2 refuses to run. Calibration fills the LR and weight-decay
+# tables and the harness choices for each harness, then sets ``frozen: true``.
 
 frozen: false
-d_model: null
-harness:
-  layer_pattern: null
-  state_mixer: null
+
+# The frozen architecture choices per harness. ``check_frozen_choices``
+# checks only the entry for ``cfg.harness.name``, and only the keys that
+# entry sets; an entry can name one or all of ``d_model``,
+# ``layer_pattern`` and ``state_mixer`` (Zoology names all three; MAD
+# names only ``d_model``, because it has no layer pattern / state mixer).
+harness_choices:
+  zoology: {d_model: null, layer_pattern: null, state_mixer: null}
+  mad: {d_model: null}
+
+# The frozen per-task settings. Only a task with a setting rule (one in
+# the protocol's ``TASK_SETTING_BANDS``) needs an entry once frozen; a
+# task without one (its difficulty comes from its slices, not its length,
+# which is part of the task definition) registers nothing here. An entry
+# that exists is checked key by key: a run whose task.seq_len differs from
+# the frozen value is refused.
+task_settings:
+  mad_fuzzy: {seq_len: null}
+
 # The frozen peak LR per (task, mixer, layout, gate).
 #
 #   lr_table:
@@ -22,3 +37,7 @@ harness:
 # A missing or null node anywhere in a key's path falls through to the
 # "fill conf/frozen_protocol.yaml" error.
 lr_table: {}
+
+# The frozen weight decay, with the same key path as ``lr_table``
+# (``<task>.gated_delta.<layout>.<gate>``, ``<task>.attention``).
+weight_decay_table: {}

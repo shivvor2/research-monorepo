@@ -1,0 +1,11 @@
+# @package task
+# MAD fuzzy's smoke sizes (test/debug selected via ``smoke: ${task}``).
+# A small vocab (the generator builds/shuffles key permutations per
+# instance, which gets expensive as the vocab grows) at a short length.
+# ``max_seq_len`` is not set here: it derives from seq_len and the harness
+# chunk size (``padded_to_chunk``), so the run length and t_max follow.
+vocab_size: 16
+seq_len: 32
+num_train: 64
+num_val: 32
+num_test: 32

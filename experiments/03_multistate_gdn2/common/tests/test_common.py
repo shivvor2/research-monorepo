@@ -7,11 +7,14 @@ Run with: pytest experiments/03_multistate_gdn2/common/tests/test_common.py -v
 """
 
 import json
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
+import torch
 from common.analysis import delta_int_table, gap_column, paired_gap_report
-from common.harnesses import build_zoology
+from common.harnesses import build_mad, build_zoology
+from common.records import flatten as records_flatten
 from common.registries import config_type_of_task, require_harness
 from common.run_id import HASH_EXCLUDE, make_run_id
 from omegaconf import OmegaConf
@@ -349,3 +352,316 @@ class TestAnalysis:
         ll_row = out[out["layout"] == "ll"].iloc[0]
         assert ws_row["mean"] == pytest.approx(0.4, abs=1e-9)
         assert ll_row["mean"] == pytest.approx(0.0, abs=1e-9)
+
+
+def _mad_model_cfg(**overrides):
+    base = {
+        "d_model": 128,
+        "num_mixers": 2,
+        "mixer": "gated_delta",
+        "attention_num_heads": 16,
+        "num_heads": 8,
+        "expand_v": 1.0,
+        "chunk_size": 16,
+        "window": 8,
+        "t_max": 528,
+        "gate_mode": "full",
+        "layout": "single",
+        "lambda_mode": "mlp",
+        "mixer_mode": "chunk",
+        "output_gate_activation": "silu",
+        "vocab_size": 16,
+    }
+    base.update(overrides)
+    return OmegaConf.create({"model": base})
+
+
+class TestBuildMadAttention:
+    def test_attention_uses_its_own_head_layout(self):
+        cfg = _mad_model_cfg(mixer="attention")
+        model = build_mad(cfg)
+        mixer = model.blocks[0].mixer
+        assert isinstance(mixer, CausalSelfAttention)
+        # MAD's attention layout: 16 heads of width 8, rotary on the full
+        # head width — distinct from the gated-delta 8 heads of width 16.
+        assert mixer.num_heads == 16
+        assert mixer.rotary_dim == 8
+        assert 128 // mixer.num_heads == 8
+
+    def test_gated_delta_uses_the_gated_layout(self):
+        cfg = _mad_model_cfg(mixer="gated_delta")
+        model = build_mad(cfg)
+        mixer = model.blocks[0].mixer
+        assert isinstance(mixer, MultistateGatedDelta)
+        # The gated-delta layer keeps its own 8 heads of width 16.
+        assert mixer.projections.num_heads == 8
+        assert mixer.projections.head_k_dim == 16
+
+    def test_attention_heads_must_divide_width(self):
+        from common.harnesses import build_mad
+
+        cfg = _mad_model_cfg(mixer="attention", attention_num_heads=12)
+        with pytest.raises(ValueError, match="attention_num_heads"):
+            build_mad(cfg)
+
+    def test_gated_delta_ignores_undivisible_attention_heads(self):
+        # d=104 is even in gated heads of width 8 but not divisible by the
+        # attention count of 16; only attention validates/derives that
+        # layout, so the gated-delta run builds.
+        from common.harnesses import build_mad
+
+        cfg = _mad_model_cfg(d_model=104, mixer="gated_delta", attention_num_heads=16)
+        model = build_mad(cfg)
+        assert isinstance(model.blocks[0].mixer, MultistateGatedDelta)
+
+
+class TestRunLength:
+    def test_fixed_set_by_epochs(self):
+        from common.run_lifecycle import RunLength, run_length
+
+        cfg = OmegaConf.create(
+            {
+                "training": {"epochs": 200, "batch_size": 128, "val_every_epochs": 1},
+                "task": {"num_train": 12800},
+            }
+        )
+        length = run_length(cfg, require_task("mad_fuzzy").regime)
+        assert length == RunLength(
+            steps_per_epoch=100, max_steps=20000, val_check_interval=100
+        )
+
+    def test_streaming_by_steps(self):
+        from common.run_lifecycle import run_length
+
+        from research_lib.data.synthetic import TaskRegime
+
+        cfg = OmegaConf.create(
+            {"training": {"max_steps": 500, "val_check_interval": 50}}
+        )
+        length = run_length(cfg, TaskRegime.STREAMING)
+        assert length.max_steps == 500 and length.val_check_interval == 50
+        assert length.steps_per_epoch is None
+
+    def test_fixed_set_requires_epochs(self):
+        from common.run_lifecycle import run_length
+
+        from research_lib.data.synthetic import TaskRegime
+
+        cfg = OmegaConf.create(
+            {"training": {"batch_size": 2}, "task": {"num_train": 10}}
+        )
+        with pytest.raises(ValueError, match="epochs"):
+            run_length(cfg, TaskRegime.FIXED_SET)
+
+    def test_fixed_set_on_multiple_devices_is_an_error(self):
+        from common.run_lifecycle import RunLength, run_length
+
+        from research_lib.data.synthetic import TaskRegime
+
+        cfg = OmegaConf.create(
+            {
+                "training": {
+                    "epochs": 2,
+                    "batch_size": 2,
+                    "val_every_epochs": 1,
+                    "devices": 2,
+                },
+                "task": {"num_train": 10},
+            }
+        )
+        with pytest.raises(RuntimeError, match="single-device"):
+            run_length(cfg, TaskRegime.FIXED_SET)
+        # ``auto`` is not resolved (a multi-GPU machine can mean several
+        # devices); it still raises the same clear error, not a confusing
+        # ``int('auto')`` ValueError.
+        cfg.training.devices = "auto"
+        with pytest.raises(RuntimeError, match="auto"):
+            run_length(cfg, TaskRegime.FIXED_SET)
+        # Single device is allowed.
+        cfg.training.devices = 1
+        length = run_length(cfg, TaskRegime.FIXED_SET)
+        assert length == RunLength(
+            steps_per_epoch=5, max_steps=10, val_check_interval=5
+        )
+
+    def test_epoch_cosine_on_streaming_is_an_error(self):
+        import torch as _torch
+        from common.run_lifecycle import build_module
+
+        from research_lib.data.synthetic import TaskRegime
+
+        cfg = OmegaConf.create(
+            {
+                "optimizer": {
+                    "schedule": "epoch_cosine",
+                    "min_lr": 1e-6,
+                    "decay_scheme": "grouped",
+                    "betas": (0.9, 0.999),
+                },
+                "training": {"max_steps": 10, "epochs": 5, "batch_size": 2},
+                "task": {"num_train": 20},
+            }
+        )
+        model = _torch.nn.Linear(4, 4)
+        with pytest.raises(ValueError, match="fixed-set"):
+            build_module(
+                cfg, model, 1e-3, (2,), weight_decay=0.0, regime=TaskRegime.STREAMING
+            )
+
+
+class TestExtraMetrics:
+    def test_resolves_named_metrics(self):
+        from common.registries import build_extra_metrics
+
+        metrics = build_extra_metrics(
+            ["macro_token_accuracy", "token_accuracy"], vocab_size=16
+        )
+        assert len(metrics) == 2
+        assert type(metrics[0]).__name__ == "MacroTokenAccuracy"
+
+    def test_empty_is_empty(self):
+        from common.registries import build_extra_metrics
+
+        assert build_extra_metrics((), 16) == ()
+
+    def test_unknown_raises(self):
+        from common.registries import build_extra_metrics
+
+        with pytest.raises(ValueError, match="unknown extra metric"):
+            build_extra_metrics(["no_such_metric"], 16)
+
+
+class TestFlattenWeightDecayFallback:
+    def test_top_level_field_wins(self):
+        row = records_flatten(
+            {
+                "run_id": "r1",
+                "weight_decay": 0.1,
+                "config": {"optimizer": {"weight_decay": 0.0}},
+                "lr_resolved": 1e-3,
+            }
+        )
+        assert row["weight_decay"] == 0.1
+
+    def test_missing_top_level_falls_back_to_config(self):
+        # A record written before the resolved weight decay became a
+        # top-level field still lands in its calibration cell.
+        row = records_flatten(
+            {
+                "run_id": "r2",
+                "config": {"optimizer": {"weight_decay": 0.0}},
+                "lr_resolved": 1e-3,
+            }
+        )
+        assert row["weight_decay"] == 0.0
+
+    def test_neither_keeps_none(self):
+        # ``0.0`` must survive a truthiness check, so a missing value stays
+        # ``None`` (which the calibration reading then refuses).
+        row = records_flatten({"run_id": "r3", "config": {}, "lr_resolved": 1e-3})
+        assert row["weight_decay"] is None
+
+    def test_seq_len_read_from_the_task_config(self):
+        row = records_flatten(
+            {"config": {"task": {"seq_len": 512}}, "lr_resolved": 1e-3}
+        )
+        assert row["seq_len"] == 512
+
+
+class TestMonitoredValueHistory:
+    def _trainer(self, *, sanity=False, fn=None, metrics=None):
+        from lightning.pytorch.trainer.states import TrainerFn
+
+        return SimpleNamespace(
+            sanity_checking=sanity,
+            state=SimpleNamespace(fn=fn if fn is not None else TrainerFn.FITTING),
+            callback_metrics=metrics or {},
+        )
+
+    def test_sanity_and_out_of_fit_validations_are_skipped(self):
+        from common.run_lifecycle import MonitoredValueHistory
+
+        cb = MonitoredValueHistory("val/acc")
+        # The coach's default sanity check (and any validation run outside a
+        # fit, e.g. in test/validate) must not be recorded.
+        cb.on_validation_end(
+            self._trainer(sanity=True, metrics={"val/acc": torch.tensor(0.1)}), None
+        )
+        from lightning.pytorch.trainer.states import TrainerFn
+
+        cb.on_validation_end(
+            self._trainer(fn=TrainerFn.TESTING, metrics={"val/acc": torch.tensor(0.2)}),
+            None,
+        )
+        assert cb.history == []
+        cb.on_validation_end(
+            self._trainer(metrics={"val/acc": torch.tensor(0.3)}), None
+        )
+        assert cb.history[0] == pytest.approx(0.3)
+
+    def test_default_sanity_steps_record_one_value_per_epoch(self):
+        from common.run_lifecycle import MonitoredValueHistory
+
+        cb = MonitoredValueHistory("val/acc")
+        trainer = self._trainer(metrics={"val/acc": torch.tensor(0.5)})
+        # Two sanity-check validations (the default num_sanity_val_steps=2)
+        # are skipped, then one fit validation per epoch is recorded.
+        for _ in range(2):
+            cb.on_validation_end(
+                self._trainer(sanity=True, metrics={"val/acc": torch.tensor(0.0)}),
+                None,
+            )
+        cb.on_validation_end(trainer, None)  # epoch 1
+        cb.on_validation_end(trainer, None)  # epoch 2
+        assert cb.history == [0.5, 0.5]
+
+    def test_state_dict_load_state_dict_keeps_history(self):
+        from common.run_lifecycle import MonitoredValueHistory
+
+        cb = MonitoredValueHistory("val/acc")
+        cb.history = [0.1, 0.2, 0.3]
+        resumed = MonitoredValueHistory("val/acc")  # history empty until load
+        resumed.load_state_dict(cb.state_dict())
+        assert resumed.history == [0.1, 0.2, 0.3]
+
+    def test_summary_reads_the_callback_history(self):
+        from common.run_lifecycle import (
+            MonitoredValueHistory,
+            monitored_history_summary,
+        )
+
+        cb = MonitoredValueHistory("val/acc")
+        cb.history = [0.4, 0.5, 0.6, 0.45, 0.5, 0.55]
+        trainer = SimpleNamespace(callbacks=[cb])
+        summary = monitored_history_summary(trainer, None)
+        assert summary["monitored_first"] == 0.4
+        assert summary["monitored_max"] == 0.6
+        assert summary["monitored_last_half_min"] == 0.45
+        assert summary["monitored_last_half_max"] == 0.55
+
+
+class TestMadSeqLenRunId:
+    def test_length_change_alters_the_id(self):
+        # The MAD default seq_len is 512 (no suffix); 256 is a non-default
+        # task field, so its run ID differs from the 512 one.
+        def cfg_for(seq_len):
+            return OmegaConf.create(
+                {
+                    "task": {"name": "mad_fuzzy", "seq_len": seq_len},
+                    "model": {
+                        "layout": "single",
+                        "gate_mode": "full",
+                        "lambda_mode": "mlp",
+                        "d_model": 128,
+                    },
+                    "optimizer": {"decay_scheme": "grouped"},
+                    "experiment": {"tier": "calib_mad_single"},
+                    "seed": 100,
+                }
+            )
+
+        a = make_run_id(cfg_for(512), 0.003, include_task_keys=True)
+        b = make_run_id(cfg_for(256), 0.003, include_task_keys=True)
+        assert a != b
+        assert "-seq_len-256" in b
+        assert "-seq_len-512" not in a

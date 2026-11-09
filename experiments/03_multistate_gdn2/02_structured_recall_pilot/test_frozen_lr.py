@@ -69,3 +69,170 @@ class TestFrozenLR:
         assert _frozen_lr(_cfg(mixer="attention"), frozen) == 6e-3
         with pytest.raises(RuntimeError):
             _frozen_lr(_cfg(mixer="attention"), _frozen({"mqar": {}}))
+
+
+def _frozen_weight_decay(cfg, frozen):
+    return _01._frozen_weight_decay(cfg, frozen)
+
+
+def _frozen_table(entries, table="lr_table"):
+    return OmegaConf.create({table: entries or {}})
+
+
+def _harness_cfg(harness, d_model, tier="tier1_mad_single"):
+    return OmegaConf.create(
+        {
+            "experiment": {"tier": tier},
+            "harness": {"name": harness},
+            "model": {
+                "d_model": d_model,
+                "layer_pattern": "zoology",
+                "state_mixer": "none",
+                "mixer": "gated_delta",
+                "layout": "single",
+                "gate_mode": "full",
+            },
+        }
+    )
+
+
+class TestFrozenWeightDecay:
+    def test_mirrors_the_lr_lookup(self):
+        frozen = _frozen_table(
+            {"mqar": {"gated_delta": {"ws": {"full": 0.1, "kda": 0.0}}}},
+            table="weight_decay_table",
+        )
+        assert _frozen_weight_decay(_cfg(gate="full"), frozen) == 0.1
+        assert _frozen_weight_decay(_cfg(gate="kda"), frozen) == 0.0
+
+    def test_attention_uses_its_own_row(self):
+        frozen = _frozen_table({"mqar": {"attention": 0.0}}, table="weight_decay_table")
+        assert _frozen_weight_decay(_cfg(mixer="attention"), frozen) == 0.0
+
+    def test_missing_raises(self):
+        with pytest.raises(RuntimeError, match="weight_decay_table"):
+            _frozen_weight_decay(_cfg(), _frozen_table({}, table="weight_decay_table"))
+
+
+class TestFrozenChoicesPerHarness:
+    def test_mad_passes_when_only_zoology_frozen(self):
+        frozen = OmegaConf.create(
+            {
+                "harness_choices": {
+                    "zoology": {"d_model": 16, "layer_pattern": "zoology"},
+                    "mad": {"d_model": None},
+                }
+            }
+        )
+        _01.check_frozen_choices(_harness_cfg("mad", d_model=128), frozen)
+
+    def test_mad_wrong_d_model_refused(self):
+        frozen = OmegaConf.create({"harness_choices": {"mad": {"d_model": 128}}})
+        with pytest.raises(RuntimeError, match="d_model"):
+            _01.check_frozen_choices(_harness_cfg("mad", d_model=64), frozen)
+
+    def test_zoology_is_checked_as_before(self):
+        frozen = OmegaConf.create(
+            {
+                "harness_choices": {
+                    "zoology": {
+                        "d_model": 16,
+                        "layer_pattern": "zoology",
+                        "state_mixer": "none",
+                    }
+                }
+            }
+        )
+        _01.check_frozen_choices(_harness_cfg("zoology", d_model=16), frozen)
+        with pytest.raises(RuntimeError, match="d_model"):
+            _01.check_frozen_choices(_harness_cfg("zoology", d_model=32), frozen)
+
+    def test_smoke_tiers_are_not_checked(self):
+        frozen = OmegaConf.create({"harness_choices": {"mad": {"d_model": 128}}})
+        _01.check_frozen_choices(_harness_cfg("mad", d_model=64, tier="smoke"), frozen)
+
+
+def _task_cfg(task="mad_fuzzy", seq_len=512, tier="tier1_mad_single"):
+    """A protocol-tier cfg with a task block (for the length freeze)."""
+    cfg = _harness_cfg("mad", d_model=128, tier=tier)
+    cfg.task = OmegaConf.create({"name": task, "seq_len": seq_len})
+    return cfg
+
+
+class TestFrozenCompleteness:
+    def test_frozen_true_missing_harness_entry_raises(self):
+        frozen = OmegaConf.create(
+            {
+                "frozen": True,
+                "harness_choices": {},
+                "task_settings": {"mad_fuzzy": {"seq_len": 512}},
+            }
+        )
+        with pytest.raises(RuntimeError, match="harness_choices"):
+            _01.check_frozen_choices(_task_cfg(), frozen)
+
+    def test_frozen_true_null_key_raises(self):
+        frozen = OmegaConf.create(
+            {
+                "frozen": True,
+                "harness_choices": {"mad": {"d_model": None}},
+                "task_settings": {"mad_fuzzy": {"seq_len": 512}},
+            }
+        )
+        with pytest.raises(RuntimeError, match="still null"):
+            _01.check_frozen_choices(_task_cfg(), frozen)
+
+    def test_frozen_true_missing_task_settings_raises(self):
+        frozen = OmegaConf.create(
+            {"frozen": True, "harness_choices": {"mad": {"d_model": 128}}}
+        )
+        with pytest.raises(RuntimeError, match="task_settings"):
+            _01.check_frozen_choices(_task_cfg(), frozen)
+
+    def test_unfrozen_null_passes(self):
+        frozen = OmegaConf.create(
+            {
+                "frozen": False,
+                "harness_choices": {"mad": {"d_model": None}},
+                "task_settings": {"mad_fuzzy": {"seq_len": None}},
+            }
+        )
+        _01.check_frozen_choices(_task_cfg(), frozen)
+
+    def test_frozen_length_mismatch_refused(self):
+        frozen = OmegaConf.create(
+            {
+                "frozen": True,
+                "harness_choices": {"mad": {"d_model": 128}},
+                "task_settings": {"mad_fuzzy": {"seq_len": 512}},
+            }
+        )
+        # A protocol-tier run at a length other than the frozen one.
+        with pytest.raises(RuntimeError, match="seq_len"):
+            _01.check_frozen_choices(_task_cfg(seq_len=256), frozen)
+        # The frozen length passes.
+        _01.check_frozen_choices(_task_cfg(seq_len=512), frozen)
+
+    def test_frozen_entity_field_with_no_entry_passes(self):
+        # entity-field has no setting rule (no band registry entry), so its
+        # phase-2 runs need no task_settings entry once frozen; a MAD entry is
+        # present for the other task but not required here.
+        frozen = OmegaConf.create(
+            {
+                "frozen": True,
+                "harness_choices": {"mad": {"d_model": 128}},
+                "task_settings": {"mad_fuzzy": {"seq_len": 512}},
+            }
+        )
+        cfg = _harness_cfg("mad", d_model=128, tier="tier1_mad_single")
+        cfg.task = OmegaConf.create({"name": "entity_field", "seq_len": 256})
+        _01.check_frozen_choices(cfg, frozen)  # no raise
+
+    def test_frozen_mad_missing_entry_refused(self):
+        # MAD has a setting rule, so a frozen phase-2 run with no entry is
+        # refused (an unfilled entry would otherwise never be checked).
+        frozen = OmegaConf.create(
+            {"frozen": True, "harness_choices": {"mad": {"d_model": 128}}}
+        )
+        with pytest.raises(RuntimeError, match="task_settings"):
+            _01.check_frozen_choices(_task_cfg(), frozen)

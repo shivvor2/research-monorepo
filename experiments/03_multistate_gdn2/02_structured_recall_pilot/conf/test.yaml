@@ -3,36 +3,28 @@
 # =============================================================================
 # Usage:
 #   python 01_train.py --config-name=test task=mqar
+#   python 01_train.py --config-name=test task=entity_field
+#   python 01_train.py --config-name=test task=mad_fuzzy
 # Finishes in a few minutes on CPU and writes a run JSON under runs/<task>/.
+#
+# The task's own smoke sizes (vocab / seq_len / field counts) live in
+# ``conf/smoke/<task>.yaml``, selected here through the ``smoke`` group
+# keyed on the task choice; a new task adds ``conf/smoke/<task>.yaml`` and
+# nothing else. Model, training and data smoke settings stay here, shared.
 
 defaults:
   - config
+  - optional smoke: ${task}
 
 experiment:
   name: multistate_gdn2_structured_recall_pilot_test
   phase: 1
   tier: smoke
 
-# Task overrides: each task's builder keeps only its own config fields,
-# so the smoke can run any registered task (mqar ignores the
-# entity-field keys and vice versa). The entity-field numbers keep every
-# slice feasible at seq_len=64 (N + U <= slots, >= distant_min_blocks + 1
-# blocks, enough entity ids and values).
-task:
-  vocab_size: 128
-  seq_len: 64
-  max_seq_len: 64
-  num_kv_pairs: [2, 4]
-  num_fields: 2
-  num_entities: [2, 4]
-  update_fraction: 0.75
-  block_size: 8
-  distant_min_blocks: 2
-  reserved_filler: 2
-
 model:
   d_model: 16
   num_heads: 1
+  attention_num_heads: 4   # d=16 -> 4 heads of width 4 (even rotary dim)
   window: 4
   gate_mode: full
   layout: ws
@@ -44,12 +36,14 @@ data:
 
 training:
   batch_size: 64
+  epochs: 2                   # mad_fuzzy: the run length derives from this
   max_steps: 20
   val_check_interval: 10
   log_every_n_steps: 1
 
 optimizer:
   lr: 0.003   # not frozen yet; the smoke config sets its own
+  weight_decay: 0.0   # same: the harness leaves it to the frozen protocol
 
 logging:
   csv:
