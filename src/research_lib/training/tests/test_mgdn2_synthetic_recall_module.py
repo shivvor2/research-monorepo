@@ -276,33 +276,35 @@ class TestCosineSchedule:
 
         total = 50
         peak = 1e-2
+        schedule = WarmupStableDecaySchedule(
+            param_name="lr",
+            warmup_frac=0.0,
+            cooldown_frac=1.0,
+            min_value=0.0,
+            max_value=peak,
+            decay_type="cosine",
+        )
         optimizer = torch.optim.AdamW([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
         scheduler = ParamScheduler(
             optimizer=optimizer,
-            global_schedules=[
-                WarmupStableDecaySchedule(
-                    param_name="lr",
-                    warmup_frac=0.0,
-                    cooldown_frac=1.0,
-                    min_value=0.0,
-                    max_value=peak,
-                    decay_type="cosine",
-                )
-            ],
+            global_schedules=[schedule],
             total_steps=total,
         )
-        # step() applies the value for the current count, then increments:
-        # the optimizer's LR after k calls is the schedule value at step k-1.
-        scheduler.step()
+        # Optimizer step s runs at schedule(s): construction applies
+        # schedule(0) = peak, and each step() advances and applies the next.
         assert optimizer.param_groups[0]["lr"] == pytest.approx(peak)
         for _ in range(total // 2):
             scheduler.step()
         mid = optimizer.param_groups[0]["lr"]
         assert peak / 2 - peak * 0.02 <= mid <= peak / 2 + peak * 0.02
-        # After total + 1 calls the applied value is f(total) = 0 exactly.
-        for _ in range(total + 1 - 1 - total // 2):
+        # After total step() calls the counter is ``total`` but the applied
+        # value stays at the last step that ran (schedule(total-1)); step()
+        # does not evaluate a step that never runs.
+        for _ in range(total - total // 2):
             scheduler.step()
-        assert optimizer.param_groups[0]["lr"] == pytest.approx(0.0, abs=1e-12)
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(
+            schedule(total - 1, total)
+        )
 
 
 @pytest.mark.slow

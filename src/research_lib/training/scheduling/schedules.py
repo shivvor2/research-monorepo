@@ -44,12 +44,14 @@ See Also:
 
 from __future__ import annotations
 
+import functools
 import inspect
 import logging
 import math
 import pickle
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -269,12 +271,12 @@ class WarmupStableDecaySchedule(ParamSchedule):
     param_name: str = "lr"
 
     # Warmup configuration (mutually exclusive)
-    warmup_steps: Optional[int] = None
-    warmup_frac: Optional[float] = None
+    warmup_steps: int | None = None
+    warmup_frac: float | None = None
 
     # Cooldown/decay configuration (mutually exclusive)
-    cooldown_steps: Optional[int] = None
-    cooldown_frac: Optional[float] = None
+    cooldown_steps: int | None = None
+    cooldown_frac: float | None = None
 
     # Value range
     min_value: float = 0.0
@@ -397,10 +399,10 @@ class _WarmupStableDecayFn:
     basic types as fields.
     """
 
-    warmup_steps: Optional[int]
-    warmup_frac: Optional[float]
-    cooldown_steps: Optional[int]
-    cooldown_frac: Optional[float]
+    warmup_steps: int | None
+    warmup_frac: float | None
+    cooldown_steps: int | None
+    cooldown_frac: float | None
     min_value: float
     max_value: float
     warmup_type: str
@@ -453,3 +455,63 @@ class _WarmupStableDecayFn:
         else:
             # Stable phase
             return self.max_value
+
+
+def _epoch_cosine(
+    step: int,
+    total_steps: int,
+    steps_per_epoch: int,
+    epochs: int,
+    max_value: float,
+    min_value: float,
+) -> float:
+    """The per-epoch cosine rate: constant inside an epoch, following
+    ``eta_min + (eta_max - eta_min) * (1 + cos(pi * e / E)) / 2`` over the
+    epochs ``e = 0..E-1`` (module-level so the schedule stays picklable)."""
+    if steps_per_epoch < 1:
+        raise ValueError(f"steps_per_epoch must be >= 1, got {steps_per_epoch}")
+    if epochs < 1:
+        raise ValueError(f"epochs must be >= 1, got {epochs}")
+    epoch = min(int(step) // int(steps_per_epoch), int(epochs) - 1)
+    progress = epoch / int(epochs)
+    cosine = 0.5 * (1 + math.cos(math.pi * progress))
+    return float(min_value + (max_value - min_value) * cosine)
+
+
+@dataclass(kw_only=True)
+class EpochCosineSchedule(ParamSchedule):
+    """A per-epoch cosine schedule, constant within each epoch.
+
+    Mirrors ``torch.optim.lr_scheduler.CosineAnnealingLR`` stepped once per
+    epoch: during epoch ``e`` (0-based) the rate is
+    ``eta_min + (eta_max - eta_min) * (1 + cos(pi * e / E)) / 2``, so it
+    starts at the maximum and decays to near the minimum over the ``E``
+    epochs.  Because it is driven by the batch ``step``, the value is
+    unchanged for every step within an epoch — the epoch changes only
+    every ``steps_per_epoch`` steps.
+
+    Attributes:
+        param_name: The optimizer parameter to schedule. Default: ``"lr"``.
+        steps_per_epoch: Training steps per epoch (the rate is constant
+            within each epoch).
+        epochs: Total number of epochs ``E``.
+        max_value: The value at epoch 0 (the peak).
+        min_value: The value the schedule decays toward (``eta_min``).
+    """
+
+    param_name: str = "lr"
+    steps_per_epoch: int
+    epochs: int
+    max_value: float
+    min_value: float
+    schedule_fn: Callable[[int, int], float] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.schedule_fn = functools.partial(
+            _epoch_cosine,
+            steps_per_epoch=int(self.steps_per_epoch),
+            epochs=int(self.epochs),
+            max_value=float(self.max_value),
+            min_value=float(self.min_value),
+        )
+        super().__post_init__()
