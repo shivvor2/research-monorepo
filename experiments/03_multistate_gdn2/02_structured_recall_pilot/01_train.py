@@ -33,6 +33,7 @@ for _path in (_PROJECT, _PILOT):
         sys.path.insert(0, str(_path))
 
 from common import conf_resolvers  # noqa: E402,F401  (registers config resolvers)
+from common.conf_resolvers import padded_generated_length  # noqa: E402,F401
 from common.launch import begin_run, claimed_run  # noqa: E402
 from common.registries import (  # noqa: E402
     build_extra_metrics,
@@ -50,8 +51,9 @@ from common.run_lifecycle import (  # noqa: E402
     upload_run_record_artifact,
 )
 from structured_recall_analysis.protocol import (  # noqa: E402
+    FROZEN_HARNESS_KEYS,
+    FROZEN_TASK_KEYS,
     PROTOCOL_TIERS,
-    TASK_SETTING_BANDS,
 )
 
 from research_lib.data.synthetic import (  # noqa: E402
@@ -70,20 +72,69 @@ def load_frozen_protocol() -> DictConfig:
     return OmegaConf.load(_PILOT / "conf" / "frozen_protocol.yaml")
 
 
-def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
-    """Assert the run uses the frozen architecture choices and, once the
-    protocol is frozen, that those choices are complete.
+def assert_fixed_set_padding(cfg: DictConfig) -> int:
+    """The fixed-set run's max_seq_len must be the derived padded length
+    (``seq_len + 1`` rounded up to the chunk size); a hand-set value could
+    silently change the padding, and with it ``t_max`` and the ``ll`` slot
+    count. Returns the validated padded length.
 
-    Applies to protocol tiers only (the smoke/debug tiers are tooling).
-    The run's config stays the record; the frozen file is checked against
-    it, never used as a second source that silently overrides.  While
-    ``frozen: false`` the check is permissive: only the ``harness_choices``
-    entry for ``cfg.harness.name`` is checked, and only for the keys the
-    entry sets.  While ``frozen: true`` a protocol-tier run additionally
-    requires that the entry exists and that every key it lists is non-null
-    (an unfilled entry would otherwise never be checked), and the same for
-    the ``task_settings.<task>`` entry (the frozen settings such as the
-    sequence length).
+    Raises:
+        ValueError: ``task.max_seq_len`` differs from the derived value.
+    """
+    derived = padded_generated_length(cfg.task.seq_len, cfg.model.chunk_size)
+    run_max = int(cfg.task.max_seq_len)
+    if run_max != derived:
+        raise ValueError(
+            f"task.max_seq_len ({run_max}) must equal the derived padded "
+            f"length {derived} = padded_generated_length(task.seq_len="
+            f"{cfg.task.seq_len}, model.chunk_size={cfg.model.chunk_size})"
+        )
+    return derived
+
+
+def _check_entry_values(
+    cfg: DictConfig,
+    entry: DictConfig | None,
+    *,
+    keys: tuple[str, ...],
+    node: str,
+    label: str,
+    tier: str,
+) -> None:
+    """Compare ``node``'s run values against the frozen ``entry`` (a
+    ``harness_choices`` / ``task_settings`` node) for every key that is set.
+
+    A set key whose run value (``cfg.<node>.<key>``) differs from the frozen
+    value is an error naming both; a ``None`` frozen value is a not-yet-set
+    key and is skipped. ``keys`` is unused here beyond documenting the
+    expected keys (completeness is enforced separately by
+    :func:`check_frozen_choices`).
+    """
+    if entry is None:
+        return
+    for key, frozen_value in entry.items():
+        if frozen_value is None:
+            continue
+        run_value = OmegaConf.select(cfg, f"{node}.{key}")
+        if str(run_value) != str(frozen_value):
+            raise RuntimeError(
+                f"the frozen protocol for {label} uses {key}={frozen_value!r}, "
+                f"but this run uses {node}.{key}={run_value!r} (tier={tier!r})"
+            )
+
+
+def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
+    """Assert the run uses the frozen choices and, once the protocol is
+    frozen, that every required choice is complete.
+
+    The required keys are the protocol's :data:`FROZEN_HARNESS_KEYS` /
+    :data:`FROZEN_TASK_KEYS` (the single source of truth; the YAML entry
+    must hold exactly those). Applies to protocol tiers only. While
+    ``frozen: false`` the check is permissive: a set key is compared, a
+    null or missing key is passed. While ``frozen: true`` a protocol-tier
+    run additionally requires that the harness entry exists and holds every
+    required key non-null, and the same for the task's entry when the task
+    has required keys.
 
     Raises:
         RuntimeError: Naming the key, the run's value, the frozen value
@@ -94,71 +145,47 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
         return
     is_frozen = bool(frozen.get("frozen", False))
     harness = str(cfg.harness.name)
+    harness_keys = FROZEN_HARNESS_KEYS.get(harness, ())
     entry = (frozen.get("harness_choices") or {}).get(harness)
-    if is_frozen:
+    if is_frozen and harness_keys:
         if entry is None:
             raise RuntimeError(
                 f"the frozen protocol is frozen but has no harness_choices "
                 f"entry for harness {harness!r} (tier={tier!r}); fill "
                 "conf/frozen_protocol.yaml"
             )
-        for key in entry:
+        for key in harness_keys:
             if entry.get(key) is None:
                 raise RuntimeError(
                     f"the frozen protocol is frozen but harness_choices."
                     f"{harness}.{key} is still null (tier={tier!r}); fill "
                     "conf/frozen_protocol.yaml"
                 )
-    if entry is not None:
-        if entry.get("d_model") is not None and int(cfg.model.d_model) != int(
-            entry["d_model"]
-        ):
-            raise RuntimeError(
-                f"the frozen protocol for harness {harness!r} fixes d_model="
-                f"{entry['d_model']}, but this run uses model.d_model="
-                f"{cfg.model.d_model} (tier={tier!r})"
-            )
-        for key in ("layer_pattern", "state_mixer"):
-            frozen_value = entry.get(key, None)
-            if frozen_value is None:
-                continue
-            if str(cfg.model[key]) != str(frozen_value):
-                raise RuntimeError(
-                    f"the frozen protocol for harness {harness!r} uses "
-                    f"{key}={frozen_value!r}, but this run uses "
-                    f"model.{key}={cfg.model[key]!r} (tier={tier!r})"
-                )
+    _check_entry_values(
+        cfg, entry, keys=harness_keys, node="model", label=f"harness {harness!r}", tier=tier
+    )
 
     # ---- the task's frozen settings (e.g. the sequence length) ----
-    # Only a task with a setting rule (one in the band registry) needs a
-    # ``task_settings`` entry once frozen; a task without one (its difficulty
-    # comes from its slices, not its length) has nothing to freeze. An entry
-    # that does exist is still checked against the run.
     task = str(OmegaConf.select(cfg, "task.name", default=""))
+    task_keys = FROZEN_TASK_KEYS.get(task, ())
     task_settings = (frozen.get("task_settings") or {}).get(task)
-    if is_frozen and task in TASK_SETTING_BANDS:
+    if is_frozen and task_keys:
         if task_settings is None:
             raise RuntimeError(
                 f"the frozen protocol is frozen but has no task_settings "
                 f"entry for task {task!r} (tier={tier!r}); fill "
                 "conf/frozen_protocol.yaml"
             )
-        for key in task_settings:
+        for key in task_keys:
             if task_settings.get(key) is None:
                 raise RuntimeError(
                     f"the frozen protocol is frozen but task_settings."
                     f"{task}.{key} is still null (tier={tier!r}); fill "
                     "conf/frozen_protocol.yaml"
                 )
-    if task_settings is not None and task_settings.get("seq_len") is not None:
-        frozen_seq = int(task_settings["seq_len"])
-        run_seq = int(OmegaConf.select(cfg, "task.seq_len", default=-1))
-        if run_seq != frozen_seq:
-            raise RuntimeError(
-                f"the frozen protocol fixes task_settings.{task}.seq_len="
-                f"{frozen_seq}, but this run uses task.seq_len={run_seq} "
-                f"(tier={tier!r}); launch the task at the frozen length"
-            )
+    _check_entry_values(
+        cfg, task_settings, keys=task_keys, node="task", label=f"task {task!r}", tier=tier
+    )
 
 
 def build_task_config(cfg: DictConfig):
@@ -223,19 +250,10 @@ def run_job(cfg: DictConfig) -> None:
         monitor_key = str(cfg.training.monitor_key)
 
         if regime is TaskRegime.FIXED_SET:
-            # Fixed, chunk-padded rows: the run's max_seq_len must cover a
-            # row (seq_len + 1) and line up with the chunk size.
-            if int(cfg.task.max_seq_len) < int(cfg.task.seq_len) + 1:
-                raise ValueError(
-                    f"task.max_seq_len ({cfg.task.max_seq_len}) must be >= "
-                    f"task.seq_len + 1 ({int(cfg.task.seq_len) + 1})"
-                )
-            if int(cfg.task.max_seq_len) % int(cfg.model.chunk_size) != 0:
-                raise ValueError(
-                    f"task.max_seq_len ({cfg.task.max_seq_len}) must be a "
-                    f"multiple of model.chunk_size ({cfg.model.chunk_size})"
-                )
-            to_row = spec.row_fn(task_config, pad_to=int(cfg.task.max_seq_len))
+            # Fixed, chunk-padded rows: the run's max_seq_len must be the
+            # derived padded length (assert_fixed_set_padding).
+            padded = assert_fixed_set_padding(cfg)
+            to_row = spec.row_fn(task_config, pad_to=padded)
             datamodule = FixedSetRecallDataModule(
                 dataset_fn=spec.dataset_fn,
                 config=task_config,

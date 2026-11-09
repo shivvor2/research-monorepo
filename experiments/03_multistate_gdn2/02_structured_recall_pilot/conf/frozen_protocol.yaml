@@ -7,21 +7,18 @@
 
 frozen: false
 
-# The frozen architecture choices per harness. ``check_frozen_choices``
-# checks only the entry for ``cfg.harness.name``, and only the keys that
-# entry sets; an entry can name one or all of ``d_model``,
-# ``layer_pattern`` and ``state_mixer`` (Zoology names all three; MAD
-# names only ``d_model``, because it has no layer pattern / state mixer).
+# The frozen architecture choices per harness. The keys a harness may
+# hold are the protocol's ``FROZEN_HARNESS_KEYS`` (the single source of
+# truth) - Zoology's d_model / layer_pattern / state_mixer, MAD's d_model /
+# num_mixers - and ``check_frozen_choices`` requires a frozen entry to list
+# exactly those, comparing each set key against the run.
 harness_choices:
   zoology: {d_model: null, layer_pattern: null, state_mixer: null}
-  mad: {d_model: null}
+  mad: {d_model: null, num_mixers: null}
 
-# The frozen per-task settings. Only a task with a setting rule (one in
-# the protocol's ``TASK_SETTING_BANDS``) needs an entry once frozen; a
-# task without one (its difficulty comes from its slices, not its length,
-# which is part of the task definition) registers nothing here. An entry
-# that exists is checked key by key: a run whose task.seq_len differs from
-# the frozen value is refused.
+# The frozen per-task settings. The keys a task may freeze are the
+# protocol's ``FROZEN_TASK_KEYS``; a task with no entry there (its
+# difficulty comes from its slices, not its length) has nothing to freeze.
 task_settings:
   mad_fuzzy: {seq_len: null}
 

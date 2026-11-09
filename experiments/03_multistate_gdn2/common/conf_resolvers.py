@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 _RESOLVER_NAME = "padded_generated_length"
 
 
-def _padded_generated_length(size: Any, chunk: Any) -> int:
+def padded_generated_length(size: Any, chunk: Any) -> int:
     """``size + 1`` rounded up to a multiple of ``chunk``.
 
     Args:
@@ -49,7 +49,7 @@ def register_conf_resolvers() -> None:
         # this resolver's arguments are themselves interpolations
         # (``${padded_generated_length:${task.seq_len}, ${model.chunk_size}}``), which
         # only the new resolver form supports.
-        OmegaConf.register_new_resolver(_RESOLVER_NAME, _padded_generated_length)
+        OmegaConf.register_new_resolver(_RESOLVER_NAME, padded_generated_length)
 
 
 register_conf_resolvers()

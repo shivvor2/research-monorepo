@@ -104,6 +104,11 @@ positive-control tier."""
 # Screening cells
 # --------------------------------------------------------------------------- #
 
+
+"""The screening metric key per registered task (a ``test/<key>``
+column). A task with a screening cell but no :data:`TASK_TIERS` entry is
+skipped by the reports with a log line, not an error."""
+
 SCREENING_CELLS: dict[str, str] = {
     "mqar": "test/acc/slice=64",
     "entity_field": "test/acc/slice=32/class=sibling",
@@ -184,6 +189,26 @@ TASK_DAMAGE: dict[str, DamageReading] = {
 (``high - low``) per slice and gate when both columns are present."""
 
 # --------------------------------------------------------------------------- #
+# Frozen settings: what the frozen protocol may fix
+# --------------------------------------------------------------------------- #
+
+FROZEN_HARNESS_KEYS: dict[str, tuple[str, ...]] = {
+    "zoology": ("d_model", "layer_pattern", "state_mixer"),
+    "mad": ("d_model", "num_mixers"),
+}
+"""The harness settings each harness may freeze (compared against the
+run's ``model.<key>``). The single source of truth for what an entry must
+hold once frozen; a key listed here but absent from the YAML entry is a
+completeness error."""
+
+FROZEN_TASK_KEYS: dict[str, tuple[str, ...]] = {
+    "mad_fuzzy": ("seq_len",),
+}
+"""The task settings a task may freeze (compared against the run's
+``task.<key>``), for tasks whose calibration picks a setting such as the
+length. A task with no entry here has nothing to freeze."""
+
+# --------------------------------------------------------------------------- #
 # Per-task length-setting band
 # --------------------------------------------------------------------------- #
 
@@ -191,7 +216,9 @@ TASK_DAMAGE: dict[str, DamageReading] = {
 @dataclass(frozen=True)
 class SettingBand:
     """A task's length-setting band: the interval a best validation reading
-    should sit in, and a margin near either edge that flags a re-check.
+    should sit in, a margin near either edge that flags a re-check, and the
+    monitor key the reading comes from (so a row recorded against a
+    different key is refused, not classified).
 
     Below the floor the setting moves down, above the ceiling it moves up,
     and a reading within ``margin`` of either edge is flagged for a
@@ -201,15 +228,19 @@ class SettingBand:
     floor: float
     ceiling: float
     margin: float
+    metric: str
 
 
 TASK_SETTING_BANDS: dict[str, SettingBand] = {
     # The MAD length rule reads a best validation ``acc_mad`` and moves
     # the length if it sits outside the band [0.15, 0.75].
-    "mad_fuzzy": SettingBand(floor=0.15, ceiling=0.75, margin=0.05),
+    "mad_fuzzy": SettingBand(
+        floor=0.15, ceiling=0.75, margin=0.05, metric="val/acc_mad"
+    ),
 }
 """The tasks whose best validation reading drives a length-setting band,
 keyed by task.  A task with no entry gets no band columns."""
+
 
 TASK_STUCK_CHECK: frozenset[str] = frozenset({"mad_fuzzy"})
 """The tasks whose runs get a per-run look-stuck flag in the calibration
