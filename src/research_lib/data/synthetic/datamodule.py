@@ -48,43 +48,16 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
+from ._shared import batch_seed as _batch_seed
+from ._shared import distributed_world_size_and_rank as _distributed_world_size_and_rank
 from .entity_field import EntityFieldConfig
 from .mqar import MQARConfig
 from .overwrite import OverwriteConfig
-from .registry import require_task
+from .registry import TaskRegime, require_task
 
 logger = logging.getLogger(__name__)
 
 TaskConfig = MQARConfig | OverwriteConfig | EntityFieldConfig
-
-
-def _batch_seed(train_seed: int, index: int) -> int:
-    """Deterministic per-batch seed: ``SeedSequence([train_seed, index])``.
-
-    Args:
-        train_seed: base seed of the train stream.
-        index: global batch index.
-
-    Returns:
-        A usable int seed for ``np.random.default_rng`` (64-bit draw).
-    """
-    return int(
-        np.random.SeedSequence([int(train_seed), int(index)]).generate_state(
-            1, dtype=np.uint64
-        )[0]
-    )
-
-
-def _distributed_world_size_and_rank() -> tuple[int, int]:
-    """World size and rank: ``torch.distributed`` when a process group is
-    initialized, else ``(1, 0)``.
-
-    Read fresh at each use (``__iter__``, the transfer hook, ``setup``) so
-    the current state is always seen and tests can simulate ranks.
-    """
-    if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return torch.distributed.get_world_size(), torch.distributed.get_rank()
-    return 1, 0
 
 
 class _SyntheticTrainDataset(IterableDataset):
@@ -289,6 +262,12 @@ class SyntheticRecallDataModule(L.LightningDataModule):
     ) -> None:
         super().__init__()
         spec = require_task(task)  # raises ValueError for an unknown task
+        if spec.regime is not TaskRegime.STREAMING:
+            raise ValueError(
+                f"task {task!r} trains on a fixed set (regime "
+                f"{spec.regime.value}) and cannot be streamed; use the "
+                f"fixed-set datamodule instead"
+            )
         expected_type = spec.config_type
         if not isinstance(task_config, expected_type):
             raise TypeError(
