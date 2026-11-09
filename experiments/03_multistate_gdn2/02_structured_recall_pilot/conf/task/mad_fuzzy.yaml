@@ -14,7 +14,7 @@ defaults:
 name: mad_fuzzy
 vocab_size: 16
 seq_len: 512
-max_seq_len: ${padded_to_chunk:${task.seq_len}, ${model.chunk_size}}
+max_seq_len: ${padded_generated_length:${task.seq_len}, ${model.chunk_size}}
 k_motif_size: 3
 v_motif_size: 3
 multi_query: true

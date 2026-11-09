@@ -74,7 +74,7 @@ cosine LR, and the two AdamW groups decay only the 2-D linear weights (the
 embedding, head norms, biases and the layer's λ/decay parameters are
 exempt). Its `max_seq_len` (the row length) is derived, not hand-set:
 `seq_len + 1` rounded up to a multiple of the harness chunk size (via the
-`padded_to_chunk` config resolver), and `t_max` follows it.
+`padded_generated_length` config resolver), and `t_max` follows it.
 
 ### MAD fuzzy calibration workflow
 
