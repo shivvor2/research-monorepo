@@ -640,6 +640,80 @@ class TestMonitoredValueHistory:
         assert summary["monitored_last_half_max"] == 0.55
 
 
+class TestRunIdWeightDecay:
+    """The resolved weight decay enters the run ID only when the harness
+    calibrates it, so Zoology's (and the first pilot's) IDs are unchanged."""
+
+    def test_zoology_id_ignores_weight_decay(self):
+        cfg = _cfg()
+        cfg.harness = {"name": "zoology"}
+        a = make_run_id(cfg, 0.003, weight_decay=0.1, include_task_keys=True)
+        b = make_run_id(cfg, 0.003, weight_decay=0.0, include_task_keys=True)
+        assert a == b
+        assert "-wd" not in a
+
+    def test_mad_id_distinguishes_weight_decay_values(self):
+        def mad_cfg(wd_calibrate=True):
+            cfg = _cfg()
+            cfg.harness = {"name": "mad"}
+            cfg.optimizer.calibrate_weight_decay = wd_calibrate
+            return cfg
+
+        a = make_run_id(mad_cfg(), 0.003, weight_decay=0.1, include_task_keys=True)
+        b = make_run_id(mad_cfg(), 0.003, weight_decay=0.0, include_task_keys=True)
+        assert a != b
+        assert "-wd0.1" in a
+        assert "-wd0" in b
+
+    def test_mad_id_matches_expected_shape(self):
+        cfg = _cfg()
+        cfg.harness = {"name": "mad"}
+        cfg.optimizer.calibrate_weight_decay = True
+        run_id = make_run_id(cfg, 0.003, weight_decay=0.1, include_task_keys=True)
+        assert run_id == "overwrite-single-full-mlp-d32-lr0.003-wd0.1-h-mad-s0"
+
+    def test_mad_attention_run_gets_wd_and_no_gated_segment(self):
+        # The attention base drops the {layout}-{gate}-{lambda} segment but
+        # still carries -wd when the weight decay is calibrated.
+        cfg = OmegaConf.create(
+            {
+                "task": {"name": "mad_fuzzy", "seq_len": 512},
+                "model": {
+                    "layout": "single",
+                    "gate_mode": "full",
+                    "lambda_mode": "mlp",
+                    "d_model": 128,
+                    "mixer": "attention",
+                    "layer_pattern": "zoology",
+                    "state_mixer": "none",
+                    "expand_v": 1.0,
+                },
+                "optimizer": {
+                    "decay_scheme": "grouped",
+                    "calibrate_weight_decay": True,
+                },
+                "harness": {"name": "mad"},
+                "experiment": {"tier": "calib_mad_attention"},
+                "seed": 100,
+            }
+        )
+        run_id = make_run_id(cfg, 0.001, weight_decay=0.1, include_task_keys=True)
+        assert run_id.startswith("calib_mad_attention_mad_fuzzy-d128-lr0.001")
+        assert "-wd0.1" in run_id
+        assert "-mix-attention-h-mad-s100" in run_id
+        for seg in ("-single-", "-full-", "-mlp-"):
+            assert seg not in run_id
+
+    def test_zoology_attention_run_gets_no_wd(self):
+        # Zoology does not calibrate the weight decay, so its attention run
+        # (also without the gated segment) has no -wd even when one is passed.
+        cfg = _cfg()
+        cfg.model.mixer = "attention"
+        run_id = make_run_id(cfg, 0.003, weight_decay=0.1, include_task_keys=True)
+        assert "-wd" not in run_id
+        assert run_id == "overwrite-d32-lr0.003-mix-attention-s0"
+
+
 class TestMadSeqLenRunId:
     def test_length_change_alters_the_id(self):
         # The MAD default seq_len is 512 (no suffix); 256 is a non-default
