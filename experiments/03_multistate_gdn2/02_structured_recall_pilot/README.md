@@ -101,7 +101,12 @@ key, so a length-resolution rerun overrides `task.seq_len=256` and
    task.seq_len=256 --multirun`; the report groups by each length
    separately and `python 02_analyze.py --seq-len mad_fuzzy=<n>` picks one
    length for the frozen snippet). The setting is chosen on accuracy level
-   only, never on the gap.
+   only, never on the gap. If one gate reads below 0.15 and the other
+   above 0.75, the floor takes precedence and the length moves to 256: a
+   reading near 0.15 is close to chance for the macro accuracy over MAD's
+   value tokens, so that gate gives no usable comparison, while a gate
+   above 0.75 is still measured and only leaves less headroom for
+   multi-state gains.
 3. Go/no-go: `full − kda ≥ +0.03` at each gate's best point.
 4. On a go, run `calib_mad_multi` and the attention calibration
    (`calib_mad_attention` for the positive control), freeze both the LR
