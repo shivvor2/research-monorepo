@@ -81,6 +81,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from ._sampling import _check_sampler_floor, _distinct_ints
+
 logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
@@ -96,16 +98,6 @@ _MAX_EXAMPLE_RESTARTS = 100
 pilot grid settings; tight configs that pass the construction-time check
 can still need restarts (e.g. all-distant K=42 at T=256 restarts ~79% of
 examples))."""
-
-_MAX_SAMPLING_ROUNDS = 10_000
-"""Hard cap on redraw rounds of :func:`_distinct_ints` before a
-RuntimeError. The configuration-time sampler bounds keep valid configs
-far below this; a hit means a caller bypassed them (e.g. an impossible
-draw)."""
-
-_SAMPLER_LOG_FLOOR = math.log(0.01)
-"""log of the per-round success floor (1%) for the without-replacement
-samplers; the expected number of redraws per row is then at most ~100."""
 
 
 class OverwriteClass(enum.IntEnum):
@@ -220,6 +212,10 @@ class OverwriteConfig:
                 f"class_probs must have 4 entries "
                 f"(same, adjacent, distant, single), got {self.class_probs}"
             )
+        if any(not math.isfinite(p) for p in self.class_probs):
+            raise ValueError(
+                f"class_probs entries must be finite, got {self.class_probs}"
+            )
         if any(p < 0 for p in self.class_probs):
             raise ValueError(
                 f"class_probs entries must be >= 0, got {self.class_probs}"
@@ -231,15 +227,6 @@ class OverwriteConfig:
     def slices(self) -> tuple[int, ...]:
         """The per-example slice values ``K`` (sorted)."""
         return tuple(sorted(self.num_keys))
-
-
-def _sampler_log_prob(n: int, d: int) -> float:
-    """Exact log-probability that ``d`` uniform draws from ``n`` ids (with
-    replacement) come out distinct: ``log(n! / ((n - d)! n^d))``, computed
-    via log-gammas so it never overflows. Requires ``1 <= d <= n`` (the
-    ``n >= d`` feasibility check runs first).
-    """
-    return math.lgamma(n + 1) - math.lgamma(n - d + 1) - d * math.log(n)
 
 
 def _validate_key_count(config: OverwriteConfig, k: int) -> None:
@@ -281,17 +268,13 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"[1, vocab_size // 2 - reserved_filler) = [1, {n_key + 1}), "
             f"which has only {n_key} ids, fewer than {k} distinct keys"
         )
-    log_key = _sampler_log_prob(n_key, k)
-    if log_key < _SAMPLER_LOG_FLOOR:
-        prob = math.exp(log_key)
-        raise ValueError(
-            f"num_keys entry {k} would stall the key sampler: drawing "
-            f"{k} distinct ids from the {n_key}-id key pool succeeds with "
-            f"exact probability {n_key}! / (({n_key} - {k})! * "
-            f"{n_key}^{k}) = {prob:.3%}, below the 1% floor (expected "
-            f"redraws ~{1.0 / prob:.0f} per row); increase vocab_size or "
-            f"reduce reserved_filler"
-        )
+    _check_sampler_floor(
+        n_key,
+        k,
+        entry=f"num_keys entry {k}",
+        pool="key",
+        remedy="increase vocab_size or reduce reserved_filler",
+    )
     n_val = config.vocab_size // 2
     if n_val < 2 * k:
         raise ValueError(
@@ -300,56 +283,13 @@ def _validate_key_count(config: OverwriteConfig, k: int) -> None:
             f"has only V/2 = {n_val} ids"
         )
     d_val = 2 * k
-    log_value = _sampler_log_prob(n_val, d_val)
-    if log_value < _SAMPLER_LOG_FLOOR:
-        prob = math.exp(log_value)
-        raise ValueError(
-            f"num_keys entry {k} would stall the value sampler: drawing "
-            f"2K = {d_val} distinct values from the {n_val}-id value pool "
-            f"succeeds with exact probability {n_val}! / (({n_val} - "
-            f"{d_val})! * {n_val}^{d_val}) = {prob:.3%}, below the 1% "
-            f"floor (expected redraws ~{1.0 / prob:.0f} per row); "
-            f"increase vocab_size"
-        )
-
-
-def _distinct_ints(
-    rng: np.random.Generator, low: int, high: int, shape: tuple[int, int]
-) -> np.ndarray:
-    """Uniform draws without replacement, per row.
-
-    Each row of the result holds ``shape[1]`` distinct values from
-    ``[low, high)``. Rows are redrawn (rejection) until distinct, which
-    preserves the uniform law over ordered distinct rows.
-
-    Args:
-        rng: numpy Generator.
-        low: inclusive lower bound.
-        high: exclusive upper bound.
-        shape: ``(rows, draws)``.
-
-    Returns:
-        Int64 array of ``shape`` whose rows hold distinct values.
-
-    Shape:
-        ``(shape)``.
-    """
-    out = np.empty(shape, dtype=np.int64)
-    pending = np.arange(shape[0])
-    rounds = 0
-    while pending.size:
-        rounds += 1
-        if rounds > _MAX_SAMPLING_ROUNDS:
-            raise RuntimeError(
-                f"_distinct_ints: could not draw {shape[1]} distinct values "
-                f"from the range [{low}, {high}) in {_MAX_SAMPLING_ROUNDS} "
-                f"rounds"
-            )
-        out[pending] = rng.integers(low, high, size=(pending.size, shape[1]))
-        ordered = np.sort(out[pending], axis=1)
-        duplicate = np.any(ordered[:, 1:] == ordered[:, :-1], axis=1)
-        pending = pending[duplicate]
-    return out
+    _check_sampler_floor(
+        n_val,
+        d_val,
+        entry=f"num_keys entry {k}",
+        pool="value",
+        remedy="increase vocab_size",
+    )
 
 
 def _generate_example_batch(

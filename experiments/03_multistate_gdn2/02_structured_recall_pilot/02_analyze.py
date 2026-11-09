@@ -27,6 +27,19 @@ Reports
     Per tier, expected vs observed done runs, plus tiers with runs but no
     expected count (via ``common.analysis.missing_runs``).
 
+Tasks that declare a damage reading in the protocol get per-slice
+``damage/slice={n}`` columns (``calibration``, at each single-state
+gate's selected point and at each multi-state row's selected LR) and
+per-gate ``damage_full/slice={n}`` / ``damage_kda/slice={n}`` columns
+(``positive_control``): the mean of the high-class accuracy minus the
+low-class accuracy over the cell's runs. A task with a screening
+fallback reads the shorter slice when both gates fall below its floor.
+An unreadable fallback (its column missing from the table, or a gate
+with no fallback value at its selected point) leaves the gap
+unreported: the calibration rows keep the primary cells without a gap
+column and the positive control skips the task, both logged at warning
+level.
+
 Usage:
     python 02_analyze.py calibration positive_control completeness
     python 02_analyze.py --runs-dir runs --out-dir analysis
@@ -114,6 +127,31 @@ def _cell_mean(grp: pd.DataFrame, metric: str, lr: float) -> float | None:
     return float(sub.mean()) if len(sub) else None
 
 
+def _damage(rows: pd.DataFrame, task: str, n: int) -> float | None:
+    """The task's damage reading for slice ``n``: the mean per-run
+    ``high - low`` over ``rows`` where both columns are present, or
+    ``None`` when the task has no reading or a column is missing.
+
+    Args:
+        rows: The runs to read (already filtered to one gate / LR).
+        task: The task name (looks up the reading in the protocol).
+        n: The slice value.
+
+    Returns:
+        The mean per-run ``high - low`` difference, or ``None``.
+    """
+    reading = _protocol.TASK_DAMAGE.get(task)
+    if reading is None:
+        return None
+    high, low = reading.columns(n)
+    if high not in rows.columns or low not in rows.columns:
+        return None
+    sub = rows[rows[high].notna() & rows[low].notna()]
+    if sub.empty:
+        return None
+    return float((sub[high] - sub[low]).mean())
+
+
 def calibration(table: pd.DataFrame, out_dir: Path) -> None:
     """The LR reading (and the single-state gap on the screening cell).
 
@@ -132,7 +170,10 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
     multi = gated_sel[gated_sel["layout"] != "single"]
     for keys, grp in single.groupby(["task", "decay_scheme", "lambda_mode"]):
         task, decay, lam = keys
-        gaps = {}
+        primary = _protocol.SCREENING_CELLS.get(task)
+        gate_rows: dict[str, dict] = {}
+        gate_lr: dict[str, float | None] = {}
+        primary_cells: dict[str, float | None] = {}
         for gate in ("full", "kda"):
             by_gate = grp[grp["gate_mode"] == gate]
             if by_gate.empty:
@@ -141,8 +182,7 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
             if per_lr.empty:
                 continue
             chosen = select_lr(per_lr)
-            metric = _protocol.SCREENING_CELLS.get(task)
-            cell = _cell_mean(by_gate, metric, chosen) if metric else None
+            cell = _cell_mean(by_gate, primary, chosen) if primary else None
             row = {
                 "kind": "single",
                 "task": task,
@@ -166,26 +206,76 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
                     else None
                 ),
                 "cell": cell,
+                "cell_metric": primary,
             }
-            gaps[gate] = cell
+            gate_rows[gate] = row
+            gate_lr[gate] = chosen
+            primary_cells[gate] = cell
             rows.append(row)
-        # Attach the full - kda gap to the single-state rows of this cell.
+        # Apply the screening fallback: if both gates read below the floor
+        # at the primary cell, read the shorter slice instead. The fallback
+        # only fires when the primary gap is uninformative by protocol, so an
+        # unreadable fallback leaves NO gap at all (the primary cells are
+        # kept for inspection only).
+        metric = _protocol.screening_cell(task, primary_cells) if primary else None
+        unreadable_fallback = False
+        if metric is not None and metric != primary:
+            # Read the fallback cell for BOTH gates at their selected LRs
+            # before touching the rows: applying it gate by gate could leave
+            # one gate on the primary cell and the other on the fallback (or
+            # None), mixing metrics.
+            if metric not in grp.columns:
+                logger.warning(
+                    "screening fallback cell %r missing for %s; reporting no gap",
+                    metric,
+                    task,
+                )
+                unreadable_fallback = True
+            else:
+                fallback_cells = {
+                    gate: _cell_mean(
+                        grp[grp["gate_mode"] == gate], metric, gate_lr[gate]
+                    )
+                    for gate in gate_rows
+                }
+                missing = [
+                    gate for gate, cell in fallback_cells.items() if cell is None
+                ]
+                if missing:
+                    logger.warning(
+                        "screening fallback reading %r missing for %s (%s); "
+                        "reporting no gap",
+                        metric,
+                        task,
+                        ", ".join(sorted(missing)),
+                    )
+                    unreadable_fallback = True
+                else:
+                    logger.info("screening fallback for %s: reading %s", task, metric)
+                    for gate, row in gate_rows.items():
+                        row["cell"] = fallback_cells[gate]
+                        row["cell_metric"] = metric
+        # Per-slice damage at each gate's selected point.
+        reading = _protocol.TASK_DAMAGE.get(task)
+        if reading is not None:
+            for gate, row in gate_rows.items():
+                at_lr = grp[(grp["gate_mode"] == gate) & (grp["lr"] == gate_lr[gate])]
+                for n in reading.slices:
+                    row[f"damage/slice={n}"] = _damage(at_lr, task, n)
+        # Attach the full - kda gap to the single-state rows of this cell --
+        # never after an unreadable fallback, which leaves no valid screening
+        # reading.
+        cells = {gate: row["cell"] for gate, row in gate_rows.items()}
         if (
-            "full" in gaps
-            and "kda" in gaps
-            and gaps["full"] is not None
-            and gaps["kda"] is not None
+            not unreadable_fallback
+            and "full" in cells
+            and "kda" in cells
+            and cells["full"] is not None
+            and cells["kda"] is not None
         ):
-            gap = gaps["full"] - gaps["kda"]
-            for row in rows:
-                if (
-                    row.get("kind") == "single"
-                    and row["task"] == task
-                    and row["decay_scheme"] == decay
-                    and row["lambda_mode"] == lam
-                    and row["gate_mode"] in ("full", "kda")
-                ):
-                    row["gap_full_kda"] = gap
+            gap = cells["full"] - cells["kda"]
+            for row in gate_rows.values():
+                row["gap_full_kda"] = gap
 
     for keys, grp in multi.groupby(
         ["task", "decay_scheme", "layout", "gate_mode", "lambda_mode"]
@@ -195,27 +285,31 @@ def calibration(table: pd.DataFrame, out_dir: Path) -> None:
         if per_lr.empty:
             continue
         chosen = select_lr(per_lr)
-        rows.append(
-            {
-                "kind": "multi",
-                "task": task,
-                "layout": layout,
-                "gate_mode": gate,
-                "lambda_mode": lam,
-                "decay_scheme": decay,
-                "mixer": "gated_delta",
-                "n_seeds": _n_seeds(per_lr, chosen),
-                "d_model": (
-                    int(grp["d_model"].dropna().iloc[0])
-                    if grp["d_model"].notna().any()
-                    else None
-                ),
-                "selected_lr": chosen,
-                "mean_best_value": (
-                    float(per_lr.loc[chosen, "mean_acc"]) if not per_lr.empty else None
-                ),
-            }
-        )
+        row = {
+            "kind": "multi",
+            "task": task,
+            "layout": layout,
+            "gate_mode": gate,
+            "lambda_mode": lam,
+            "decay_scheme": decay,
+            "mixer": "gated_delta",
+            "n_seeds": _n_seeds(per_lr, chosen),
+            "d_model": (
+                int(grp["d_model"].dropna().iloc[0])
+                if grp["d_model"].notna().any()
+                else None
+            ),
+            "selected_lr": chosen,
+            "mean_best_value": (
+                float(per_lr.loc[chosen, "mean_acc"]) if not per_lr.empty else None
+            ),
+        }
+        reading = _protocol.TASK_DAMAGE.get(task)
+        if reading is not None:
+            at_lr = grp[grp["lr"] == chosen]
+            for n in reading.slices:
+                row[f"damage/slice={n}"] = _damage(at_lr, task, n)
+        rows.append(row)
     # --- attention: one row per (task, decay, layout); no gate ---
     attn = sel[sel["mixer"].fillna("gated_delta") == "attention"]
     for keys, grp in attn.groupby(["task", "decay_scheme", "layout"]):
@@ -297,11 +391,10 @@ def _frozen_snippet(rows: list[dict], out_dir: Path) -> None:
         attn = [r for r in attention if r["task"] == task]
         if len(attn) > 1:
             raise RuntimeError(
-                "task %s has more than one grouped attention reading (attention "
-                "runs at different model.layout values): %s; refusing to pick "
-                "the first",
-                task,
-                sorted({r.get("layout") for r in attn}),
+                f"task {task} has more than one grouped attention reading "
+                f"(attention runs at different model.layout values): "
+                f"{sorted({r.get('layout') for r in attn})}; refusing to pick "
+                f"the first"
             )
         if len(attn) == 1:
             lines.append(f"    attention: {attn[0]['selected_lr']:g}")
@@ -318,16 +411,38 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
         & (table["mixer"].fillna("gated_delta") == "gated_delta")
     ]
     rows = []
-    for task, metric in _protocol.SCREENING_CELLS.items():
+    for task, primary in _protocol.SCREENING_CELLS.items():
         tiers = _protocol.TASK_TIERS.get(task)
         if tiers is None:
             logger.info("skipping positive control for %s: no TASK_TIERS entry", task)
             continue
-        by_task = base[
-            (base["task"] == task)
-            & (base["tier"] == tiers.positive_control)
-            & base[metric].notna()
+        if primary not in base.columns:
+            logger.info(
+                "skipping positive control for %s: screening cell %r not "
+                "in the run table",
+                task,
+                primary,
+            )
+            continue
+        tier_rows = base[
+            (base["task"] == task) & (base["tier"] == tiers.positive_control)
         ]
+        # Per-gate means at the primary cell, then the fallback rule.
+        readings: dict[str, float | None] = {}
+        for gate in ("full", "kda"):
+            sub = tier_rows[tier_rows["gate_mode"] == gate][primary].dropna()
+            readings[gate] = float(sub.mean()) if not sub.empty else None
+        metric = _protocol.screening_cell(task, readings)
+        if metric != primary and metric not in base.columns:
+            logger.warning(
+                "screening fallback cell %r missing for %s; skipping the task",
+                metric,
+                task,
+            )
+            continue
+        if metric != primary:
+            logger.info("screening fallback for %s: reading %s", task, metric)
+        by_task = tier_rows[tier_rows[metric].notna()]
         dup = by_task.groupby(["seed", "gate_mode"])["run_id"].nunique()
         dup = dup[dup > 1]
         if not dup.empty:
@@ -342,6 +457,13 @@ def positive_control(table: pd.DataFrame, out_dir: Path) -> None:
         report.insert(0, "task", task)
         report.insert(1, "metric", metric)
         report["tier"] = tiers.positive_control
+        # Per-slice damage per gate over the tier's runs.
+        reading = _protocol.TASK_DAMAGE.get(task)
+        if reading is not None:
+            for gate in ("full", "kda"):
+                gate_rows = by_task[by_task["gate_mode"] == gate]
+                for n in reading.slices:
+                    report[f"damage_{gate}/slice={n}"] = _damage(gate_rows, task, n)
         rows.append(report)
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     (out_dir / "positive_control.csv").write_text(

@@ -1,10 +1,14 @@
-"""Synthetic recall tasks: procedural MQAR and repeated-key overwrite.
+"""Synthetic recall tasks: procedural MQAR, repeated-key overwrite and
+entity-field.
 
 Public names:
     - :class:`MQARConfig`, :func:`generate_mqar` (Zoology-format MQAR)
     - :class:`OverwriteConfig`, :class:`OverwriteClass`,
       :func:`generate_overwrite` (repeated-key overwrite with placement
       classes)
+    - :class:`EntityFieldConfig`, :class:`EntityFieldClass`,
+      :func:`generate_entity_field`, :data:`ENTITY_FIELD_CLASSES`
+      (entity-field with per-entity update classes)
     - :class:`SyntheticRecallDataModule` (Lightning DataModule streaming
       fresh training batches and fixed validation/test sets)
     - :class:`RecallMetrics`, :func:`answer_predictions` (answer-position
@@ -12,6 +16,12 @@ Public names:
 """
 
 from .datamodule import SyntheticRecallDataModule
+from .entity_field import (
+    ENTITY_FIELD_CLASSES,
+    EntityFieldClass,
+    EntityFieldConfig,
+    generate_entity_field,
+)
 from .metrics import OVERWRITE_CLASSES, RecallMetrics, answer_predictions
 from .mqar import MQARConfig, generate_mqar
 from .overwrite import OverwriteClass, OverwriteConfig, generate_overwrite
@@ -25,6 +35,9 @@ from .registry import (
 )
 
 __all__ = [
+    "ENTITY_FIELD_CLASSES",
+    "EntityFieldClass",
+    "EntityFieldConfig",
     "MQARConfig",
     "OverwriteClass",
     "OverwriteConfig",
@@ -35,6 +48,7 @@ __all__ = [
     "TaskSpec",
     "answer_predictions",
     "config_types",
+    "generate_entity_field",
     "generate_mqar",
     "generate_overwrite",
     "generators",

@@ -1,9 +1,14 @@
 """The project's run-ID builder and its identity exclusion set.
 
 The run ID names a run's JSON, its curves directory and its W&B run and
-artifact. The base ID covers task / layout / gate / lambda / width / lr /
-seed; non-default optimiser, model, harness and mixer keys are appended so
-two runs that differ only in such a key never share a file name. With
+artifact. For the gated-delta mixer the base ID is
+``{task}-{layout}-{gate}-{lambda}-d{d_model}-lr{lr}``; a run with any
+other mixer omits the layout / gate / lambda segment (and the ``-ev``
+``expand_v`` suffix) because those are gated-delta settings the other
+mixers do not read, so its base ID is ``{task}-d{d_model}-lr{lr}``. In
+both cases non-default optimiser, model and harness keys are appended,
+along with ``-mix-{mixer}`` for a non-default mixer, so two runs that
+differ only in such a key never share a file name. With
 ``include_task_keys`` on, the non-default fields of the task's registered
 config type are appended too (a run whose task keys are part of its
 identity enables it); with it off (the default) the base ID reproduces
@@ -13,6 +18,7 @@ the first pilot's builder exactly.
 from __future__ import annotations
 
 import inspect
+import math
 from typing import Any
 
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -65,6 +71,38 @@ def _join(value: Any) -> str:
     return str(value)
 
 
+def _normalize(value: Any) -> Any:
+    """A comparable form of a config value: containers become tuples
+    (recursively), everything else is unchanged."""
+    value = (
+        OmegaConf.to_container(value, resolve=True)
+        if isinstance(value, (DictConfig, ListConfig))
+        else value
+    )
+    if isinstance(value, (list, tuple)):
+        return tuple(_normalize(item) for item in value)
+    return value
+
+
+def _values_differ(value: Any, default: Any) -> bool:
+    """Whether a configured task value differs from its dataclass default.
+
+    Containers are compared as tuples (a Hydra ``ListConfig`` and the
+    dataclass's tuple are the same value), and floats with a relative
+    tolerance so a YAML decimal that rounds the default (e.g. ``1/3``)
+    does not count as a change.
+    """
+    a = _normalize(value)
+    b = _normalize(default)
+    if isinstance(a, tuple) and isinstance(b, tuple):
+        if len(a) != len(b):
+            return True
+        return any(_values_differ(x, y) for x, y in zip(a, b))
+    if isinstance(a, float) and isinstance(b, float):
+        return not math.isclose(a, b, rel_tol=1e-9)
+    return a != b
+
+
 def _task_suffixes(cfg: DictConfig) -> list[str]:
     """The non-default task-config fields of this run's task.
 
@@ -92,7 +130,7 @@ def _task_suffixes(cfg: DictConfig) -> list[str]:
             continue
         value = _cfg_value(cfg, f"task.{leaf}")
         try:
-            differs = value != default
+            differs = _values_differ(value, default)
         except (ValueError, TypeError):
             differs = False
         if value is not None and differs:
@@ -102,6 +140,10 @@ def _task_suffixes(cfg: DictConfig) -> list[str]:
 
 def make_run_id(cfg: DictConfig, lr: float, *, include_task_keys: bool = False) -> str:
     """The run ID of one run, per the base-ID rule.
+
+    The gated-delta base is ``{task}-{layout}-{gate}-{lambda}-d{d}-lr{lr}``;
+    any other mixer drops that segment (the layout / gate / lambda keys are
+    gated-delta settings it ignores), leaving ``{task}-d{d}-lr{lr}``.
 
     Args:
         cfg: The resolved config (``task.*``, ``model.*``,
@@ -113,10 +155,18 @@ def make_run_id(cfg: DictConfig, lr: float, *, include_task_keys: bool = False) 
     Returns:
         The run ID string.
     """
-    run_id = (
-        f"{cfg.task.name}-{cfg.model.layout}-{cfg.model.gate_mode}"
-        f"-{cfg.model.lambda_mode}-d{cfg.model.d_model}-lr{lr:g}"
-    )
+    mixer = str(_cfg_value(cfg, "model.mixer") or "gated_delta")
+    if mixer == "gated_delta":
+        run_id = (
+            f"{cfg.task.name}-{cfg.model.layout}-{cfg.model.gate_mode}"
+            f"-{cfg.model.lambda_mode}-d{cfg.model.d_model}-lr{lr:g}"
+        )
+    else:
+        # Layout, gate and lambda are gated-delta settings; the other
+        # mixers are built from the model width and head count (the layer
+        # pattern and state mixer still apply), so their base ID names the
+        # model without those keys.
+        run_id = f"{cfg.task.name}-d{cfg.model.d_model}-lr{lr:g}"
     scheme = str(_cfg_value(cfg, "optimizer.decay_scheme") or "grouped")
     if scheme != "grouped":
         run_id += f"-wd-{scheme}"
@@ -124,12 +174,11 @@ def make_run_id(cfg: DictConfig, lr: float, *, include_task_keys: bool = False) 
         run_id += f"-pat-{cfg.model.layer_pattern}"
     if str(cfg.model.state_mixer) != "none":
         run_id += f"-sm-{cfg.model.state_mixer}"
-    if (
+    if mixer == "gated_delta" and (
         _cfg_value(cfg, "model.expand_v") is not None
         and float(cfg.model.expand_v) != 1.0
     ):
         run_id += f"-ev{cfg.model.expand_v:g}"
-    mixer = str(_cfg_value(cfg, "model.mixer") or "gated_delta")
     if mixer != "gated_delta":
         run_id += f"-mix-{mixer}"
     harness = str(_cfg_value(cfg, "harness.name") or "zoology")

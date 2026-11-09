@@ -37,6 +37,8 @@ _spec1.loader.exec_module(_01)
 _frozen_lr = _01._frozen_lr
 
 METRIC = "test/acc/slice=64"
+PRIMARY = "test/acc/slice=64/class=sibling"
+FALLBACK = "test/acc/slice=32/class=sibling"
 
 TOY_CALIBRATION = ("calib_lr", "calib_ws")
 TOY_CONTROL = "tier1_core"
@@ -255,6 +257,174 @@ class TestCalibration:
         assert att["mean_best_value"] == pytest.approx(0.985)
 
 
+class TestCalibrationDamage:
+    HIGH = "untouched"
+    LOW = "sibling"
+
+    @pytest.fixture
+    def damage_protocol(self, protocol, monkeypatch):
+        monkeypatch.setattr(
+            protocol,
+            "TASK_DAMAGE",
+            {"toy": protocol.DamageReading(self.HIGH, self.LOW, slices=(16, 32))},
+        )
+        return protocol
+
+    def _rows(self, seed, **extra):
+        return _row(
+            f"f{seed}",
+            gate="full",
+            lr=0.01,
+            seed=seed,
+            best=0.9,
+            step=10,
+            **{METRIC: 0.95, **extra},
+        )
+
+    def test_damage_columns_per_slice_at_the_selected_point(
+        self, tmp_path, damage_protocol
+    ):
+        rows = [
+            self._rows(
+                seed,
+                **{
+                    "test/acc/slice=16/class=untouched": 0.9,
+                    "test/acc/slice=16/class=sibling": 0.7,
+                    "test/acc/slice=32/class=untouched": 0.8,
+                    "test/acc/slice=32/class=sibling": 0.5,
+                },
+            )
+            for seed in (100, 101)
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["selected_lr"] == pytest.approx(0.01)
+        assert full["damage/slice=16"] == pytest.approx(0.2)
+        assert full["damage/slice=32"] == pytest.approx(0.3)
+        assert "damage" not in df.columns  # no pooled column
+
+    def test_damage_uses_only_the_selected_lr(self, tmp_path, damage_protocol):
+        # The selected LR is 0.01; an unselected LR carries a wildly
+        # different damage reading that must not leak into the value.
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                self._rows(
+                    seed,
+                    **{
+                        "test/acc/slice=16/class=untouched": 0.9,
+                        "test/acc/slice=16/class=sibling": 0.7,
+                    },
+                )
+            )
+            rows.append(
+                _row(
+                    f"old{seed}",
+                    gate="full",
+                    lr=0.003,
+                    seed=seed,
+                    best=0.2,
+                    step=10,
+                    **{
+                        METRIC: 0.1,
+                        "test/acc/slice=16/class=untouched": 1.0,
+                        "test/acc/slice=16/class=sibling": 0.0,
+                    },
+                )
+            )
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["selected_lr"] == pytest.approx(0.01)
+        assert full["damage/slice=16"] == pytest.approx(0.2)
+        assert pd.isna(full["damage/slice=32"])
+
+    def test_multi_state_rows_get_damage_at_their_selected_lr(
+        self, tmp_path, damage_protocol
+    ):
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"m{seed}",
+                    layout="ws",
+                    gate="full",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.8,
+                    step=10,
+                    **{
+                        METRIC: 0.9,
+                        "test/acc/slice=16/class=untouched": 0.9,
+                        "test/acc/slice=16/class=sibling": 0.7,
+                        "test/acc/slice=32/class=untouched": 0.8,
+                        "test/acc/slice=32/class=sibling": 0.5,
+                    },
+                )
+            )
+            # A competing LR with lower accuracy and a different damage
+            # reading: it must not be selected, so its values must not leak
+            # into the reported damage.
+            rows.append(
+                _row(
+                    f"m{seed}old",
+                    layout="ws",
+                    gate="full",
+                    lr=0.003,
+                    seed=seed,
+                    best=0.2,
+                    step=10,
+                    **{
+                        METRIC: 0.1,
+                        "test/acc/slice=16/class=untouched": 1.0,
+                        "test/acc/slice=16/class=sibling": 0.0,
+                        "test/acc/slice=32/class=untouched": 1.0,
+                        "test/acc/slice=32/class=sibling": 0.0,
+                    },
+                )
+            )
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        multi = df[df["kind"] == "multi"].iloc[0]
+        assert multi["selected_lr"] == pytest.approx(0.01)
+        assert multi["damage/slice=16"] == pytest.approx(0.2)
+        assert multi["damage/slice=32"] == pytest.approx(0.3)
+
+    def test_missing_slice_columns_give_none(self, tmp_path, damage_protocol):
+        rows = [
+            self._rows(
+                seed,
+                **{
+                    "test/acc/slice=16/class=untouched": 0.9,
+                    "test/acc/slice=16/class=sibling": 0.7,
+                },
+            )
+            for seed in (100, 101)
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["damage/slice=16"] == pytest.approx(0.2)
+        assert pd.isna(full["damage/slice=32"])
+
+    def test_no_damage_reading_means_no_damage_columns(self, tmp_path, protocol):
+        rows = [self._rows(100)]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        assert not any(c.startswith("damage") for c in df.columns)
+
+
 class TestPositiveControl:
     def test_known_gap_over_seeds(self, tmp_path, protocol):
         rows = [
@@ -304,6 +474,84 @@ class TestPositiveControl:
         assert df["mean_high"].iloc[0] == pytest.approx(0.65)
         assert df["mean_low"].iloc[0] == pytest.approx(0.45)
 
+    def test_damage_columns_per_gate_and_slice(self, tmp_path, protocol, monkeypatch):
+        monkeypatch.setattr(
+            protocol,
+            "TASK_DAMAGE",
+            {"toy": protocol.DamageReading("untouched", "sibling", slices=(16, 32))},
+        )
+        rows = [
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{
+                    METRIC: 0.6,
+                    "test/acc/slice=16/class=untouched": 0.9,
+                    "test/acc/slice=16/class=sibling": 0.7,
+                    "test/acc/slice=32/class=untouched": 0.8,
+                    "test/acc/slice=32/class=sibling": 0.5,
+                },
+            ),
+            _row(
+                "p1",
+                gate="full",
+                seed=1,
+                tier=TOY_CONTROL,
+                best=0.7,
+                step=5,
+                **{
+                    METRIC: 0.7,
+                    "test/acc/slice=16/class=untouched": 0.95,
+                    "test/acc/slice=16/class=sibling": 0.65,
+                    "test/acc/slice=32/class=untouched": 0.85,
+                    "test/acc/slice=32/class=sibling": 0.55,
+                },
+            ),
+            _row(
+                "p2",
+                gate="kda",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.4,
+                step=5,
+                **{
+                    METRIC: 0.4,
+                    "test/acc/slice=16/class=untouched": 0.8,
+                    "test/acc/slice=16/class=sibling": 0.7,
+                    "test/acc/slice=32/class=untouched": 0.7,
+                    "test/acc/slice=32/class=sibling": 0.6,
+                },
+            ),
+            _row(
+                "p3",
+                gate="kda",
+                seed=1,
+                tier=TOY_CONTROL,
+                best=0.5,
+                step=5,
+                **{
+                    METRIC: 0.5,
+                    "test/acc/slice=16/class=untouched": 0.82,
+                    "test/acc/slice=16/class=sibling": 0.7,
+                    "test/acc/slice=32/class=untouched": 0.72,
+                    "test/acc/slice=32/class=sibling": 0.6,
+                },
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out)
+        df = pd.read_csv(out / "positive_control.csv")
+        assert df["damage_full/slice=16"].iloc[0] == pytest.approx(0.25)
+        assert df["damage_full/slice=32"].iloc[0] == pytest.approx(0.3)
+        assert df["damage_kda/slice=16"].iloc[0] == pytest.approx(0.11)
+        assert df["damage_kda/slice=32"].iloc[0] == pytest.approx(0.11)
+        assert "damage_full" not in df.columns
+
     def test_duplicate_seed_rows_raise_naming_runs(self, tmp_path, protocol):
         rows = [
             _row(
@@ -352,6 +600,342 @@ class TestPositiveControl:
         empty = _table([_row("x")]).iloc[0:0]
         _analyze.positive_control(empty, out)
         assert (out / "positive_control.csv").read_text().strip() == ""
+
+
+class TestScreeningCell:
+    """Direct unit tests of the pure fallback rule."""
+
+    @pytest.fixture
+    def fallback_protocol(self, protocol, monkeypatch):
+        monkeypatch.setattr(protocol, "SCREENING_CELLS", {"toy": PRIMARY})
+        monkeypatch.setattr(protocol, "SCREENING_FALLBACKS", {"toy": (FALLBACK, 0.15)})
+        return protocol
+
+    def test_both_below_floor_returns_fallback(self, fallback_protocol):
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.1, "kda": 0.05})
+            == FALLBACK
+        )
+
+    def test_one_above_floor_keeps_primary(self, fallback_protocol):
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.2, "kda": 0.05})
+            == PRIMARY
+        )
+
+    def test_missing_gate_keeps_primary(self, fallback_protocol):
+        assert fallback_protocol.screening_cell("toy", {"full": 0.1}) == PRIMARY
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.1, "kda": None})
+            == PRIMARY
+        )
+
+    def test_task_without_fallback_keeps_primary(self, protocol):
+        # The protocol fixture registers a screening cell but no fallback.
+        assert protocol.screening_cell("toy", {"full": 0.0, "kda": 0.0}) == METRIC
+
+    def test_exactly_at_floor_keeps_primary(self, fallback_protocol):
+        # The rule is strictly below the floor: a gate reading exactly 0.15
+        # (one gate or both) keeps the primary cell.
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.15, "kda": 0.05})
+            == PRIMARY
+        )
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.1, "kda": 0.15})
+            == PRIMARY
+        )
+        assert (
+            fallback_protocol.screening_cell("toy", {"full": 0.15, "kda": 0.15})
+            == PRIMARY
+        )
+
+
+class TestScreeningFallback:
+    @pytest.fixture
+    def fallback_protocol(self, protocol, monkeypatch):
+        monkeypatch.setattr(protocol, "SCREENING_CELLS", {"toy": PRIMARY})
+        monkeypatch.setattr(protocol, "SCREENING_FALLBACKS", {"toy": (FALLBACK, 0.15)})
+        return protocol
+
+    def _calib_rows(self, full_primary, kda_primary):
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"f{seed}",
+                    gate="full",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.9,
+                    step=10,
+                    **{PRIMARY: full_primary, FALLBACK: 0.6},
+                )
+            )
+            rows.append(
+                _row(
+                    f"k{seed}",
+                    gate="kda",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.7,
+                    step=10,
+                    **{PRIMARY: kda_primary, FALLBACK: 0.4},
+                )
+            )
+        return rows
+
+    def _gap_cell_rows(self):
+        """An ordinary cell (both gates above the floor, so no fallback
+        triggers) that does produce a gap: a table with this cell has a
+        ``gap_full_kda`` column even when the fallback cell's gap is
+        unreported."""
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"g{seed}",
+                    gate="full",
+                    lam="gated",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.9,
+                    step=10,
+                    **{PRIMARY: 0.4, FALLBACK: 0.6},
+                )
+            )
+            rows.append(
+                _row(
+                    f"kg{seed}",
+                    gate="kda",
+                    lam="gated",
+                    lr=0.01,
+                    seed=seed,
+                    best=0.7,
+                    step=10,
+                    **{PRIMARY: 0.3, FALLBACK: 0.4},
+                )
+            )
+        return rows
+
+    def test_calibration_fallback_triggers_when_both_below(
+        self, tmp_path, fallback_protocol
+    ):
+        rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        kda = df[(df["kind"] == "single") & (df["gate_mode"] == "kda")].iloc[0]
+        assert full["cell_metric"] == FALLBACK
+        assert full["cell"] == pytest.approx(0.6)
+        assert kda["cell"] == pytest.approx(0.4)
+        assert full["gap_full_kda"] == pytest.approx(0.2)
+
+    def test_calibration_no_fallback_when_one_gate_above(
+        self, tmp_path, fallback_protocol
+    ):
+        rows = self._calib_rows(full_primary=0.2, kda_primary=0.05)
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["cell_metric"] == PRIMARY
+        assert full["cell"] == pytest.approx(0.2)
+
+    def test_calibration_no_fallback_when_one_gate_missing(
+        self, tmp_path, fallback_protocol
+    ):
+        rows = [
+            _row(
+                f"f{seed}",
+                gate="full",
+                lr=0.01,
+                seed=seed,
+                best=0.9,
+                step=10,
+                **{PRIMARY: 0.1, FALLBACK: 0.6},
+            )
+            for seed in (100, 101)
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["cell_metric"] == PRIMARY
+        assert full["cell"] == pytest.approx(0.1)
+
+    def _no_gap_rows(self, *, drop_fallback_column):
+        """The unreadable-fallback cell (both gates below the floor, mlp)
+        plus an ordinary gap-producing cell (gated), for the no-gap tests.
+        With ``drop_fallback_column`` the fallback metric is removed from
+        every row, so the column is absent from the table."""
+        rows = self._calib_rows(full_primary=0.1, kda_primary=0.05)
+        rows += self._gap_cell_rows()
+        if drop_fallback_column:
+            for row in rows:
+                row.pop(FALLBACK)
+        else:
+            for row in rows:
+                if row["lambda_mode"] == "mlp" and row["gate_mode"] == "kda":
+                    row[FALLBACK] = float("nan")
+        return rows
+
+    def _assert_unreadable_fallback_cell_no_gap(self, df):
+        single = df[df["kind"] == "single"]
+        mlp = single[single["lambda_mode"] == "mlp"]
+        full = mlp[mlp["gate_mode"] == "full"].iloc[0]
+        kda = mlp[mlp["gate_mode"] == "kda"].iloc[0]
+        assert full["cell_metric"] == PRIMARY
+        assert kda["cell_metric"] == PRIMARY
+        assert full["cell"] == pytest.approx(0.1)
+        assert kda["cell"] == pytest.approx(0.05)
+        # The column exists (the ordinary cell below set it) and these rows
+        # hold NaN: per-row, this cell has NO gap, not a whole-CSV absence.
+        assert pd.isna(full.get("gap_full_kda", float("nan")))
+        assert pd.isna(kda.get("gap_full_kda", float("nan")))
+        gated = single[single["lambda_mode"] == "gated"]
+        gd_full = gated[gated["gate_mode"] == "full"].iloc[0]
+        gd_kda = gated[gated["gate_mode"] == "kda"].iloc[0]
+        assert gd_full["gap_full_kda"] == pytest.approx(0.1)
+        assert gd_kda["gap_full_kda"] == pytest.approx(0.1)
+        assert gd_full["cell_metric"] == PRIMARY
+
+    def test_calibration_fallback_missing_column_reports_no_gap(
+        self, tmp_path, fallback_protocol
+    ):
+        # Both gates are below the floor, but the fallback column is absent:
+        # the report keeps the primary cells for inspection and this cell
+        # reports NO gap (the primary gap would be noise the protocol flagged
+        # as uninformative). The ordinary cell in the same table has its gap.
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(self._no_gap_rows(drop_fallback_column=True)), out)
+        df = pd.read_csv(out / "calibration.csv")
+        assert "gap_full_kda" in df.columns
+        self._assert_unreadable_fallback_cell_no_gap(df)
+
+    def test_calibration_fallback_missing_reading_reports_no_gap(
+        self, tmp_path, fallback_protocol
+    ):
+        # Both gates are below the floor and the fallback column exists, but
+        # the kda gate has no fallback value at its selected LR: both cells
+        # stay on the primary metric (never a primary/fallback mix) and this
+        # cell reports no gap, while the ordinary cell keeps its own.
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(self._no_gap_rows(drop_fallback_column=False)), out)
+        df = pd.read_csv(out / "calibration.csv")
+        assert "gap_full_kda" in df.columns
+        self._assert_unreadable_fallback_cell_no_gap(df)
+
+    def test_positive_control_fallback_missing_column_skips_task(
+        self, tmp_path, fallback_protocol
+    ):
+        # Both gates are below the floor, but the fallback column is absent:
+        # there is no valid screening reading, so the task gets no row at
+        # all instead of a primary-gap row.
+        rows = self._control_rows(full_primary=0.1, kda_primary=0.05)
+        for row in rows:
+            row.pop(FALLBACK)
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out)
+        assert (out / "positive_control.csv").read_text().strip() == ""
+
+    def _control_rows(self, full_primary, kda_primary):
+        rows = []
+        for seed in (0, 1):
+            rows.append(
+                _row(
+                    f"f{seed}",
+                    gate="full",
+                    seed=seed,
+                    tier=TOY_CONTROL,
+                    best=0.6,
+                    step=5,
+                    **{PRIMARY: full_primary, FALLBACK: 0.6},
+                )
+            )
+            rows.append(
+                _row(
+                    f"k{seed}",
+                    gate="kda",
+                    seed=seed,
+                    tier=TOY_CONTROL,
+                    best=0.4,
+                    step=5,
+                    **{PRIMARY: kda_primary, FALLBACK: 0.4},
+                )
+            )
+        return rows
+
+    def test_positive_control_fallback_triggers_when_both_below(
+        self, tmp_path, fallback_protocol
+    ):
+        rows = self._control_rows(full_primary=0.1, kda_primary=0.05)
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out)
+        df = pd.read_csv(out / "positive_control.csv")
+        assert df["metric"].iloc[0] == FALLBACK
+        assert df["mean_high"].iloc[0] == pytest.approx(0.6)
+        assert df["mean_low"].iloc[0] == pytest.approx(0.4)
+        assert df["mean_gap"].iloc[0] == pytest.approx(0.2)
+
+    def test_positive_control_no_fallback_when_one_gate_above(
+        self, tmp_path, fallback_protocol
+    ):
+        rows = self._control_rows(full_primary=0.2, kda_primary=0.05)
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out)
+        df = pd.read_csv(out / "positive_control.csv")
+        assert df["metric"].iloc[0] == PRIMARY
+        assert df["mean_high"].iloc[0] == pytest.approx(0.2)
+
+    def test_positive_control_no_fallback_when_one_gate_missing(
+        self, tmp_path, fallback_protocol
+    ):
+        # The full gate has only the primary cell; the kda gate has only the
+        # fallback cell (its primary value is missing). The rule needs both
+        # gates' primary readings, so it does not trigger and there is no
+        # paired gap: the report is empty. A wrongly triggered fallback would
+        # see both gates' fallback cells and produce a row.
+        rows = []
+        for seed in (0, 1):
+            rows.append(
+                _row(
+                    f"f{seed}",
+                    gate="full",
+                    seed=seed,
+                    tier=TOY_CONTROL,
+                    best=0.6,
+                    step=5,
+                    **{PRIMARY: 0.1, FALLBACK: 0.6},
+                )
+            )
+            rows.append(
+                _row(
+                    f"k{seed}",
+                    gate="kda",
+                    seed=seed,
+                    tier=TOY_CONTROL,
+                    best=0.4,
+                    step=5,
+                    **{PRIMARY: float("nan"), FALLBACK: 0.4},
+                )
+            )
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out)
+        # The no-row case still carries the report schema, so read_csv works
+        # and yields an empty frame.
+        df = pd.read_csv(out / "positive_control.csv")
+        assert df.empty
 
 
 class TestCompleteness:
@@ -524,6 +1108,45 @@ class TestFrozenSnippet:
         assert _frozen_lr(_lr_cfg(layout="ws", gate="full"), frozen) == 0.005
         assert _frozen_lr(_lr_cfg(mixer="attention"), frozen) == 0.006
 
+    def test_snippet_writes_an_attention_entry_per_task(
+        self, tmp_path, protocol, monkeypatch
+    ):
+        # The attention calibration tier feeds lr_table.<task>.attention for
+        # every task that runs it, each under its own task heading.
+        monkeypatch.setattr(
+            protocol,
+            "CALIBRATION_TIERS",
+            frozenset((*TOY_CALIBRATION, "calib_ef_attention")),
+        )
+        rows = [
+            _row(
+                "ea0",
+                task="entity_field",
+                layout="single",
+                mixer="attention",
+                lr=0.003,
+                seed=100,
+                best=0.8,
+                tier="calib_ef_attention",
+            ),
+            _row(
+                "a0",
+                task="toy",
+                layout="single",
+                mixer="attention",
+                lr=0.006,
+                seed=100,
+                best=0.8,
+                tier="calib_ws",
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        snippet = (out / "frozen_protocol_snippet.yaml").read_text()
+        assert "  entity_field:\n    attention: 0.003" in snippet
+        assert "  toy:\n    attention: 0.006" in snippet
+
     def test_multiple_attention_rows_raise_naming_layouts(self, tmp_path, protocol):
         rows = [
             _row(
@@ -547,7 +1170,8 @@ class TestFrozenSnippet:
         ]
         out = tmp_path / "out"
         out.mkdir()
-        with pytest.raises(RuntimeError, match="ws"):
+        # The message names the task and the two layouts, not a %-tuple.
+        with pytest.raises(RuntimeError, match="task toy.*\\['ll', 'ws'\\]"):
             _analyze.calibration(_table(rows), out)
 
 

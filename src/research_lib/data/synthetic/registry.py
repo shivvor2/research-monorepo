@@ -35,6 +35,16 @@ class TaskSpec:
         slice_kwarg: The generator keyword for one explicit slice value
             in a fixed evaluation set (``None`` when slices are always
             taken from ``config.slices``).
+        class_names: The task's metric key fragments per ``key_class``
+            code, for :class:`~research_lib.data.synthetic.RecallMetrics`
+            (``None`` uses the overwrite names).
+        slice_arg_of: Optional map from a slice value (as returned by
+            ``config.slices``) to the fixed argument the generator
+            takes for that slice, ``callable(slice_value, config)``. A
+            task whose slice values are a *derived* quantity (e.g. the
+            entity-field task's ``N = E * M`` pairs, whose generator
+            takes ``num_entities`` ``= N // M``) supplies this;
+            ``None`` means the slice value is the argument as is.
     """
 
     name: str
@@ -42,6 +52,7 @@ class TaskSpec:
     generator: Callable[..., dict[str, Any]]
     slice_kwarg: str | None = None
     class_names: tuple[str, ...] | None = None
+    slice_arg_of: Callable[[int, Any], int] | None = None
 
     def slice_values(self, config: Any) -> tuple[int, ...]:
         """The task's slice values from a config (via ``config.slices``)."""
@@ -68,9 +79,30 @@ def _overwrite_spec():
     )
 
 
+def _entity_field_spec():
+    from .entity_field import (
+        ENTITY_FIELD_CLASSES,
+        EntityFieldConfig,
+        generate_entity_field,
+    )
+
+    # Slice values are the number of pairs N = E * M (on the same scale as
+    # the overwrite task's K); the generator's fixed argument is the entity
+    # count E = N // M.
+    return TaskSpec(
+        "entity_field",
+        EntityFieldConfig,
+        generate_entity_field,
+        slice_kwarg="num_entities",
+        slice_arg_of=lambda slice_value, config: slice_value // config.num_fields,
+        class_names=ENTITY_FIELD_CLASSES,
+    )
+
+
 TASKS: dict[str, TaskSpec] = {
     "mqar": _mqar_spec(),
     "overwrite": _overwrite_spec(),
+    "entity_field": _entity_field_spec(),
 }
 """The registered synthetic tasks, keyed by name."""
 
