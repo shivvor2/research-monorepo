@@ -96,7 +96,6 @@ def _check_entry_values(
     cfg: DictConfig,
     entry: DictConfig | None,
     *,
-    keys: tuple[str, ...],
     node: str,
     label: str,
     tier: str,
@@ -106,9 +105,7 @@ def _check_entry_values(
 
     A set key whose run value (``cfg.<node>.<key>``) differs from the frozen
     value is an error naming both; a ``None`` frozen value is a not-yet-set
-    key and is skipped. ``keys`` is unused here beyond documenting the
-    expected keys (completeness is enforced separately by
-    :func:`check_frozen_choices`).
+    key and is skipped.
     """
     if entry is None:
         return
@@ -164,7 +161,6 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
     _check_entry_values(
         cfg,
         entry,
-        keys=harness_keys,
         node="model",
         label=f"harness {harness!r}",
         tier=tier,
@@ -191,7 +187,6 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
     _check_entry_values(
         cfg,
         task_settings,
-        keys=task_keys,
         node="task",
         label=f"task {task!r}",
         tier=tier,

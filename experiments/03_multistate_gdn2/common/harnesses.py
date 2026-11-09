@@ -100,9 +100,12 @@ def build_mad(cfg: DictConfig) -> MadLM:
     Reads ``cfg.model.mixer`` (``gated_delta``, the default, or
     ``attention``), and builds ``cfg.model.num_mixers`` independent mixer
     modules, each followed by a SwiGLU block inside :class:`MadLM`.  The
-    gated-delta mixer is configured from ``cfg.model``; attention is
-    :class:`CausalSelfAttention` with rotary on the full head width (its
-    head count comes from the same ``cfg.model.num_heads`` field).
+    gated-delta mixer is configured from ``cfg.model`` (its head count is
+    ``model.num_heads``, the head dimension derived as ``d_model //
+    num_heads``); attention is :class:`CausalSelfAttention` with rotary on
+    the full head width and its own head count,
+    ``model.attention_num_heads`` (default 16, so its head width is
+    ``d_model // attention_num_heads``).
 
     Args:
         cfg: The resolved config (``model.*``).
@@ -111,7 +114,9 @@ def build_mad(cfg: DictConfig) -> MadLM:
         A :class:`MadLM` ready to train.
 
     Raises:
-        ValueError: An unknown ``model.mixer`` value.
+        ValueError: An unknown ``model.mixer`` value, or a ``d_model``
+            not divisible by the selected mixer's head count (``num_heads``
+            for gated-delta, ``attention_num_heads`` for attention).
     """
     c = cfg.model
     d = int(c.d_model)
