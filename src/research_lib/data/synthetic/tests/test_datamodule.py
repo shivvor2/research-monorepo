@@ -333,27 +333,23 @@ def test_resume_sharded_with_workers():
 
 def _rank_batches(rank, count, world_size=2, num_workers=1):
     """Collect `count` batches from a rank's dataset under a simulated
-    (world_size, rank) process group (and optional DataLoader workers)."""
+    (world_size, rank) identity (and optional DataLoader workers)."""
     dataset = _SyntheticTrainDataset(
         task="mqar", config=MQAR_CFG, batch_size=4, train_seed=0
     )
-    with patch.object(
-        datamodule_module,
-        "_distributed_world_size_and_rank",
-        return_value=(world_size, rank),
-    ):
-        if num_workers > 1:
-            batches = {}
-            for worker_id in range(num_workers):
-                with patch(
-                    "torch.utils.data.get_worker_info",
-                    return_value=SimpleNamespace(id=worker_id, num_workers=num_workers),
-                ):
-                    worker_batches = _take(iter(dataset), count // num_workers)
-                for batch in worker_batches:
-                    batches[int(batch["batch_index"])] = batch
-            return [batches[index] for index in sorted(batches)]
-        return _take(iter(dataset), count)
+    dataset.set_identity(world_size, rank)
+    if num_workers > 1:
+        batches = {}
+        for worker_id in range(num_workers):
+            with patch(
+                "torch.utils.data.get_worker_info",
+                return_value=SimpleNamespace(id=worker_id, num_workers=num_workers),
+            ):
+                worker_batches = _take(iter(dataset), count // num_workers)
+            for batch in worker_batches:
+                batches[int(batch["batch_index"])] = batch
+        return [batches[index] for index in sorted(batches)]
+    return _take(iter(dataset), count)
 
 
 def _expected_batch(index):
@@ -362,52 +358,98 @@ def _expected_batch(index):
     return expected
 
 
-def test_ddp_two_rank_stream_partition_and_resume():
-    """W = 2 (simulated): the two ranks' global indices are disjoint and
-    together cover 0..N-1 in lockstep order, with contents equal to the
-    per-index generations (so the global stream is identical to W = 1);
-    resume via the transfer hook + state_dict is exact per rank."""
-    rank0 = _rank_batches(0, 5)
-    rank1 = _rank_batches(1, 5)
-    assert [int(b["batch_index"]) for b in rank0] == [0, 2, 4, 6, 8]
-    assert [int(b["batch_index"]) for b in rank1] == [1, 3, 5, 7, 9]
-    for batch in rank0 + rank1:
-        index = int(batch["batch_index"])
-        assert _batch_content(batch) == _batch_content(_expected_batch(index))
+def _expected_rows(batch):
+    """The rank slice of a whole global batch: rows [0, B//2) or
+    [B//2, B) of each key (the ``_expected_batch`` content, sliced)."""
+    half = batch["input_ids"].shape[0] // 2
 
-    # Resume: feed rank 0's batches through the transfer hook (W = 2) and
-    # checkpoint after 3 of them (globals 0, 2, 4 -> local 0, 1, 2).
+    def _slice(batch, start):
+        return {
+            key: (value[start : start + half] if value.dim() >= 1 else value)
+            for key, value in batch.items()
+        }
+
+    return _slice(batch, 0), _slice(batch, half)
+
+
+def test_ddp_two_rank_stream_slices_and_resume():
+    """W = 2 (simulated): every rank iterates the SAME global batch
+    indices (the stream is independent of the device count); rank ``r``
+    keeps the contiguous rows ``[r * B / 2, (r + 1) * B / 2)`` of each
+    global batch, and the two ranks' slices concatenate to the
+    single-device batch (``num_workers`` 0 and 2).  The shared cursor is
+    the global batch index, identical on both ranks, and resume at an
+    unaligned cursor continues the uninterrupted stream."""
+    for num_workers, count in ((1, 3), (2, 4)):
+        rank0 = _rank_batches(0, count, num_workers=num_workers)
+        rank1 = _rank_batches(1, count, num_workers=num_workers)
+        assert [int(b["batch_index"]) for b in rank0] == list(range(count))
+        assert [int(b["batch_index"]) for b in rank1] == list(range(count))
+        for r0, r1, index in zip(rank0, rank1, range(count), strict=True):
+            expected = _expected_batch(index)
+            expected0, expected1 = _expected_rows(expected)
+            assert _batch_content(r0) == _batch_content(expected0)
+            assert _batch_content(r1) == _batch_content(expected1)
+            # The ranks' rows are disjoint and cover the single-device batch.
+            joined = {}
+            for key in expected:
+                joined[key] = (
+                    torch.cat([r0[key], r1[key]], dim=0)
+                    if r0[key].dim() >= 1
+                    else r0[key]
+                )
+            assert _batch_content(joined) == _batch_content(expected)
+
+    # Resume: feed rank 1's batches through the transfer hook (W = 2)
+    # and checkpoint after 3 of them (globals 0, 1, 2); both ranks share
+    # the cursor, so the saved value is valid for every rank.
     dm = _dm()
     dm.trainer = SimpleNamespace(training=True)
     with patch.object(
-        datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 0)
+        datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 1)
     ):
-        for batch in rank0[:3]:
+        rank1 = _rank_batches(1, 3)
+        for batch in rank1:
             dm.on_before_batch_transfer(batch, 0)
         state = dm.state_dict()
     assert state == {"next_batch_idx": 3}
-    fresh = _dm()
-    fresh.load_state_dict(state)
+    dm0 = _dm()
+    dm0.trainer = SimpleNamespace(training=True)
     with patch.object(
         datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 0)
     ):
-        resumed = _take(fresh.train_dataloader(), 2)
-    assert [int(b["batch_index"]) for b in resumed] == [6, 8]
-    for batch in resumed:
-        index = int(batch["batch_index"])
-        assert _batch_content(batch) == _batch_content(_expected_batch(index))
+        rank0 = _rank_batches(0, 3)
+        for batch in rank0:
+            dm0.on_before_batch_transfer(batch, 0)
+        assert dm0.state_dict() == {"next_batch_idx": 3}
 
-    # Ranks x DataLoader workers: the four (rank, worker) streams are
-    # disjoint and together cover 0..11.
-    produced = {}
+    # Resume at an unaligned cursor: each rank continues the stream
+    # exactly from the saved global index (no replay, no skip), rows
+    # sliced by rank.  A fresh module captures its identity in setup
+    # (the way Lightning runs it) before resuming.
+    fresh = _dm()
+    fresh.load_state_dict(state)
+    with patch.object(
+        datamodule_module, "_distributed_world_size_and_rank", return_value=(2, 1)
+    ):
+        fresh.setup()
+        resumed = _take(fresh.train_dataloader(), 2)
+    assert [int(b["batch_index"]) for b in resumed] == [3, 4]
+    for offset, batch in enumerate(resumed):
+        expected = _expected_batch(3 + offset)
+        _, expected1 = _expected_rows(expected)
+        assert _batch_content(batch) == _batch_content(expected1)
+
+    # Ranks x DataLoader workers: a rank's workers together cover the
+    # same global indices 0..n-1 (the stream is shared), and every batch
+    # carries that rank's row slice.
     for rank in (0, 1):
-        for batch in _rank_batches(rank, 6, num_workers=2):
-            index = int(batch["batch_index"])
-            assert index not in produced, "global index produced twice"
-            produced[index] = batch
-    assert sorted(produced) == list(range(12))
-    for index, batch in produced.items():
-        assert _batch_content(batch) == _batch_content(_expected_batch(index))
+        batches = _rank_batches(rank, 6, num_workers=2)
+        assert [int(b["batch_index"]) for b in batches] == list(range(6))
+        for index, batch in enumerate(batches):
+            expected0, expected1 = _expected_rows(_expected_batch(index))
+            wanted = expected0 if rank == 0 else expected1
+            assert _batch_content(batch) == _batch_content(wanted)
 
 
 def test_ddp_val_test_divisibility():

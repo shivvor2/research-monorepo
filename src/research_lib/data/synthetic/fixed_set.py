@@ -6,14 +6,20 @@ once and presents it as a new random permutation every epoch, which is the
 training regime for the MAD-style harness.
 
 - **Train:** the ``num_train`` instances are generated once in
-  :meth:`setup` from ``np.random.default_rng(train_seed)`` (train-style).
-  Each epoch ``e`` draws a permutation of the set from
-  ``np.random.SeedSequence([train_seed, e])`` and yields whole batches in
-  that order; the last partial batch is kept (``drop_last=False``).  The
-  stream comes from an :class:`~torch.utils.data.IterableDataset` keyed by
-  the GLOBAL batch index ``g = epoch * batches_per_epoch + position``, so
-  it is independent of ``num_workers`` and resumable from a batch index,
-  exactly as in :class:`~research_lib.data.synthetic.SyntheticRecallDataModule`.
+  :meth:`setup` from ``np.random.default_rng(train_seed)`` (train-style),
+  on every rank (each rank materialises the full training set so the
+  ranks slice the same global batches; about two minutes at the
+  MAD-style setting, in parallel).  Each epoch ``e`` draws a permutation
+  of the set from ``np.random.SeedSequence([train_seed, e])`` and yields
+  whole batches in that order; the last partial batch is kept
+  (``drop_last=False``).  ``batch_size`` is the **global** batch size:
+  rank ``r`` keeps the contiguous rows ``[r * B / W, (r + 1) * B / W)``
+  of every batch (divisibility enforced in :meth:`setup`).  The stream
+  comes from an :class:`~torch.utils.data.IterableDataset` keyed by the
+  GLOBAL batch index ``g = epoch * batches_per_epoch + position``, so it
+  is independent of ``num_workers`` and of the device count, and
+  resumable from a batch index, exactly as in
+  :class:`~research_lib.data.synthetic.SyntheticRecallDataModule`.
 - **Validation / test:** ``num_val`` / ``num_test`` test-style instances
   from their own fixed seeds, loaded in a fixed order.
 - **Leakage check:** :meth:`setup` counts validation and test sequences
@@ -78,14 +84,57 @@ class _FixedEpochTrainDataset(IterableDataset):
         rows: list[dict[str, torch.Tensor]],
         batch_size: int,
         train_seed: int,
+        world_size: int = 1,
+        rank: int = 0,
     ) -> None:
         super().__init__()
         self.rows = rows
         self.batch_size = int(batch_size)
         self.train_seed = train_seed
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self._identity_explicit = False
+        self._identity_fallback_logged = False
         self._n = len(rows)
         self._batches_per_epoch = math.ceil(self._n / int(batch_size))
         self.next_local_idx = 0
+
+    def set_identity(self, world_size: int, rank: int) -> None:
+        """Capture the rank identity (see
+        :meth:`~research_lib.data.synthetic.SyntheticRecallDataModule.setup`
+        and :meth:`_SyntheticTrainDataset.set_identity` for the rationale).
+
+        Raises:
+            ValueError: ``world_size`` out of range, ``rank`` outside
+                ``[0, world_size)``, or ``batch_size`` not divisible by
+                ``world_size``.
+        """
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank {rank} out of range for world_size {world_size}")
+        if self.batch_size % world_size != 0:
+            raise ValueError(
+                f"batch_size {self.batch_size} must be divisible by "
+                f"world_size {world_size} (a global batch is split into "
+                f"contiguous rank slices)"
+            )
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self._identity_explicit = True
+
+    def _rank_rows(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """This rank's contiguous rows of a global batch (identity slice;
+        the whole batch at world size 1)."""
+        if self.world_size <= 1:
+            return batch
+        rows = batch["input_ids"].shape[0]
+        per_rank = rows // self.world_size
+        start = self.rank * per_rank
+        return {
+            key: (value[start : start + per_rank] if value.dim() >= 1 else value)
+            for key, value in batch.items()
+        }
 
     def _make_batch(self, index: int) -> dict[str, torch.Tensor]:
         """Batch ``index`` (global) from its epoch's permutation."""
@@ -102,13 +151,20 @@ class _FixedEpochTrainDataset(IterableDataset):
         return batch
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        world_size, rank = distributed_world_size_and_rank()
+        world_size, rank = self.world_size, self.rank
+        if not self._identity_explicit and not self._identity_fallback_logged:
+            self._identity_fallback_logged = True
+            logger.info(
+                "%s iterated without a captured rank identity (it was built "
+                "outside a datamodule); assuming world size 1, rank 0",
+                type(self).__name__,
+            )
         info = torch.utils.data.get_worker_info()
         worker_id = info.id if info is not None else 0
         num_workers = info.num_workers if info is not None else 1
         local = self.next_local_idx + worker_id
         while True:
-            batch = self._make_batch(local * world_size + rank)
+            batch = self._rank_rows(self._make_batch(local))
             if info is None:
                 self.next_local_idx = local + 1
             yield batch
@@ -273,18 +329,24 @@ class FixedSetRecallDataModule(L.LightningDataModule):
     def setup(self, stage: str | None = None) -> None:
         """Generate the fixed training/validation/test sets (idempotent).
 
-        Logs the configuration and set sizes, and logs the val/test-
-        into-train leakage fraction at WARNING level when it exceeds
-        0.001.
+        Captures the rank identity (world size / rank from
+        :func:`distributed_world_size_and_rank`; ``setup`` runs in the
+        rank process, so the process group — if any — is initialised
+        here) on the train dataset, and enforces ``batch_size`` /
+        world-size divisibility.  Logs the configuration and set sizes,
+        and logs the val/test-into-train leakage fraction at WARNING
+        level when it exceeds 0.001.
 
         Raises:
-            ValueError: Under a distributed process group with world size
-                > 1, a validation or test set size not divisible by the
-                world size (Lightning's DistributedSampler would pad by
-                duplicating rows and double-count examples).
+            ValueError: ``batch_size`` not divisible by the world size, or
+                (as before) a validation or test set size not divisible
+                by the world size (Lightning's DistributedSampler would
+                pad by duplicating rows and double-count examples).
         """
         self._ensure_train_rows()
-        world_size, _ = distributed_world_size_and_rank()
+        world_size, rank = distributed_world_size_and_rank()
+        dataset = self._ensure_train_dataset()
+        dataset.set_identity(world_size, rank)
         if world_size > 1:
             for set_name, size, arg_name in (
                 ("validation", self.num_val, "num_val"),
@@ -368,12 +430,13 @@ class FixedSetRecallDataModule(L.LightningDataModule):
     # ------------------------------------------------------------------ #
 
     def state_dict(self) -> dict[str, Any]:
-        """Serialize the train stream position (the next LOCAL batch index,
-        equal to the global batch index at world size 1)."""
+        """Serialize the train stream position (the next GLOBAL batch
+        index — the same on every rank; equal to the local index at world
+        size 1)."""
         return {"next_batch_idx": int(self._ensure_train_dataset().next_local_idx)}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Resume the train stream from a serialized batch index."""
+        """Resume the train stream from a serialized global batch index."""
         self._ensure_train_dataset().next_local_idx = int(state_dict["next_batch_idx"])
 
     def on_before_batch_transfer(
@@ -390,7 +453,6 @@ class FixedSetRecallDataModule(L.LightningDataModule):
             and trainer is not None
             and bool(getattr(trainer, "training", False))
         ):
-            world_size, _ = distributed_world_size_and_rank()
             index = int(batch["batch_index"])
-            self._ensure_train_dataset().next_local_idx = index // world_size + 1
+            self._ensure_train_dataset().next_local_idx = index + 1
         return batch
