@@ -1,0 +1,176 @@
+"""
+Test suite for the evaluation metrics under a two-process process group.
+
+The evaluation metrics must read the same on several devices as on one:
+their counts reduce across ranks (SUM all-reduce in ``compute``), so a
+metric accumulated over a split of the batches equals the single-process
+value on the same batches.  Under two real gloo processes this is
+verified for:
+
+* :class:`~research_lib.data.synthetic.RecallMetrics` (overall, per
+  slice, per class),
+* :class:`~research_lib.data.synthetic.MacroTokenAccuracy` (torchmetrics
+  syncs its state across ranks itself),
+* :class:`~research_lib.data.synthetic.TokenAccuracy` (custom counters),
+* and a rank that saw NO evaluation batch (it still joins the collectives
+  with zero counts).
+
+Run with: pytest src/research_lib/data/synthetic/tests/test_ddp_metrics.py -v
+"""
+
+import multiprocessing
+import socket
+
+import pytest
+import torch
+import torch.distributed as dist
+
+from research_lib.data.synthetic._shared import batch_seed
+from research_lib.data.synthetic.mad_metrics import MacroTokenAccuracy, TokenAccuracy
+from research_lib.data.synthetic.metrics import RecallMetrics
+from research_lib.data.synthetic.mqar import MQARConfig, generate_mqar
+from research_lib.data.synthetic.overwrite import OverwriteConfig, generate_overwrite
+
+_B = 4
+MQ_CFG = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2, 4))
+OW_CFG = OverwriteConfig(
+    vocab_size=512,
+    seq_len=128,
+    num_keys=(4, 8),
+    block_size=16,
+    distant_min_blocks=4,
+)
+_VOCAB = 512  # the overwrite vocabulary (MQAR's 128 is a subset)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _rank_batches(rank: int, mode: str) -> list[dict[str, torch.Tensor]]:
+    """The batches this rank accumulates: batch ``i`` (``i`` in 0..3) is
+    MQAR for even ``i`` and overwrite for odd; ranks always accumulate
+    the same per-index batches (deterministic per seed), while ``mode``
+    decides whether rank 1 also accumulates any (``split``: rank ``r``
+    takes ``i % 2 == r``; ``empty``: rank 1 accumulates nothing)."""
+    if mode == "empty" and rank == 1:
+        return []
+    if mode == "split":
+        return [i for i in range(4) if i % 2 == rank]
+    return list(range(4))  # mode == "all" (the single-process reference)
+
+
+def _make_batch(index: int) -> dict[str, torch.Tensor]:
+    """Batch ``index``: MQAR for even indices, overwrite otherwise, plus
+    deterministic random logits over the vocab."""
+    if index % 2 == 0:
+        batch = generate_mqar(MQ_CFG, _B, seed=batch_seed(0, index))
+    else:
+        batch = generate_overwrite(OW_CFG, _B, seed=batch_seed(0, index))
+    torch.manual_seed(1000 + index)
+    batch["logits"] = torch.randn(
+        _B, 32 if index % 2 == 0 else 128, _VOCAB, dtype=torch.float64
+    )
+    return batch
+
+
+def _accumulate(
+    batches: list[dict[str, torch.Tensor]],
+) -> dict[str, float]:
+    """Accumulate the batches into every metric and return the combined
+    metric dict (the comparison surface)."""
+    torch.set_default_dtype(torch.float64)
+    recall_mqar = RecallMetrics(tuple(MQ_CFG.slices))
+    recall_ow = RecallMetrics(tuple(OW_CFG.slices), with_classes=True)
+    macro = MacroTokenAccuracy(num_classes=_VOCAB)
+    token = TokenAccuracy()
+    for batch in batches:
+        logits = torch.as_tensor(batch["logits"])
+        del batch["logits"]
+        if "key_class" in batch:
+            recall_ow.update(logits, batch)
+        else:
+            recall_mqar.update(logits, batch)
+        predictions = logits[:, :-1, :].argmax(-1)
+        macro.update(predictions, batch)
+        token.update(predictions, batch)
+    out: dict[str, float] = {}
+    for prefix, metrics in (
+        ("mqar", recall_mqar),
+        ("ow", recall_ow),
+        ("macro", macro),
+        ("token", token),
+    ):
+        for key, value in metrics.compute().items():
+            out[f"{prefix}/{key}"] = value
+    return out
+
+
+def _metrics_worker(rank: int, world_size: int, port: int, queue, mode: str) -> None:
+    """One rank of the metrics test: accumulates its share of the batches
+    (deterministic per rank) and hands back its metric dict.  ``compute``
+    reduces across ranks, so every rank's dict is the global reading."""
+    dist.init_process_group(
+        backend="gloo",
+        init_method=f"tcp://127.0.0.1:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+    batches = [_make_batch(i) for i in _rank_batches(rank, mode)]
+    values = _accumulate(batches)
+    queue.put((rank, values))
+    dist.destroy_process_group()
+
+
+def _run_two(mode: str) -> list[dict[str, float]]:
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    port = _free_port()
+    processes = [
+        ctx.Process(target=_metrics_worker, args=(rank, 2, port, queue, mode))
+        for rank in (0, 1)
+    ]
+    for process in processes:
+        process.start()
+    results = [None, None]
+    for _ in processes:
+        rank, values = queue.get(timeout=120)
+        results[rank] = values
+    for process in processes:
+        process.join(timeout=120)
+        assert process.exitcode == 0, f"rank worker failed with exit {process.exitcode}"
+    assert all(r is not None for r in results)
+    return results
+
+
+def _assert_same(ranked: list[dict[str, float]], reference: dict[str, float]) -> None:
+    for values in ranked:
+        assert set(values) == set(reference)
+        for key in reference:
+            assert values[key] == pytest.approx(reference[key], abs=1e-9, rel=1e-9), key
+
+
+@pytest.mark.slow
+def test_metrics_equal_the_single_process_values_two_gloo_processes():
+    """With the batches split across two real gloo processes (each rank
+    holding only its half — MQAR on one rank, overwrite on the other),
+    every metric's reduced value equals the single-process accumulation
+    over the same batches: RecallMetrics (overall, per slice, per
+    class), MacroTokenAccuracy and TokenAccuracy."""
+    reference = _accumulate([_make_batch(i) for i in range(4)])
+    # Sanity: the split really separates the metric families.
+    assert "mqar/acc" in reference and "ow/acc/class=distant" in reference
+    ranked = _run_two("split")
+    _assert_same(ranked, reference)
+
+
+@pytest.mark.slow
+def test_metrics_with_an_empty_rank_two_gloo_processes():
+    """A rank that saw no evaluation batch still joins the metrics'
+    collectives (its counters were created at reset), and both ranks
+    read the single-process values."""
+    reference = _accumulate([_make_batch(i) for i in range(4)])
+    ranked = _run_two("empty")  # rank 1 accumulates nothing
+    _assert_same(ranked, reference)
