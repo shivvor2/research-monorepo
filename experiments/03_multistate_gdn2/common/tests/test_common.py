@@ -462,36 +462,32 @@ class TestRunLength:
         with pytest.raises(ValueError, match="epochs"):
             run_length(cfg, TaskRegime.FIXED_SET)
 
-    def test_fixed_set_on_multiple_devices_is_an_error(self):
+    def test_fixed_set_run_length_independent_of_devices(self):
+        """The fixed-set run length derives from global batches: steps per
+        epoch, max steps and the validation interval are the same whether
+        the run uses 1 device, 2, or ``auto`` (a fixed-set task on several
+        devices trains on global batches, so the schedule does not depend
+        on the device count)."""
         from common.run_lifecycle import RunLength, run_length
 
         from research_lib.data.synthetic import TaskRegime
 
-        cfg = OmegaConf.create(
-            {
-                "training": {
-                    "epochs": 2,
-                    "batch_size": 2,
-                    "val_every_epochs": 1,
-                    "devices": 2,
-                },
-                "task": {"num_train": 10},
-            }
-        )
-        with pytest.raises(RuntimeError, match="single-device"):
-            run_length(cfg, TaskRegime.FIXED_SET)
-        # ``auto`` is not resolved (a multi-GPU machine can mean several
-        # devices); it still raises the same clear error, not a confusing
-        # ``int('auto')`` ValueError.
-        cfg.training.devices = "auto"
-        with pytest.raises(RuntimeError, match="auto"):
-            run_length(cfg, TaskRegime.FIXED_SET)
-        # Single device is allowed.
-        cfg.training.devices = 1
-        length = run_length(cfg, TaskRegime.FIXED_SET)
-        assert length == RunLength(
-            steps_per_epoch=5, max_steps=10, val_check_interval=5
-        )
+        for devices in (1, 2, "auto"):
+            cfg = OmegaConf.create(
+                {
+                    "training": {
+                        "epochs": 2,
+                        "batch_size": 2,
+                        "val_every_epochs": 1,
+                        "devices": devices,
+                    },
+                    "task": {"num_train": 10},
+                }
+            )
+            length = run_length(cfg, TaskRegime.FIXED_SET)
+            assert length == RunLength(
+                steps_per_epoch=5, max_steps=10, val_check_interval=5
+            )
 
     def test_epoch_cosine_on_streaming_is_an_error(self):
         import torch as _torch

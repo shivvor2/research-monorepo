@@ -69,6 +69,12 @@ class LayerStatsCallback(L.Callback):
     stats in a batch (or holds a value from a previous epoch) is never
     snapshotted with stale values.
 
+    The statistics are **per rank**: each rank snapshots its own batches'
+    values, and under several devices the recorded values come from the
+    global rank's rows (the run record's collector reads rank 0's
+    callbacks). The values are diagnostics, not metrics; they are not
+    reduced across ranks.
+
     Args:
         prefix: Metric prefix; entries are logged as
             ``{prefix}/layer{i}/{name}``.

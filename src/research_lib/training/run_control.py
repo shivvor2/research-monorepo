@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -79,6 +80,43 @@ def disable_tf32() -> dict[str, bool]:
         "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
         "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
     }
+
+
+def lightning_launched_rank() -> int:
+    """The rank this process holds under Lightning's subprocess launcher.
+
+    Only Lightning's own launcher is supported: the training script is
+    started once (rank 0), and at ``Trainer.fit`` Lightning re-executes
+    the script for ranks 1..W-1 as child processes.  A child is told
+    apart from an ordinary rank-0 start by the environment the launcher
+    sets: :data:`LOCAL_RANK` (plus ``MASTER_ADDR``, ``MASTER_PORT``,
+    ``NODE_RANK`` and ``WORLD_SIZE``) — lightning 2.6.6, the version
+    pinned in ``uv.lock`` (its subprocess-script launcher, which never
+    sets a global ``RANK`` variable).  Launches in which every rank is
+    started independently are refused here: ``torchrun`` sets ``RANK``
+    and ``srun`` sets ``SLURM_PROCID``, and rank 0 of such a launch also
+    finds one set at start-up, which the supported launcher never does.
+
+    Returns:
+        The rank: 0 for the process that runs ``fit``, ``i > 0`` for a
+        child rank Lightning started.  At world size 1 this is 0 (no
+        rank variables are set).
+
+    Raises:
+        RuntimeError: An external launcher's rank variable is present
+            (``RANK`` or ``SLURM_PROCID``); the error names the
+            supported launcher.
+    """
+    external = [name for name in ("RANK", "SLURM_PROCID") if name in os.environ]
+    if external:
+        raise RuntimeError(
+            "process was started by an unsupported launcher (found rank "
+            f"variable(s) {', '.join(sorted(external))}); only Lightning's "
+            "own subprocess launcher is supported: start the script once "
+            "and let Lightning start the other ranks (torchrun and srun "
+            "are refused)"
+        )
+    return int(os.environ.get("LOCAL_RANK", 0))
 
 
 def assert_fit_finished(trainer: L.Trainer) -> None:

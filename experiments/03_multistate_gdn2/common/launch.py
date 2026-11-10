@@ -5,9 +5,10 @@ job number (for the shard round-robin), the STOP file in the launch
 directory, and the run claim (:func:`claimed_run`). :func:`begin_run`
 runs the head of one job in the pilots' shared order — precision flags,
 STOP file, shard membership — once, up front, before any run-specific
-machinery is built. A job outside this process's shard is not started;
-:func:`claimed_run` wraps the run lock, the skip check and the re-upload
-of a skipped finished run.
+machinery is built (a rank that Lightning's subprocess launcher started
+skips the gate: rank 0 already decided it). A job outside this process's
+shard is not started; :func:`claimed_run` wraps the run lock, the skip
+check and the re-upload of a skipped finished run.
 """
 
 from __future__ import annotations
@@ -23,7 +24,12 @@ from hydra.core.hydra_config import HydraConfig
 from hydra.utils import get_original_cwd
 from omegaconf import DictConfig, OmegaConf
 
-from research_lib.training.run_control import claim_run, disable_tf32, in_shard
+from research_lib.training.run_control import (
+    claim_run,
+    disable_tf32,
+    in_shard,
+    lightning_launched_rank,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,13 +60,20 @@ def begin_run(cfg: DictConfig) -> dict[str, bool] | None:
     """The shared head of one job: precision flags, then branch on the
     STOP file and shard membership.
 
-    Precision is set first (fp32 without TF32). Then, while the STOP file
-    exists, no new run starts and the job exits (``sys.exit(0)``): in a
-    multirun this ends the whole sweep — Hydra's job wrapper catches
-    Exception, not SystemExit — in a single run it just exits. A run
-    whose job number is not in this process's shard is **not** started;
-    the function returns ``None`` for the caller to return normally, so
-    the other shards of the sweep continue.
+    Precision is set first (fp32 without TF32) in every process, the
+    launch-gate ranks included.  Unsupported launchers are refused here
+    (see :func:`lightning_launched_rank`).  A rank that Lightning's
+    subprocess launcher started is a child of this job: rank 0 already
+    ran the gate, so the child skips it and goes straight to building the
+    run — the STOP file and the shard round-robin must not stop a child
+    whose rank 0 decided to run, and the child's Hydra job number is not
+    the gate's.  Otherwise: while the STOP file exists, no new run starts
+    and the job exits (``sys.exit(0)``): in a multirun this ends the
+    whole sweep — Hydra's job wrapper catches Exception, not SystemExit —
+    in a single run it just exits. A run whose job number is not in this
+    process's shard is **not** started; the function returns ``None`` for
+    the caller to return normally, so the other shards of the sweep
+    continue.
 
     Args:
         cfg: The resolved config (``launch.*``).
@@ -69,9 +82,23 @@ def begin_run(cfg: DictConfig) -> dict[str, bool] | None:
         ``None`` when this job is not in this process's shard (the caller
         returns without running); otherwise the precision flags, for the
         run record.
+
+    Raises:
+        RuntimeError: An unsupported launcher's rank variables are
+            present (torchrun / srun), from :func:`lightning_launched_rank`.
     """
     precision_flags = disable_tf32()
     logger.info("Precision flags: %s", precision_flags)
+
+    rank = lightning_launched_rank()
+    if rank > 0:
+        logger.info(
+            "Lightning started this process as child rank %d; the launch "
+            "gate (STOP file, shard membership, skip and lock) was decided "
+            "by rank 0 and is bypassed here",
+            rank,
+        )
+        return precision_flags
 
     stop = stop_requested(cfg)
     if stop is not None:
