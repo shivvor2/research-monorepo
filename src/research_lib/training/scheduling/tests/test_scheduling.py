@@ -22,13 +22,7 @@ from research_lib.training.scheduling.utils import (
 from research_lib.training.scheduling.validation import (
     check_finite,
     check_in_range,
-    check_in_set,
-    check_monotonic_decreasing,
-    check_monotonic_increasing,
-    check_monotonic_non_decreasing,
-    check_monotonic_non_increasing,
     check_non_negative,
-    check_positive,
     validate_schedule,
 )
 
@@ -200,6 +194,24 @@ class TestWarmupStableDecaySchedule:
 
 
 # =============================================================================
+def _raise_past_total(step: int, total: int) -> float:
+    """A schedule that a tailored step() must never evaluate past ``total``."""
+    if step >= total:
+        raise RuntimeError(f"evaluated the schedule at step {step} >= total {total}")
+    return 0.1
+
+
+def _distinct_below_total(step: int, total: int) -> float:
+    """A schedule with a distinct value per step that raises at ``total``.
+
+    Used to tell which step a restore actually applied (the values are 0.3,
+    0.4, 0.5 at steps 0, 1, 2 for ``total`` 3).
+    """
+    if step >= total:
+        raise RuntimeError(f"evaluated the schedule at step {step} >= total {total}")
+    return 0.3 + 0.1 * step
+
+
 # ParamScheduler Tests
 # =============================================================================
 
@@ -254,12 +266,12 @@ class TestParamScheduler:
             total_steps=100,
         )
 
-        # Initial LR is 0.1
-        assert simple_optimizer.param_groups[0]["lr"] == 0.1
+        # Construction applies schedule(0) = 1.0 (from constant_one).
+        assert simple_optimizer.param_groups[0]["lr"] == 1.0
 
         scheduler.step()
 
-        # After step, LR should be 1.0 (from constant_one)
+        # After step, the next step's value is also 1.0.
         assert simple_optimizer.param_groups[0]["lr"] == 1.0
 
     def test_increments_step(self, simple_optimizer, constant_schedule):
@@ -269,12 +281,61 @@ class TestParamScheduler:
             global_schedules=[constant_schedule],
             total_steps=100,
         )
-
         assert scheduler.get_current_step() == 0
         scheduler.step()
         assert scheduler.get_current_step() == 1
         scheduler.step()
         assert scheduler.get_current_step() == 2
+
+    def test_steps_stop_evaluating_at_total_steps(self, simple_optimizer):
+        """After the final optimizer step the schedule is not evaluated at a
+        step that would never run (a user schedule may raise there)."""
+        schedule = ParamSchedule(param_name="lr", schedule_fn=_raise_past_total)
+        scheduler = ParamScheduler(simple_optimizer, [schedule], total_steps=3)
+        # Construction evaluated step 0. Three optimizer steps follow (their
+        # counts 1, 2, 3); the third step() must skip the evaluation at
+        # count 3 == total_steps, or _raise_past_total raises.
+        for _ in range(3):
+            scheduler.step()
+        assert scheduler.get_current_step() == 3
+
+    def test_load_finished_schedule_applies_the_last_step(self, simple_optimizer):
+        """Loading a finished scheduler (step_count == total_steps) must not
+        evaluate the schedule at a step that never runs; it applies the last
+        step that ran instead. The schedule has distinct values per step, so
+        the assertion tells steps 0 and 2 apart."""
+        schedule = ParamSchedule(param_name="lr", schedule_fn=_distinct_below_total)
+        scheduler = ParamScheduler(simple_optimizer, [schedule], total_steps=3)
+        scheduler.load_state_dict({"step_count": 3})  # total_steps == 3
+        # Applied the value for the last step that ran (2): 0.5, not step 0's
+        # 0.3 and not step 3 (which raises).
+        assert scheduler.get_current_step() == 3
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+
+    def test_load_finished_schedule_fresh_scheduler_matches(self, simple_optimizer):
+        """A fresh scheduler loading a finished state behaves the same as one
+        that ran to completion. The optimizer is shared, so the LR is captured
+        before ``b``'s construction (which otherwise re-applies step 0);
+        ``b``'s restored value must equal the captured one."""
+        schedule = ParamSchedule(param_name="lr", schedule_fn=_distinct_below_total)
+        a = ParamScheduler(simple_optimizer, [schedule], total_steps=3)
+        for _ in range(3):
+            a.step()  # run to completion: count 3, value stays at step 2 (0.5)
+        captured = simple_optimizer.param_groups[0]["lr"]
+
+        b = ParamScheduler(simple_optimizer, [schedule], total_steps=3)
+        b.load_state_dict({"step_count": 3})
+        assert b.get_current_step() == 3
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(captured)
+
+    def test_zero_steps_does_not_evaluate_a_schedule(self, simple_optimizer):
+        """With total_steps == 0, step 0 is a step that never runs; the
+        scheduler must not evaluate the schedule at construction."""
+        schedule = ParamSchedule(param_name="lr", schedule_fn=_raise_past_total)
+        scheduler = ParamScheduler(simple_optimizer, [schedule], total_steps=0)
+        assert scheduler.get_current_step() == 0
+        scheduler.step()  # count 1 >= total 0: skipped, no evaluation
+        assert scheduler.get_current_step() == 1
 
     def test_linear_decay(self, simple_optimizer, linear_schedule):
         """Should apply changing values over steps."""
@@ -284,18 +345,18 @@ class TestParamScheduler:
             total_steps=100,
         )
 
-        # Step 0: applies value for step 0, then increments
-        # simple_linear_decay(0, 100) = 1.0
-        scheduler.step()
+        # Construction applies schedule(0) = 1.0.
         assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(1.0)
 
-        # Advance to step 50 (we're at step 1, need 49 more steps)
+        scheduler.step()
+
+        # After one step we are at count 1: schedule(1) = 0.99.
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.99)
+
+        # Advance to count 50: schedule(50) = 1.0 - 50/100 = 0.5.
         for _ in range(49):
             scheduler.step()
-
-        # Now at step 50, last applied was step 49
-        # simple_linear_decay(49, 100) = 1.0 - 49/100 = 0.51
-        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.51)
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
 
     def test_group_overrides(self, simple_model):
         """Should apply different schedules to different groups."""
@@ -316,6 +377,10 @@ class TestParamScheduler:
             total_steps=100,
             group_overrides={1: [schedule_group1]},
         )
+
+        # Values for step 0 are applied at construction.
+        assert optimizer.param_groups[0]["lr"] == 1.0
+        assert optimizer.param_groups[1]["lr"] == 0.5
 
         scheduler.step()
 
@@ -349,6 +414,10 @@ class TestParamScheduler:
             global_schedules=[lr_schedule, momentum_schedule],
             total_steps=100,
         )
+
+        # Both values for step 0 applied at construction.
+        assert simple_optimizer.param_groups[0]["lr"] == 1.0
+        assert simple_optimizer.param_groups[0]["momentum"] == 0.5
 
         scheduler.step()
 
@@ -405,13 +474,13 @@ class TestParamScheduler:
         )
         scheduler2.load_state_dict(state)
 
-        # Should be at same step
+        # Should be at same step and the restored step's value applied.
         assert scheduler2.get_current_step() == 50
-
-        # Next step should apply value for step 50
-        # simple_linear_decay(50, 100) = 0.5
-        scheduler2.step()
         assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.5)
+
+        # Advancing now gives the value for step 51.
+        scheduler2.step()
+        assert simple_optimizer.param_groups[0]["lr"] == pytest.approx(0.49)
 
 
 # =============================================================================
@@ -720,3 +789,149 @@ class TestWarmRestarts:
                 initial_cycle_steps=100,
                 cycle_mult=0.5,
             )
+
+
+class TestEpochCosineSchedule:
+    """A per-epoch cosine: constant inside an epoch, decaying from peak at
+    epoch 0 to near-minimum at the last epoch."""
+
+    def _sch(self):
+        from research_lib.training.scheduling import EpochCosineSchedule
+
+        return EpochCosineSchedule(
+            steps_per_epoch=10, epochs=200, max_value=1e-3, min_value=1e-6
+        )
+
+    def test_epoch_zero_is_peak(self):
+        s = self._sch()
+        assert s(0, 2000) == 1e-3
+        # whole epoch 0 is constant at the peak
+        assert s(9, 2000) == 1e-3
+
+    def test_midpoint_epoch_halves(self):
+        s = self._sch()
+        # epoch 100: progress 1/2 -> (max+min)/2
+        assert s(1000, 2000) == pytest.approx((1e-3 + 1e-6) / 2)
+        assert s(1009, 2000) == s(1000, 2000)
+
+    def test_constant_within_an_epoch(self):
+        s = self._sch()
+        vals = {s(step, 2000) for step in range(500, 510)}
+        assert len(vals) == 1
+        # but the next epoch differs
+        assert s(509, 2000) != s(510, 2000)
+
+    def test_matches_cosine_annealing_step_per_epoch(self):
+        # Exact match against torch's CosineAnnealingLR(T_max=200,
+        # eta_min=1e-6) stepped once per epoch, for every one of the 200
+        # epochs (this pins the closed form; a near-minimum check alone
+        # could not distinguish a delta from floor).
+        import math
+
+        peak = 1e-3
+        s = self._sch()
+
+        def ref_lr(last_epoch):
+            # torch CosineAnnealingLR closed form: eta_min + (base - eta_min)
+            # * (1 + cos(pi * last_epoch / T_max)) / 2.
+            return 1e-6 + (peak - 1e-6) * (1 + math.cos(math.pi * last_epoch / 200)) / 2
+
+        for epoch in range(200):
+            ours = s(epoch * 10, 2000)
+            assert ours == pytest.approx(ref_lr(epoch), rel=1e-12), f"epoch {epoch}"
+
+    def test_last_epoch_is_monotone_from_peak(self):
+        s = self._sch()
+        assert s(0, 2000) >= s(1999, 2000) > 0.0
+        assert s(1999, 2000) > 1e-6  # strictly above the floor, not 0
+
+    def test_picklable(self):
+        import pickle
+
+        s = self._sch()
+        clone = pickle.loads(pickle.dumps(s))
+        assert clone(0, 2000) == s(0, 2000)
+        assert clone(1000, 2000) == s(1000, 2000)
+
+
+class TestStepAlignsWithOptimizer:
+    """The scheduler is stepped once per optimizer step, after
+    ``optimizer.step()``, and optimizer step ``s`` runs at ``schedule(s)``.
+
+    The values the optimizer actually sees (recorded just before each
+    ``optimizer.step()``) must equal the schedule at the 0-based step
+    index, including step 0 (the constructor value) and the first step of
+    each epoch (for the per-epoch cosine).
+    """
+
+    def _run(self, schedule, n_steps):
+        model = torch.nn.Linear(2, 2)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+        scheduler = ParamScheduler(
+            optimizer=optimizer,
+            global_schedules=[schedule],
+            total_steps=n_steps,
+        )
+        seen = []
+        for _ in range(n_steps):
+            seen.append(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            scheduler.step()
+        return seen
+
+    def test_warmup_step_zero_is_the_start_value(self):
+        schedule = WarmupStableDecaySchedule(
+            param_name="lr",
+            min_value=1e-4,
+            max_value=1e-2,
+            warmup_frac=0.1,
+            cooldown_frac=0.5,
+        )
+        seen = self._run(schedule, 20)
+        assert seen == [schedule(k, 20) for k in range(20)]
+        assert seen[0] == pytest.approx(1e-4)  # schedule(0), the warmup start
+
+    def test_epoch_cosine_first_step_of_each_epoch(self):
+        from research_lib.training.scheduling import EpochCosineSchedule
+
+        schedule = EpochCosineSchedule(
+            steps_per_epoch=10, epochs=100, max_value=1.0, min_value=0.1
+        )
+        seen = self._run(schedule, 25)
+        assert seen == [schedule(k, 250) for k in range(25)]
+        # Epoch 0 is the peak; epoch 1's first step is below it.
+        assert seen[0] == pytest.approx(1.0)
+        assert seen[10] < 1.0 and seen[10] == pytest.approx(schedule(10, 250))
+        # Constant within an epoch, changing at the boundary.
+        assert seen[9] == pytest.approx(1.0)
+
+    def test_resume_continues_the_sequence(self):
+        from research_lib.training.scheduling import EpochCosineSchedule
+
+        schedule = EpochCosineSchedule(
+            steps_per_epoch=5, epochs=20, max_value=1.0, min_value=0.0
+        )
+        n = 17
+        optimizer = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
+        scheduler = ParamScheduler(
+            optimizer=optimizer, global_schedules=[schedule], total_steps=40
+        )
+        first = []
+        for _ in range(n):
+            first.append(optimizer.param_groups[0]["lr"])
+            optimizer.step()
+            scheduler.step()
+        state = scheduler.state_dict()
+
+        optimizer2 = torch.optim.SGD([torch.nn.Parameter(torch.zeros(1))], lr=0.0)
+        scheduler2 = ParamScheduler(
+            optimizer=optimizer2, global_schedules=[schedule], total_steps=40
+        )
+        scheduler2.load_state_dict(state)
+        # The resumed run continues with schedule(17), schedule(18), ...
+        for k in range(n):
+            assert optimizer2.param_groups[0]["lr"] == pytest.approx(
+                schedule(n + k, 40)
+            )
+            optimizer2.step()
+            scheduler2.step()

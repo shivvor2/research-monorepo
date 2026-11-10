@@ -32,21 +32,34 @@ for _path in (_PROJECT, _PILOT):
     if str(_path) not in sys.path:
         sys.path.insert(0, str(_path))
 
+from common import conf_resolvers  # noqa: E402,F401  (registers config resolvers)
+from common.conf_resolvers import padded_generated_length  # noqa: E402,F401
 from common.launch import begin_run, claimed_run  # noqa: E402
-from common.registries import config_type_of_task, require_harness  # noqa: E402
+from common.registries import (  # noqa: E402
+    build_extra_metrics,
+    config_type_of_task,
+    require_harness,
+)
 from common.run_id import HASH_EXCLUDE, make_run_id  # noqa: E402
-from common.run_lifecycle import build_module  # noqa: E402
 from common.run_lifecycle import (  # noqa: E402
+    build_module,
     create_callbacks_reset_curves,
     create_loggers,
     post_fit,
     run_and_close,
+    run_length,
     upload_run_record_artifact,
 )
-from structured_recall_analysis.protocol import PROTOCOL_TIERS  # noqa: E402
+from structured_recall_analysis.protocol import (  # noqa: E402
+    FROZEN_HARNESS_KEYS,
+    FROZEN_TASK_KEYS,
+    PROTOCOL_TIERS,
+)
 
 from research_lib.data.synthetic import (  # noqa: E402
+    FixedSetRecallDataModule,
     SyntheticRecallDataModule,
+    TaskRegime,
     require_task,
 )
 from research_lib.training.callbacks import config_hash  # noqa: E402
@@ -59,12 +72,66 @@ def load_frozen_protocol() -> DictConfig:
     return OmegaConf.load(_PILOT / "conf" / "frozen_protocol.yaml")
 
 
-def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
-    """Assert the run uses the frozen width and harness choices.
+def assert_fixed_set_padding(cfg: DictConfig) -> int:
+    """The fixed-set run's max_seq_len must be the derived padded length
+    (``seq_len + 1`` rounded up to the chunk size); a hand-set value could
+    silently change the padding, and with it ``t_max`` and the ``ll`` slot
+    count. Returns the validated padded length.
 
-    Applies to protocol tiers only (the smoke/debug tiers are tooling).
-    The run's config stays the record; the frozen file is checked against
-    it, never used as a second source that silently overrides.
+    Raises:
+        ValueError: ``task.max_seq_len`` differs from the derived value.
+    """
+    derived = padded_generated_length(cfg.task.seq_len, cfg.model.chunk_size)
+    run_max = int(cfg.task.max_seq_len)
+    if run_max != derived:
+        raise ValueError(
+            f"task.max_seq_len ({run_max}) must equal the derived padded "
+            f"length {derived} = padded_generated_length(task.seq_len="
+            f"{cfg.task.seq_len}, model.chunk_size={cfg.model.chunk_size})"
+        )
+    return derived
+
+
+def _check_entry_values(
+    cfg: DictConfig,
+    entry: DictConfig | None,
+    *,
+    node: str,
+    label: str,
+    tier: str,
+) -> None:
+    """Compare ``node``'s run values against the frozen ``entry`` (a
+    ``harness_choices`` / ``task_settings`` node) for every key that is set.
+
+    A set key whose run value (``cfg.<node>.<key>``) differs from the frozen
+    value is an error naming both; a ``None`` frozen value is a not-yet-set
+    key and is skipped.
+    """
+    if entry is None:
+        return
+    for key, frozen_value in entry.items():
+        if frozen_value is None:
+            continue
+        run_value = OmegaConf.select(cfg, f"{node}.{key}")
+        if str(run_value) != str(frozen_value):
+            raise RuntimeError(
+                f"the frozen protocol for {label} uses {key}={frozen_value!r}, "
+                f"but this run uses {node}.{key}={run_value!r} (tier={tier!r})"
+            )
+
+
+def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
+    """Assert the run uses the frozen choices and, once the protocol is
+    frozen, that every required choice is complete.
+
+    The required keys are the protocol's :data:`FROZEN_HARNESS_KEYS` /
+    :data:`FROZEN_TASK_KEYS` (the single source of truth; the YAML entry
+    must hold exactly those). Applies to protocol tiers only. While
+    ``frozen: false`` the check is permissive: a set key is compared, a
+    null or missing key is passed. While ``frozen: true`` a protocol-tier
+    run additionally requires that the harness entry exists and holds every
+    required key non-null, and the same for the task's entry when the task
+    has required keys.
 
     Raises:
         RuntimeError: Naming the key, the run's value, the frozen value
@@ -73,24 +140,57 @@ def check_frozen_choices(cfg: DictConfig, frozen: DictConfig) -> None:
     tier = str(cfg.experiment.get("tier") or "")
     if tier not in PROTOCOL_TIERS:
         return
-    frozen_d_model = frozen.get("d_model", None)
-    if frozen_d_model is not None and int(cfg.model.d_model) != int(frozen_d_model):
-        raise RuntimeError(
-            f"the frozen protocol's d_model is {frozen_d_model}, but this run "
-            f"uses model.d_model={cfg.model.d_model} (tier={tier!r})"
-        )
-    harness = frozen.get("harness", None)
-    if harness is not None:
-        for key in ("layer_pattern", "state_mixer"):
-            frozen_value = harness.get(key, None)
-            if frozen_value is None:
-                continue
-            if str(cfg.model[key]) != str(frozen_value):
+    is_frozen = bool(frozen.get("frozen", False))
+    harness = str(cfg.harness.name)
+    harness_keys = FROZEN_HARNESS_KEYS.get(harness, ())
+    entry = (frozen.get("harness_choices") or {}).get(harness)
+    if is_frozen and harness_keys:
+        if entry is None:
+            raise RuntimeError(
+                f"the frozen protocol is frozen but has no harness_choices "
+                f"entry for harness {harness!r} (tier={tier!r}); fill "
+                "conf/frozen_protocol.yaml"
+            )
+        for key in harness_keys:
+            if entry.get(key) is None:
                 raise RuntimeError(
-                    f"the frozen protocol's harness uses {key}={frozen_value!r}, "
-                    f"but this run uses model.{key}={cfg.model[key]!r} "
-                    f"(tier={tier!r})"
+                    f"the frozen protocol is frozen but harness_choices."
+                    f"{harness}.{key} is still null (tier={tier!r}); fill "
+                    "conf/frozen_protocol.yaml"
                 )
+    _check_entry_values(
+        cfg,
+        entry,
+        node="model",
+        label=f"harness {harness!r}",
+        tier=tier,
+    )
+
+    # ---- the task's frozen settings (e.g. the sequence length) ----
+    task = str(OmegaConf.select(cfg, "task.name", default=""))
+    task_keys = FROZEN_TASK_KEYS.get(task, ())
+    task_settings = (frozen.get("task_settings") or {}).get(task)
+    if is_frozen and task_keys:
+        if task_settings is None:
+            raise RuntimeError(
+                f"the frozen protocol is frozen but has no task_settings "
+                f"entry for task {task!r} (tier={tier!r}); fill "
+                "conf/frozen_protocol.yaml"
+            )
+        for key in task_keys:
+            if task_settings.get(key) is None:
+                raise RuntimeError(
+                    f"the frozen protocol is frozen but task_settings."
+                    f"{task}.{key} is still null (tier={tier!r}); fill "
+                    "conf/frozen_protocol.yaml"
+                )
+    _check_entry_values(
+        cfg,
+        task_settings,
+        node="task",
+        label=f"task {task!r}",
+        tier=tier,
+    )
 
 
 def build_task_config(cfg: DictConfig):
@@ -124,7 +224,12 @@ def run_job(cfg: DictConfig) -> None:
         if cfg.optimizer.lr is not None
         else _frozen_lr(cfg, frozen)
     )
-    logger.info("Peak learning rate: %g", lr)
+    weight_decay = (
+        float(cfg.optimizer.weight_decay)
+        if cfg.optimizer.weight_decay is not None
+        else _frozen_weight_decay(cfg, frozen)
+    )
+    logger.info("Peak learning rate: %g; weight decay: %g", lr, weight_decay)
 
     if int(cfg.model.t_max) < int(cfg.task.max_seq_len):
         raise RuntimeError(
@@ -132,7 +237,7 @@ def run_job(cfg: DictConfig) -> None:
             f"({cfg.task.max_seq_len}); the ll slot count depends on it"
         )
 
-    run_id = make_run_id(cfg, lr, include_task_keys=True)
+    run_id = make_run_id(cfg, lr, weight_decay=weight_decay, include_task_keys=True)
     identity = (
         config_hash(OmegaConf.to_container(cfg, resolve=True), HASH_EXCLUDE),
         cfg.seed,
@@ -141,27 +246,44 @@ def run_job(cfg: DictConfig) -> None:
         if reason is not None:
             logger.info("skip %s: %s", run_id, reason)
             return
-        monitor_key = str(cfg.training.monitor_key)
-        callbacks = create_callbacks_reset_curves(
-            cfg, run_id, precision_flags, lr=lr, monitor_key=monitor_key
-        )
-        loggers = create_loggers(cfg, run_id)
-
         L.seed_everything(cfg.seed)
         task = str(cfg.task.name)
         task_config = build_task_config(cfg)
         spec = require_task(task)
-        datamodule = SyntheticRecallDataModule(
-            task=task,
-            task_config=task_config,
-            batch_size=cfg.training.batch_size,
-            num_val_per_slice=cfg.data.num_val_per_slice,
-            num_test_per_slice=cfg.data.num_test_per_slice,
-            train_seed=cfg.seed,
-            val_seed=cfg.task.val_seed,
-            test_seed=cfg.task.test_seed,
-            num_workers=cfg.data.num_workers,
-        )
+        regime = spec.regime
+        length = run_length(cfg, regime)
+        monitor_key = str(cfg.training.monitor_key)
+
+        if regime is TaskRegime.FIXED_SET:
+            # Fixed, chunk-padded rows: the run's max_seq_len must be the
+            # derived padded length (assert_fixed_set_padding).
+            padded = assert_fixed_set_padding(cfg)
+            to_row = spec.row_fn(task_config, pad_to=padded)
+            datamodule = FixedSetRecallDataModule(
+                dataset_fn=spec.dataset_fn,
+                config=task_config,
+                to_row=to_row,
+                num_train=cfg.task.num_train,
+                num_val=cfg.task.num_val,
+                num_test=cfg.task.num_test,
+                batch_size=cfg.training.batch_size,
+                train_seed=cfg.seed,
+                val_seed=cfg.task.val_seed,
+                test_seed=cfg.task.test_seed,
+                num_workers=cfg.data.num_workers,
+            )
+        else:
+            datamodule = SyntheticRecallDataModule(
+                task=task,
+                task_config=task_config,
+                batch_size=cfg.training.batch_size,
+                num_val_per_slice=cfg.data.num_val_per_slice,
+                num_test_per_slice=cfg.data.num_test_per_slice,
+                train_seed=cfg.seed,
+                val_seed=cfg.task.val_seed,
+                test_seed=cfg.task.test_seed,
+                num_workers=cfg.data.num_workers,
+            )
 
         # 0. Model through the harness registry; the mixer kind comes from
         # model.mixer (the run, not the harness).
@@ -169,18 +291,45 @@ def run_job(cfg: DictConfig) -> None:
         model = harness(cfg)
         if bool(getattr(cfg.training, "compile", False)):
             model = torch.compile(model)
+        extra_metrics = build_extra_metrics(
+            list(cfg.task.get("extra_metrics") or ()),
+            vocab_size=int(cfg.task.vocab_size),
+        )
         module = build_module(
             cfg,
             model,
             lr,
             spec.slice_values(task_config),
+            weight_decay=weight_decay,
+            regime=regime,
             monitor_key=monitor_key,
             class_names=spec.class_names,
+            extra_metrics=extra_metrics,
         )
 
+        # The run record's caller-owned top-level fields (the model class,
+        # the training regime and the derived run length).
+        record_extra = {
+            "model_class": type(model).__name__,
+            "task_regime": regime.value,
+            "epochs": int(cfg.training.get("epochs") or 0) or None,
+            "steps_per_epoch": length.steps_per_epoch,
+            "max_steps": length.max_steps,
+            "weight_decay": weight_decay,
+        }
+        callbacks = create_callbacks_reset_curves(
+            cfg,
+            run_id,
+            precision_flags,
+            lr=lr,
+            monitor_key=monitor_key,
+            record_extra=record_extra,
+        )
+        loggers = create_loggers(cfg, run_id)
+
         trainer = L.Trainer(
-            max_steps=cfg.training.max_steps,
-            val_check_interval=cfg.training.val_check_interval,
+            max_steps=length.max_steps,
+            val_check_interval=length.val_check_interval,
             precision=cfg.training.precision,
             callbacks=callbacks,
             logger=loggers,
@@ -212,26 +361,37 @@ def _walk(node: object, *keys: str) -> object | None:
     return current
 
 
-def _frozen_lr(cfg: DictConfig, frozen: DictConfig) -> float:
-    """The frozen peak LR for this run, or raise.
+def _frozen_value(cfg: DictConfig, frozen: DictConfig, table: str, kind: str) -> float:
+    """The frozen scalar for this run from ``frozen[table]``, or raise.
 
-    For the gated-delta mixer the table is
-    ``lr_table.<task>.gated_delta.<layout>.<gate>``; an attention run has
-    its own row ``lr_table.<task>.attention``.
+    Both tables share the key path: for the gated-delta mixer
+    ``<table>.<task>.gated_delta.<layout>.<gate>``; an attention run has
+    its own row ``<table>.<task>.attention``.  ``kind`` names the config
+    key in the error (e.g. ``optimizer.lr``).
     """
     mixer = str(OmegaConf.select(cfg, "model.mixer", default="gated_delta"))
-    task_node = _walk(frozen.get("lr_table"), str(cfg.task.name))
+    task_node = _walk(frozen.get(table), str(cfg.task.name))
     if mixer == "attention":
         value = _walk(task_node, "attention")
     else:
         value = _walk(task_node, mixer, str(cfg.model.layout), str(cfg.model.gate_mode))
     if value is None:
         raise RuntimeError(
-            "optimizer.lr is null and no frozen-protocol entry exists (mixer="
-            f"{mixer!r}); fill conf/frozen_protocol.yaml after calibration, or "
-            "pass optimizer.lr=<value>"
+            f"{kind} is null and no frozen-protocol entry exists in "
+            f"{table!r} (mixer={mixer!r}); fill conf/frozen_protocol.yaml "
+            f"after calibration, or pass {kind}=<value>"
         )
     return float(value)
+
+
+def _frozen_lr(cfg: DictConfig, frozen: DictConfig) -> float:
+    """The frozen peak LR for this run (see :func:`_frozen_value`)."""
+    return _frozen_value(cfg, frozen, "lr_table", "optimizer.lr")
+
+
+def _frozen_weight_decay(cfg: DictConfig, frozen: DictConfig) -> float:
+    """The frozen weight decay for this run (see :func:`_frozen_value`)."""
+    return _frozen_value(cfg, frozen, "weight_decay_table", "optimizer.weight_decay")
 
 
 @hydra.main(version_base=None, config_path="conf", config_name="config")

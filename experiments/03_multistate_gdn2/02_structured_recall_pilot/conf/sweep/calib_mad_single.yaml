@@ -1,0 +1,24 @@
+# @package _global_
+# MAD fuzzy single-state LR calibration.
+# gate {kda, full} x lr {1e-4, 5e-4, 1e-3} x weight decay {0, 0.1},
+# selection seed 100 = 12 runs. The setting is chosen on accuracy level
+# only, never on the gap.
+# Run: python 01_train.py +sweep=calib_mad_single task=mad_fuzzy --multirun
+# A length-resolution rerun (per the length rule) overrides seq_len:
+#   python 01_train.py +sweep=calib_mad_single task=mad_fuzzy \
+#     task.seq_len=256 --multirun   # max_seq_len follows via the config
+
+experiment:
+  phase: 1
+  tier: calib_mad_single
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mad_fuzzy
+      model.layout: single
+      model.gate_mode: kda,full
+      optimizer.lr: 1e-4,5e-4,1e-3
+      optimizer.weight_decay: 0,0.1
+      seed: 100

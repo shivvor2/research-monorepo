@@ -99,9 +99,10 @@ class ParamScheduler:
         >>> scheduler.load_state_dict(checkpoint["scheduler_state"])
 
     Note:
-        Call scheduler.step() AFTER optimizer.step(), similar to PyTorch's
-        LRScheduler convention. The scheduler applies values for the current
-        step, then increments the step counter.
+        Call scheduler.step() AFTER optimizer.step(). Optimizer step ``s``
+        (0-based) runs at ``schedule(s)``: the value for step 0 is applied at
+        construction, and each ``step()`` advances the counter and sets the
+        value for the new step.
 
     Note:
         Override semantics: group_overrides[i] completely REPLACES global_schedules
@@ -155,6 +156,14 @@ class ParamScheduler:
         self._step_count = 0
 
         self._validate()
+        # Stepping convention: optimizer step ``s`` (0-based) uses
+        # ``schedule(s)``.  The value for step 0 is applied here, at
+        # construction, so the very first ``optimizer.step()`` already runs
+        # at ``schedule(0)`` rather than at whatever LR the optimizer was
+        # constructed with -- unless there are no steps at all, in which
+        # case step 0 is a step that never runs and must not be evaluated.
+        if self.total_steps > 0:
+            self._apply_step(0)
 
     def _validate(self) -> None:
         """Validate group_overrides against optimizer structure."""
@@ -180,20 +189,29 @@ class ParamScheduler:
             return self.group_overrides[group_idx]
         return self.global_schedules
 
-    def step(self) -> None:
-        """Apply schedules for current step, then increment step counter.
-
-        This should be called once per optimizer step, after optimizer.step().
-        Values are computed for the current _step_count, then _step_count is
-        incremented for the next call.
-        """
+    def _apply_step(self, count: int) -> None:
+        """Set every param group's scheduled value for optimizer step ``count``."""
         for group_idx, param_group in enumerate(self.optimizer.param_groups):
             schedules = self._get_schedules_for_group(group_idx)
             for schedule in schedules:
-                value = schedule(self._step_count, self.total_steps)
-                param_group[schedule.param_name] = value
+                param_group[schedule.param_name] = schedule(count, self.total_steps)
 
+    def step(self) -> None:
+        """Advance to the next optimizer step and set its scheduled value.
+
+        Call once per optimizer step, **after** ``optimizer.step()``.  The
+        counter is always incremented, then the value for the new count is
+        applied — but only while ``count < total_steps``.  After the final
+        ``optimizer.step()`` (at ``count == total_steps``) the pending value
+        would describe a step that never runs, and a user schedule may not
+        tolerate being evaluated there (the built-in schedules clamp, so
+        they are unaffected), so it is skipped.  Optimizer step ``s``
+        (0-based) runs at ``schedule(s)``; the value set after step ``s``
+        is what step ``s + 1`` uses.
+        """
         self._step_count += 1
+        if self._step_count < self.total_steps:
+            self._apply_step(self._step_count)
 
     def get_current_step(self) -> int:
         """Return current step count.
@@ -218,6 +236,13 @@ class ParamScheduler:
     def load_state_dict(self, state: Dict[str, Any]) -> None:
         """Load scheduler state from checkpoint.
 
+        Restores the step count and re-applies the scheduled value for the
+        restored step, so a resumed run continues with the exact value its
+        next ``optimizer.step()`` should use.  When the saved count is a
+        finished schedule (``>= total_steps``), the schedule is applied at
+        ``total_steps - 1`` - the last step that actually ran - instead of
+        evaluating a step that never runs.
+
         Args:
             state: Dictionary from state_dict().
 
@@ -225,4 +250,10 @@ class ParamScheduler:
             >>> checkpoint = torch.load("checkpoint.pt")
             >>> scheduler.load_state_dict(checkpoint["scheduler"])
         """
-        self._step_count = state["step_count"]
+        self._step_count = int(state["step_count"])
+        if self._step_count < self.total_steps:
+            self._apply_step(self._step_count)
+        elif self.total_steps > 0:
+            # A finished schedule: keep the saved count but apply the value
+            # of the last step that ran, not the never-to-run step total.
+            self._apply_step(self.total_steps - 1)

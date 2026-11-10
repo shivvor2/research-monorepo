@@ -14,7 +14,10 @@
 
 defaults:
   - _self_
-  - task: mqar
+  # No default task: a launch must name its task (mqar / entity_field /
+  # mad_fuzzy) or Hydra stops with "You must specify 'task'". The task
+  # group still overrides ``_self_`` and selects its own harness.
+  - task: ???
 
 seed: 0
 

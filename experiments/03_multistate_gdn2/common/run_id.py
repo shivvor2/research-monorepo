@@ -8,7 +8,10 @@ other mixer omits the layout / gate / lambda segment (and the ``-ev``
 mixers do not read, so its base ID is ``{task}-d{d_model}-lr{lr}``. In
 both cases non-default optimiser, model and harness keys are appended,
 along with ``-mix-{mixer}`` for a non-default mixer, so two runs that
-differ only in such a key never share a file name. With
+differ only in such a key never share a file name. When
+``optimizer.calibrate_weight_decay`` is set, the resolved weight decay is
+appended as ``-wd<value>`` so a calibration that sweeps it gets distinct
+IDs (Zoology's and the first pilot's IDs are unchanged). With
 ``include_task_keys`` on, the non-default fields of the task's registered
 config type are appended too (a run whose task keys are part of its
 identity enables it); with it off (the default) the base ID reproduces
@@ -129,16 +132,24 @@ def _task_suffixes(cfg: DictConfig) -> list[str]:
         if default is inspect.Parameter.empty:
             continue
         value = _cfg_value(cfg, f"task.{leaf}")
+        if value is None:
+            continue
         try:
             differs = _values_differ(value, default)
         except (ValueError, TypeError):
             differs = False
-        if value is not None and differs:
+        if differs:
             suffixes.append(f"-{leaf}-{_join(value)}")
     return suffixes
 
 
-def make_run_id(cfg: DictConfig, lr: float, *, include_task_keys: bool = False) -> str:
+def make_run_id(
+    cfg: DictConfig,
+    lr: float,
+    *,
+    weight_decay: float | None = None,
+    include_task_keys: bool = False,
+) -> str:
     """The run ID of one run, per the base-ID rule.
 
     The gated-delta base is ``{task}-{layout}-{gate}-{lambda}-d{d}-lr{lr}``;
@@ -149,6 +160,10 @@ def make_run_id(cfg: DictConfig, lr: float, *, include_task_keys: bool = False) 
         cfg: The resolved config (``task.*``, ``model.*``,
             ``experiment.tier``, ``optimizer.*``, ``harness.name``).
         lr: The (resolved) peak learning rate.
+        weight_decay: The resolved weight decay; appended to the run ID
+            (for either mixer) only when ``optimizer.calibrate_weight_decay``
+            is set, so a calibration that sweeps the value gets distinct
+            IDs.
         include_task_keys: Also append the run's non-default task-config
             fields (off reproduces the first pilot's IDs exactly).
 
@@ -163,17 +178,21 @@ def make_run_id(cfg: DictConfig, lr: float, *, include_task_keys: bool = False) 
         )
     else:
         # Layout, gate and lambda are gated-delta settings; the other
-        # mixers are built from the model width and head count (the layer
-        # pattern and state mixer still apply), so their base ID names the
-        # model without those keys.
+        # mixers are built from the model width and head count. Their base
+        # ID names the model without those keys.
         run_id = f"{cfg.task.name}-d{cfg.model.d_model}-lr{lr:g}"
+    if (
+        bool(_cfg_value(cfg, "optimizer.calibrate_weight_decay"))
+        and weight_decay is not None
+    ):
+        run_id += f"-wd{weight_decay:g}"
     scheme = str(_cfg_value(cfg, "optimizer.decay_scheme") or "grouped")
     if scheme != "grouped":
         run_id += f"-wd-{scheme}"
-    if str(cfg.model.layer_pattern) != "zoology":
-        run_id += f"-pat-{cfg.model.layer_pattern}"
-    if str(cfg.model.state_mixer) != "none":
-        run_id += f"-sm-{cfg.model.state_mixer}"
+    if str(_cfg_value(cfg, "model.layer_pattern") or "zoology") != "zoology":
+        run_id += f"-pat-{_cfg_value(cfg, 'model.layer_pattern')}"
+    if str(_cfg_value(cfg, "model.state_mixer") or "none") != "none":
+        run_id += f"-sm-{_cfg_value(cfg, 'model.state_mixer')}"
     if mixer == "gated_delta" and (
         _cfg_value(cfg, "model.expand_v") is not None
         and float(cfg.model.expand_v) != 1.0

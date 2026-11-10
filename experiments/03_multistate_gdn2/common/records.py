@@ -49,6 +49,16 @@ def flatten(record: Mapping[str, Any]) -> dict[str, Any]:
             if "lr_resolved" in record
             else (cfg.get("optimizer") or {}).get("lr")
         ),
+        # A record written before the resolved weight decay became a
+        # top-level field falls back to the run's config value.  ``None``
+        # is checked, not truthiness: ``0.0`` is a real selection.
+        "weight_decay": (
+            record.get("weight_decay")
+            if record.get("weight_decay") is not None
+            else (cfg.get("optimizer") or {}).get("weight_decay")
+        ),
+        "seq_len": task_config.get("seq_len"),
+        "monitor_key": (cfg.get("training") or {}).get("monitor_key"),
         "seed": record.get("seed"),
         "tier": (cfg.get("experiment") or {}).get("tier"),
         "phase": (cfg.get("experiment") or {}).get("phase"),
@@ -56,6 +66,14 @@ def flatten(record: Mapping[str, Any]) -> dict[str, Any]:
         "early_stopped": (record.get("stopping") or {}).get("early_stopped"),
         "best_value": (record.get("stopping") or {}).get("best_value"),
         "best_step": (record.get("stopping") or {}).get("best_step"),
+        "monitored_first": (record.get("monitored") or {}).get("monitored_first"),
+        "monitored_max": (record.get("monitored") or {}).get("monitored_max"),
+        "monitored_last_half_min": (record.get("monitored") or {}).get(
+            "monitored_last_half_min"
+        ),
+        "monitored_last_half_max": (record.get("monitored") or {}).get(
+            "monitored_last_half_max"
+        ),
         "status": record.get("status"),
         "decay_scheme": record.get("decay_scheme")
         or (cfg.get("optimizer") or {}).get("decay_scheme"),

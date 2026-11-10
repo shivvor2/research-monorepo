@@ -10,34 +10,24 @@
 #   2. one attention run (the positive control), single:
 #        python 01_train.py --config-name=debug task=mqar model.mixer=attention
 # Each job runs a few steps and writes one JSON.
+#
+# Task smoke sizes live in ``conf/smoke/<task>.yaml`` (selected via the
+# ``smoke`` group keyed on the task); model, training and data settings
+# stay here, shared.
 
 defaults:
   - config
+  - optional smoke: ${task}
 
 experiment:
   name: multistate_gdn2_structured_recall_pilot_debug
   phase: 1
   tier: debug
 
-# Task overrides: each task's builder keeps only its own config fields,
-# so the debug config can run any registered task (mqar ignores the
-# entity-field keys and vice versa). The entity-field numbers keep every
-# slice feasible at seq_len=64.
-task:
-  vocab_size: 128
-  seq_len: 64
-  max_seq_len: 64
-  num_kv_pairs: [2, 4]
-  num_fields: 2
-  num_entities: [2, 4]
-  update_fraction: 0.75
-  block_size: 8
-  distant_min_blocks: 2
-  reserved_filler: 2
-
 model:
   d_model: 16
   num_heads: 1
+  attention_num_heads: 4   # d=16 -> 4 heads of width 4 (even rotary dim)
   window: 4
   gate_mode: full
   layout: ws
@@ -49,12 +39,14 @@ data:
 
 training:
   batch_size: 32
+  epochs: 2                   # mad_fuzzy: the run length derives from this
   max_steps: 4
   val_check_interval: 4
   log_every_n_steps: 1
 
 optimizer:
   lr: 0.003
+  weight_decay: 0.0   # not frozen yet; debug sets its own
   decay_scheme: grouped
 
 logging:

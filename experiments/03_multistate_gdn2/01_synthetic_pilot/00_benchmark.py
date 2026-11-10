@@ -240,6 +240,7 @@ def build_benchmark_module(cfg: DictConfig, lr: float) -> L.LightningModule:
         model,
         lr,
         slice_values(cfg),
+        weight_decay=float(cfg.optimizer.weight_decay),
         monitor_key="val/acc",
         class_names=require_task(str(cfg.task.name)).class_names,
     )

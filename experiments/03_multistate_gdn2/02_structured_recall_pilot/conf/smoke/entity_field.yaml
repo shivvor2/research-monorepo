@@ -1,0 +1,13 @@
+# @package task
+# Entity-field's smoke sizes (test/debug selected via ``smoke: ${task}``).
+# These keep every slice feasible at seq_len=64 (N + U <= slots, >=
+# distant_min_blocks + 1 blocks, enough entity ids and values).
+vocab_size: 128
+seq_len: 64
+max_seq_len: 64
+num_fields: 2
+num_entities: [2, 4]
+update_fraction: 0.75
+block_size: 8
+distant_min_blocks: 2
+reserved_filler: 2

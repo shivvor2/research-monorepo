@@ -52,6 +52,8 @@ def _row(
     lam="mlp",
     mixer="gated_delta",
     lr=0.003,
+    weight_decay=0.1,
+    seq_len=0,
     seed=100,
     tier="calib_lr",
     best=None,
@@ -68,6 +70,8 @@ def _row(
         "d_model": 64,
         "mixer": mixer,
         "lr": lr,
+        "weight_decay": weight_decay,
+        "seq_len": seq_len,
         "seed": seed,
         "tier": tier,
         "status": status,
@@ -1115,6 +1119,19 @@ class TestFrozenSnippet:
         # every task that runs it, each under its own task heading.
         monkeypatch.setattr(
             protocol,
+            "TASK_TIERS",
+            {
+                "toy": protocol.TaskTiers(
+                    calibration=TOY_CALIBRATION, positive_control=TOY_CONTROL
+                ),
+                "entity_field": protocol.TaskTiers(
+                    calibration=("calib_ef_attention",),
+                    positive_control="tier1_ef_single",
+                ),
+            },
+        )
+        monkeypatch.setattr(
+            protocol,
             "CALIBRATION_TIERS",
             frozenset((*TOY_CALIBRATION, "calib_ef_attention")),
         )
@@ -1202,9 +1219,6 @@ class TestEmptyRunsDir:
 
 class TestSweepTiersRegistered:
     def test_every_sweep_tier_is_a_protocol_tier(self):
-        # conf/sweep has no configs now (MQAR is smoke/debug only), so
-        # the loop is empty; this catches a sweep file whose tier isn't
-        # registered in PROTOCOL_TIERS.
         sweep_dir = _PILOT / "conf" / "sweep"
         registered = _analyze._protocol.PROTOCOL_TIERS
         for path in sorted(sweep_dir.glob("*.yaml")):
@@ -1213,3 +1227,932 @@ class TestSweepTiersRegistered:
             assert (
                 tier in registered
             ), f"{path.name}: tier {tier!r} not in PROTOCOL_TIERS"
+
+    def test_every_sweep_tier_pins_its_task(self):
+        # Every sweep owns its task (a sweep must not run the pilot's
+        # default-less task under another tier's name by accident).
+        sweep_dir = _PILOT / "conf" / "sweep"
+        for path in sorted(sweep_dir.glob("*.yaml")):
+            cfg = OmegaConf.load(path)
+            # Assert on the raw value: ``str(None) == "None"` is truthy, so
+            # converting before asserting would let an unpinned sweep pass.
+            task = cfg.get("hydra", {}).get("sweeper", {}).get("params", {}).get("task")
+            assert task, f"{path.name}: no task pinned in the sweeper params"
+
+
+class TestWeightDecaySelection:
+    def test_selects_pair_not_lr_pool(self, tmp_path, protocol):
+        # Two weight decays at one LR with different best values: selecting
+        # the (lr, wd) pair picks the better decay; pooling by LR alone
+        # would average them and reach a different reading.
+        rows = [
+            _row("r1", lr=1e-3, weight_decay=0.0, seed=100, best=0.8, **{METRIC: 0.79}),
+            _row("r2", lr=1e-3, weight_decay=0.1, seed=100, best=0.6, **{METRIC: 0.55}),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        row = df.iloc[0]
+        assert row["selected_lr"] == 1e-3
+        assert row["selected_weight_decay"] == 0.0
+        assert row["mean_best_value"] == 0.8  # not the pooled (0.8+0.6)/2
+        assert row["cell"] == 0.79
+
+    def test_single_decay_unchanged_apart_from_column(self, tmp_path, protocol):
+        rows = [
+            _row("a", lr=1e-3, weight_decay=0.1, seed=100, best=0.8, **{METRIC: 0.79}),
+            _row("b", lr=5e-4, weight_decay=0.1, seed=100, best=0.7, **{METRIC: 0.68}),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        assert list(df["selected_weight_decay"]) == [0.1]
+        assert list(df["selected_lr"]) == [1e-3]
+
+    def test_double_decay_selection_reads_screening_fallback_damage(
+        self, tmp_path, protocol, monkeypatch
+    ):
+        # One gate at one LR run under two weight decays; selection picks
+        # (0.01, 0.0). Screening (both gates below the floor at the primary
+        # cell, so the fallback cell is read), and damage are all read at
+        # that exact pair: a filter on lr alone (which mixes the decays)
+        # must fail every one of these assertions.
+        monkeypatch.setattr(protocol, "SCREENING_CELLS", {"toy": PRIMARY})
+        monkeypatch.setattr(protocol, "SCREENING_FALLBACKS", {"toy": (FALLBACK, 0.15)})
+        monkeypatch.setattr(
+            protocol,
+            "TASK_DAMAGE",
+            {"toy": protocol.DamageReading("untouched", "sibling", slices=(16,))},
+        )
+        rows = []
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"wf{seed}",
+                    gate="full",
+                    lr=0.01,
+                    weight_decay=0.0,
+                    seed=seed,
+                    best=0.9,
+                    step=10,
+                    **{
+                        PRIMARY: 0.1,
+                        FALLBACK: 0.8,
+                        "test/acc/slice=16/class=untouched": 0.9,
+                        "test/acc/slice=16/class=sibling": 0.4,
+                    },
+                )
+            )
+            rows.append(
+                _row(
+                    f"wx{seed}",
+                    gate="full",
+                    lr=0.01,
+                    weight_decay=0.1,
+                    seed=seed,
+                    best=0.4,
+                    step=10,
+                    **{
+                        PRIMARY: 0.1,
+                        FALLBACK: 0.2,
+                        "test/acc/slice=16/class=untouched": 0.2,
+                        "test/acc/slice=16/class=sibling": 0.8,
+                    },
+                )
+            )
+        for seed in (100, 101):
+            rows.append(
+                _row(
+                    f"wk{seed}",
+                    gate="kda",
+                    lr=0.01,
+                    weight_decay=0.0,
+                    seed=seed,
+                    best=0.3,
+                    step=10,
+                    **{PRIMARY: 0.1, FALLBACK: 0.4},
+                )
+            )
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")].iloc[0]
+        assert full["selected_lr"] == 0.01
+        assert full["selected_weight_decay"] == 0.0
+        # Fallback cell at the selected pair (0.8), not the lr-pooled
+        # (0.8 + 0.2)/2 = 0.5.
+        assert full["cell"] == pytest.approx(0.8)
+        assert full["cell_metric"] == FALLBACK
+        # Damage at the selected pair (0.5), not the lr-pooled -0.05.
+        assert full["damage/slice=16"] == pytest.approx(0.5)
+
+
+class TestMadBandAndSafeguard:
+    def test_band_near_edge_and_stuck(self, tmp_path):
+        # Run a sits in the band (0.18 both) with a monitored history that
+        # never doubles its first value -> look-stuck on the same row. Run b
+        # sits above the ceiling and peaks above twice its first value, so
+        # it is not flagged on the first clause and (its tail is not flat)
+        # not on the second either.
+        rows = [
+            _row(
+                "a",
+                task="mad_fuzzy",
+                tier="calib_mad_single",
+                lr=1e-3,
+                weight_decay=0.1,
+                seed=100,
+                best=0.18,
+                **{"test/acc_mad": 0.18},
+                monitored_first=0.1,
+                monitored_max=0.15,
+                monitored_last_half_min=0.12,
+                monitored_last_half_max=0.15,
+            ),
+            _row(
+                "b",
+                task="mad_fuzzy",
+                gate="kda",
+                tier="calib_mad_single",
+                lr=1e-3,
+                weight_decay=0.1,
+                seed=100,
+                best=0.95,
+                **{"test/acc_mad": 0.9},
+                monitored_first=0.8,
+                monitored_max=1.9,
+                monitored_last_half_min=0.9,
+                monitored_last_half_max=0.95,
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[df["gate_mode"] == "full"].iloc[0]
+        kda = df[df["gate_mode"] == "kda"].iloc[0]
+        assert full["band"] == "in_band"
+        assert full["near_edge"] is True or str(full["near_edge"]) == "True"
+        assert kda["band"] == "above_ceiling"
+        # The same safeguard row that lists run ``a`` must flag it stuck.
+        stuck = pd.read_csv(out / "safeguard.csv")
+        a = stuck[stuck["run_id"] == "a"]
+        assert len(a) == 1 and bool(a.iloc[0]["looks_stuck"]) is True
+        b = stuck[stuck["run_id"] == "b"]
+        assert len(b) == 1 and bool(b.iloc[0]["looks_stuck"]) is False
+
+    def test_peak_above_twice_early_then_fall_is_not_stuck(self):
+        row = {
+            "monitored_first": 0.1,
+            "monitored_max": 0.9,
+            "monitored_last_half_min": 0.08,
+            "monitored_last_half_max": 0.13,  # 0.13 - 0.1 = 0.03 > 0.02
+        }
+        assert _analyze._looks_stuck(pd.Series(row)) is False
+
+    def test_climbs_then_flat_tail_is_stuck_only_when_flat_both_ways(self):
+        stuck = {
+            "monitored_first": 0.1,
+            "monitored_max": 0.9,
+            "monitored_last_half_min": 0.09,
+            "monitored_last_half_max": 0.11,
+        }
+        assert _analyze._looks_stuck(pd.Series(stuck)) is True
+        not_stuck = {
+            "monitored_first": 0.1,
+            "monitored_max": 0.9,
+            "monitored_last_half_min": 0.06,
+            "monitored_last_half_max": 0.11,
+        }
+        assert _analyze._looks_stuck(pd.Series(not_stuck)) is False
+
+
+class TestSeqLenCells:
+    @staticmethod
+    def _grid_rows(seq_len, winner):
+        """The full MAD grid (lr x weight decay) at ``seq_len`` with
+        ``winner`` the unique best point."""
+        rows = []
+        for seed in (100, 101):
+            for lr in (1e-4, 5e-4, 1e-3):
+                for wd in (0.0, 0.1):
+                    best = 0.9 if (lr, wd) == winner else 0.7
+                    rows.append(
+                        _row(
+                            f"r{seq_len}-{lr:g}-{wd:g}-{seed}",
+                            gate="full",
+                            lr=lr,
+                            weight_decay=wd,
+                            seq_len=seq_len,
+                            seed=seed,
+                            best=best,
+                            step=10,
+                            **{METRIC: best + 0.05},
+                        )
+                    )
+        return rows
+
+    def test_per_length_selection_picks_each_lengths_own_winner(
+        self, tmp_path, protocol
+    ):
+        # Both lengths run the full grid with a different (lr, wd) winning at
+        # each. Selection inside each length picks that length's winner; a
+        # selection pooled across lengths would fail these assertions.
+        rows = self._grid_rows(512, (5e-4, 0.0)) + self._grid_rows(256, (1e-3, 0.1))
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out, {"toy": 512})
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")]
+        by_len = {row["seq_len"]: row for _, row in full.iterrows()}
+        assert by_len[512]["selected_lr"] == pytest.approx(5e-4)
+        assert by_len[512]["selected_weight_decay"] == pytest.approx(0.0)
+        assert by_len[256]["selected_lr"] == pytest.approx(1e-3)
+        assert by_len[256]["selected_weight_decay"] == pytest.approx(0.1)
+
+    def test_rows_split_into_one_set_per_length(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "x0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+            _row(
+                "x1",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=101,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+            _row(
+                "y0",
+                gate="full",
+                lr=5e-4,
+                weight_decay=0.0,
+                seed=100,
+                best=0.7,
+                **{METRIC: 0.72},
+                **{"seq_len": 256},
+            ),
+            _row(
+                "y1",
+                gate="full",
+                lr=5e-4,
+                weight_decay=0.0,
+                seed=101,
+                best=0.7,
+                **{METRIC: 0.72},
+                **{"seq_len": 256},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out, {"toy": 512})
+        df = pd.read_csv(out / "calibration.csv")
+        full = df[(df["kind"] == "single") & (df["gate_mode"] == "full")]
+        assert set(full["seq_len"]) == {512, 256}
+        by_len = {row["seq_len"]: row for _, row in full.iterrows()}
+        assert by_len[512]["selected_lr"] == pytest.approx(1e-3)
+        assert by_len[256]["selected_lr"] == pytest.approx(5e-4)
+
+    def test_mixed_lengths_refuse_a_snippet_naming_them(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "x0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+            _row(
+                "y0",
+                gate="full",
+                lr=5e-4,
+                weight_decay=0.0,
+                seed=100,
+                best=0.7,
+                **{METRIC: 0.72},
+                **{"seq_len": 256},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="256.*512|512.*256"):
+            _analyze.calibration(_table(rows), out)
+
+    def test_seq_len_override_picks_one_length_for_the_snippet(
+        self, tmp_path, protocol
+    ):
+        rows = [
+            _row(
+                "x0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+            _row(
+                "y0",
+                gate="full",
+                lr=5e-4,
+                weight_decay=0.0,
+                seed=100,
+                best=0.7,
+                **{METRIC: 0.72},
+                **{"seq_len": 256},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out, {"toy": 512})
+        snippet = OmegaConf.load(out / "frozen_protocol_snippet.yaml")
+        assert _frozen_lr(_lr_cfg(layout="single", gate="full"), snippet) == 1e-3
+
+    def test_override_with_no_matching_rows_is_an_error(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "x0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="1024.*512|512.*1024"):
+            _analyze.calibration(_table(rows), out, {"toy": 1024})
+
+    def test_one_length_across_gated_and_attention_rows(self, tmp_path, protocol):
+        # Gated single-state rows at 512 and an attention row at 256: one
+        # length per task over the combined rows, so freeze at 512 with an
+        # override. The gated and attention entries both come from 512.
+        rows = [
+            _row(
+                "g0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+            _row(
+                "a0",
+                layout="ws",
+                mixer="attention",
+                lr=6e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                tier="calib_ws",
+                **{"seq_len": 256},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out, {"toy": 512})
+        snippet = OmegaConf.load(out / "frozen_protocol_snippet.yaml")
+        assert _frozen_lr(_lr_cfg(layout="single", gate="full"), snippet) == 1e-3
+        # The attention row was at 256, so it is not frozen at 512.
+        assert "attention" not in str(snippet.lr_table.toy)
+
+
+class TestMissingWeightDecay:
+    def test_no_weight_decay_raises_naming_runs(self, tmp_path, protocol):
+        rows = [
+            _row("w0", gate="full", lr=1e-3, seed=100, best=0.8, weight_decay=None),
+            _row("w1", gate="kda", lr=1e-3, seed=100, best=0.8, weight_decay=None),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="w0"):
+            _analyze.calibration(_table(rows), out)
+
+
+class TestNoBandWithoutRegistration:
+    def test_unregistered_task_gets_no_band_columns(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "a0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.1,
+                seed=100,
+                best=0.5,
+                **{METRIC: 0.5},
+            )
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        assert "band" not in df.columns
+        assert "near_edge" not in df.columns
+
+
+class TestSweepComposeTaskLen:
+    def test_sweep_composes_with_the_length_override(self, monkeypatch):
+        # The MAD sweeps pin task=mad_fuzzy; the length is an ordinary task
+        # key, so task.seq_len=256 composes and max_seq_len (and t_max)
+        # follow via the config resolver.
+        from common import conf_resolvers  # noqa: F401  (registers the resolver)
+        from hydra import compose, initialize
+
+        monkeypatch.chdir(_PILOT)
+        with initialize(version_base=None, config_path="conf"):
+            cfg = compose(
+                config_name="config",
+                overrides=[
+                    "+sweep=calib_mad_single",
+                    "task=mad_fuzzy",
+                    "task.seq_len=256",
+                ],
+            )
+            assert cfg.task.name == "mad_fuzzy"
+            assert cfg.task.seq_len == 256
+            assert cfg.task.max_seq_len == 272
+            assert OmegaConf.select(cfg, "model.t_max") == 272
+
+
+class TestPositiveControlSeqLen:
+    def test_mixed_length_tier_refuses_without_override(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=512,
+            ),
+            _row(
+                "p1",
+                gate="kda",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.4,
+                step=5,
+                **{METRIC: 0.4},
+                seq_len=256,
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="256.*512|512.*256"):
+            _analyze.positive_control(_table(rows), out)
+
+    def test_override_picks_one_length(self, tmp_path, protocol):
+        # Both seeds' paired gates at 512, plus a stray 256 row that the
+        # override drops before the gap is read.
+        rows = [
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=512,
+            ),
+            _row(
+                "p1",
+                gate="kda",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.4,
+                step=5,
+                **{METRIC: 0.4},
+                seq_len=256,
+            ),
+            _row(
+                "p2",
+                gate="full",
+                seed=1,
+                tier=TOY_CONTROL,
+                best=0.7,
+                step=5,
+                **{METRIC: 0.7},
+                seq_len=512,
+            ),
+            _row(
+                "p3",
+                gate="kda",
+                seed=1,
+                tier=TOY_CONTROL,
+                best=0.5,
+                step=5,
+                **{METRIC: 0.5},
+                seq_len=512,
+            ),
+            _row(
+                "p4",
+                gate="kda",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.4,
+                step=5,
+                **{METRIC: 0.4},
+                seq_len=512,
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.positive_control(_table(rows), out, {"toy": 512})
+        df = pd.read_csv(out / "positive_control.csv")
+        assert df["n_seeds"].iloc[0] == 2
+        assert df["mean_gap"].iloc[0] == pytest.approx(0.2)
+
+
+class TestSeqLenOverrideValidation:
+    def test_unknown_task_key_refused(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "a0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            )
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="no rows"):
+            _analyze.calibration(_table(rows), out, {"toy2": 512})
+
+    def test_single_length_nonmatching_override_refused(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=512,
+            )
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="matches no rows"):
+            _analyze.positive_control(_table(rows), out, {"toy": 256})
+
+    def test_multi_length_nonmatching_override_refused(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "p0",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=512,
+            ),
+            _row(
+                "p1",
+                gate="full",
+                seed=0,
+                tier=TOY_CONTROL,
+                best=0.6,
+                step=5,
+                **{METRIC: 0.6},
+                seq_len=256,
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="matches no rows"):
+            _analyze.positive_control(_table(rows), out, {"toy": 1024})
+
+
+class TestCompletenessPerLength:
+    def test_two_lengths_read_as_complete_groups(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(_analyze._protocol, "EXPECTED_RUNS", {TOY_CONTROL: 2})
+        rows = [
+            _row("a0", seed=0, tier=TOY_CONTROL, best=0.6, step=5, seq_len=512),
+            _row("a1", seed=1, tier=TOY_CONTROL, best=0.6, step=5, seq_len=512),
+            _row("b0", seed=0, tier=TOY_CONTROL, best=0.6, step=5, seq_len=256),
+            _row("b1", seed=1, tier=TOY_CONTROL, best=0.6, step=5, seq_len=256),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.completeness(_table(rows), out)
+        df = pd.read_csv(out / "completeness.csv")
+        assert set(df["seq_len"]) == {512, 256}
+        assert (df["observed"] == 2).all()
+        assert (df["missing"] == 0).all()
+        assert (df["expected"] == 2).all()
+
+
+class TestCompletenessMissingLength:
+    def test_missing_length_task_counts_beside_another_tasks_override(
+        self, tmp_path, monkeypatch
+    ):
+        # Task ``a`` has no seq_len at all (the column is float / NA); the
+        # override is for task ``b``. Both tasks' done runs are counted and
+        # the override filters only ``b``.
+        monkeypatch.setattr(
+            _analyze._protocol, "EXPECTED_RUNS", {"a_tier": 1, "b_tier": 1}
+        )
+        rows = [
+            _row("a0", task="a", tier="a_tier", best=0.6, step=5, seq_len=None),
+            _row("b0", task="b", tier="b_tier", best=0.6, step=5, seq_len=512),
+            _row("b1", task="b", tier="b_tier", best=0.6, step=5, seq_len=512),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.completeness(_table(rows), out, {"b": 512})
+        # keep_default_na=False: the empty seq_len in the CSV must stay empty
+        # instead of being read back as NaN in a mixed column.
+        df = pd.read_csv(out / "completeness.csv", keep_default_na=False)
+        a_row = df[df["tier"] == "a_tier"].iloc[0]
+        assert a_row["observed"] == 1
+        assert a_row["seq_len"] == ""  # the missing length writes empty
+        b_row = df[df["tier"] == "b_tier"].iloc[0]
+        assert b_row["observed"] == 2
+        assert b_row["seq_len"] == "512"
+
+    def test_float_seq_len_column_override_keeps_the_length_runs(
+        self, tmp_path, monkeypatch
+    ):
+        # One row without seq_len makes the column float ("512.0"); the
+        # override must still match the 512 rows numerically and drop only
+        # the not-at-512 ones.
+        monkeypatch.setattr(
+            _analyze._protocol, "EXPECTED_RUNS", {"calib_mad_single": 12}
+        )
+        rows = [
+            _row(
+                "x0",
+                task="mad_fuzzy",
+                tier="calib_mad_single",
+                best=0.6,
+                step=5,
+                seq_len=512,
+            ),
+            _row(
+                "x1",
+                task="mad_fuzzy",
+                tier="calib_mad_single",
+                best=0.6,
+                step=5,
+                seq_len=512,
+            ),
+            _row(
+                "y0",
+                task="mad_fuzzy",
+                tier="calib_mad_single",
+                best=0.6,
+                step=5,
+                seq_len=None,
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.completeness(_table(rows), out, {"mad_fuzzy": 512})
+        df = pd.read_csv(out / "completeness.csv")
+        assert len(df) == 1
+        cell = df.iloc[0]
+        assert cell["seq_len"] == 512
+        assert cell["observed"] == 2
+
+
+class TestOwnTierCalibration:
+    def test_mismatched_tier_row_excluded_not_silent(
+        self, tmp_path, protocol, monkeypatch, caplog
+    ):
+        monkeypatch.setattr(
+            protocol,
+            "TASK_TIERS",
+            {
+                "toy": protocol.TaskTiers(
+                    calibration=("calib_lr", "calib_ws"), positive_control=TOY_CONTROL
+                ),
+                "ef": protocol.TaskTiers(
+                    calibration=("calib_ef_single",), positive_control="tier1_ef_single"
+                ),
+            },
+        )
+        monkeypatch.setattr(
+            protocol,
+            "CALIBRATION_TIERS",
+            frozenset(("calib_lr", "calib_ws", "calib_ef_single")),
+        )
+        rows = [
+            _row(
+                "good",
+                task="toy",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+                tier="calib_lr",
+            ),
+            _row(
+                "stray",
+                task="toy",
+                gate="kda",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+                tier="calib_ef_single",
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with caplog.at_level("WARNING"):
+            _analyze.calibration(_table(rows), out)
+        df = pd.read_csv(out / "calibration.csv")
+        assert len(df) == 1 and df["gate_mode"].iloc[0] == "full"
+        assert "stray" in caplog.text
+
+
+class TestBandMetric:
+    def test_band_rows_on_another_monitor_refused(
+        self, tmp_path, protocol, monkeypatch
+    ):
+        monkeypatch.setattr(
+            protocol,
+            "TASK_SETTING_BANDS",
+            {"toy": protocol.SettingBand(0.15, 0.75, 0.05, "val/acc_toy")},
+        )
+        rows = [
+            _row(
+                "a",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.18,
+                **{METRIC: 0.18},
+                monitor_key="val/loss",
+            )
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="band"):
+            _analyze.calibration(_table(rows), out)
+
+    def test_band_row_on_the_band_metric_passes(self, tmp_path, protocol, monkeypatch):
+        monkeypatch.setattr(
+            protocol,
+            "TASK_SETTING_BANDS",
+            {"toy": protocol.SettingBand(0.15, 0.75, 0.05, "val/acc_toy")},
+        )
+        rows = [
+            _row(
+                "a",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.18,
+                **{METRIC: 0.18},
+                monitor_key="val/acc_toy",
+            )
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)  # no raise
+
+
+class TestMissingLearningRate:
+    def test_no_lr_raises_naming_runs(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "w0",
+                gate="full",
+                lr=None,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            )
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="learning rate"):
+            _analyze.calibration(_table(rows), out)
+
+
+class TestFrozenConflict:
+    def test_conflicting_values_at_a_cell_refused(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "x",
+                gate="full",
+                lr=0.003,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            ),
+            _row(
+                "y",
+                gate="full",
+                lr=0.004,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                lam="gated",
+                **{METRIC: 0.8},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        with pytest.raises(RuntimeError, match="conflicting"):
+            _analyze.calibration(_table(rows), out)
+
+    def test_identical_values_at_a_cell_coexist(self, tmp_path, protocol):
+        rows = [
+            _row(
+                "x",
+                gate="full",
+                lr=0.003,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.8},
+            ),
+            _row(
+                "y",
+                gate="full",
+                lr=0.003,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                lam="gated",
+                **{METRIC: 0.8},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)  # identical values coexist
+
+
+class TestFrozenLengthWritten:
+    def test_snippet_writes_the_frozen_length(self, tmp_path, protocol, monkeypatch):
+        monkeypatch.setattr(protocol, "FROZEN_TASK_KEYS", {"toy": ("seq_len",)})
+        rows = [
+            _row(
+                "x0",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.8,
+                **{METRIC: 0.82},
+                **{"seq_len": 512},
+            ),
+            _row(
+                "y0",
+                gate="full",
+                lr=5e-4,
+                weight_decay=0.0,
+                seed=100,
+                best=0.7,
+                **{METRIC: 0.72},
+                **{"seq_len": 256},
+            ),
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out, {"toy": 512})
+        snippet = (out / "frozen_protocol_snippet.yaml").read_text()
+        assert "task_settings:\n  toy:\n    seq_len: 512" in snippet
+        assert (
+            "lr_table:\n  toy:\n    gated_delta:\n      single:\n        full: 0.001"
+            in snippet
+        )
