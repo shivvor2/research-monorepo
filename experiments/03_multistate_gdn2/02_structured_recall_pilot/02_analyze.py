@@ -49,13 +49,6 @@ whose rows span more than one length is refused without it, and an
 override that matches no rows is an error rather than a silently-empty
 report.
 
-Every report's columns are fixed by
-:mod:`structured_recall_analysis.report_columns` and the protocol
-constants (the damage slices, the setting bands), never by which runs
-happen to exist; a report with no rows is written header-only, so a
-reader sees the same schema before and after a task's runs exist. A
-column the code would write but the schema does not name is an error.
-
 Usage:
     python 02_analyze.py calibration positive_control completeness
     python 02_analyze.py --runs-dir runs --out-dir analysis \
@@ -85,7 +78,6 @@ from common.analysis import (  # noqa: E402
 )
 from common.records import flatten  # noqa: E402
 from structured_recall_analysis import protocol as _protocol  # noqa: E402
-from structured_recall_analysis import report_columns  # noqa: E402
 
 from research_lib.training.record_table import load_records  # noqa: E402
 from research_lib.training.run_control import RUN_DONE_STATUS  # noqa: E402
@@ -101,30 +93,6 @@ def _load(runs_dir: Path) -> pd.DataFrame:
         # empty-but-typed table instead of raising ``AttributeError``.
         return pd.DataFrame(columns=list(flatten({}).keys()))
     return table
-
-
-def _write_report(df: pd.DataFrame, path: Path, columns: tuple[str, ...]) -> None:
-    """Write ``df`` to ``path`` with exactly ``columns``, in order.
-
-    A column in ``df`` that is not in ``columns`` is an error naming the
-    extra columns: a new kind of reading must be registered in its column
-    builder, never dropped or appeared silently. Missing columns become
-    empty cells and the header is always written, so a report with no
-    rows reads back as an empty frame with the right columns.
-
-    Args:
-        df: The report's rows.
-        path: The destination CSV.
-        columns: The report's fixed schema (see
-            :mod:`structured_recall_analysis.report_columns`).
-    """
-    extra = [c for c in df.columns if c not in columns]
-    if extra:
-        raise ValueError(
-            f"report columns not in its schema; register them in the column "
-            f"builder: {sorted(extra)}"
-        )
-    df.reindex(columns=columns).to_csv(path, index=False)
 
 
 def _gated(table: pd.DataFrame) -> pd.DataFrame:
@@ -528,7 +496,7 @@ def calibration(
         )
 
     df = pd.DataFrame(rows)
-    _write_report(df, out_dir / "calibration.csv", report_columns.calibration_columns())
+    (out_dir / "calibration.csv").write_text(df.to_csv(index=False), encoding="utf-8")
     _stuck_report(sel, out_dir)
     _frozen_snippet(rows, out_dir, seq_len_overrides or {})
 
@@ -551,7 +519,6 @@ def _stuck_report(sel: pd.DataFrame, out_dir: Path) -> None:
             {
                 "run_id": r.get("run_id"),
                 "task": r.get("task"),
-                "seq_len": r.get("seq_len"),
                 "tier": r.get("tier"),
                 "layout": r.get("layout"),
                 "gate_mode": r.get("gate_mode"),
@@ -559,10 +526,8 @@ def _stuck_report(sel: pd.DataFrame, out_dir: Path) -> None:
                 "looks_stuck": flag,
             }
         )
-    _write_report(
-        pd.DataFrame(flagged),
-        out_dir / "safeguard.csv",
-        report_columns.safeguard_columns(),
+    (out_dir / "safeguard.csv").write_text(
+        pd.DataFrame(flagged).to_csv(index=False), encoding="utf-8"
     )
 
 
@@ -738,22 +703,6 @@ def _one_length(
     )
 
 
-def _one_length_selected(tier_rows: pd.DataFrame) -> int | str:
-    """The single sequence length :func:`_one_length` left for a task's
-    tier-1 rows, or ``""`` when the rows carry no length.
-
-    ``_one_length`` guarantees a single distinct length (or an override
-    applied), so the first distinct value is that length; ``""`` signals
-    that the report rows carry no sequence length at all.
-    """
-    if "seq_len" not in tier_rows.columns or tier_rows.empty:
-        return ""
-    lengths = set(tier_rows["seq_len"].dropna().astype(int))
-    if not lengths:
-        return ""
-    return int(lengths.pop())
-
-
 def positive_control(
     table: pd.DataFrame, out_dir: Path, seq_len_overrides: dict[str, int] | None = None
 ) -> None:
@@ -815,7 +764,6 @@ def positive_control(
         report.insert(0, "task", task)
         report.insert(1, "metric", metric)
         report["tier"] = tiers.positive_control
-        report["seq_len"] = _one_length_selected(tier_rows)
         # Per-slice damage per gate over the tier's runs.
         reading = _protocol.TASK_DAMAGE.get(task)
         if reading is not None:
@@ -825,8 +773,8 @@ def positive_control(
                     report[f"damage_{gate}/slice={n}"] = _damage(gate_rows, task, n)
         rows.append(report)
     df = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
-    _write_report(
-        df, out_dir / "positive_control.csv", report_columns.positive_control_columns()
+    (out_dir / "positive_control.csv").write_text(
+        df.to_csv(index=False), encoding="utf-8"
     )
 
 
@@ -930,9 +878,7 @@ def completeness(
     _validate_seq_len_overrides(table, overrides)
     rows = _completeness_rows(table, dict(_protocol.EXPECTED_RUNS), overrides)
     df = pd.DataFrame(rows)
-    _write_report(
-        df, out_dir / "completeness.csv", report_columns.completeness_columns()
-    )
+    (out_dir / "completeness.csv").write_text(df.to_csv(index=False), encoding="utf-8")
 
 
 def _parse_seq_len_overrides(values: list[str] | None) -> dict[str, int]:

@@ -134,23 +134,6 @@ def delta_int_table(
     return pd.DataFrame(records)
 
 
-PAIRED_GAP_COLUMNS: tuple[str, ...] = (
-    "n_seeds",
-    "mean_gap",
-    "ci_low",
-    "ci_high",
-    "mean_high",
-    "mean_low",
-)
-"""The columns :func:`paired_gap_report` always returns, with or without
-rows.
-
-A single source for the report's fixed gap columns: an empty paired gap
-(the no-row case) carries these columns so a reader gets the same schema
-whether or not a screening cell has runs yet.
-"""
-
-
 def paired_gap_report(
     table: pd.DataFrame,
     metric: str,
@@ -177,7 +160,16 @@ def paired_gap_report(
     """
     gaps = gap_pairs(table, metric, high_gate, low_gate)
     if gaps.empty:
-        return pd.DataFrame(columns=list(PAIRED_GAP_COLUMNS))
+        return pd.DataFrame(
+            columns=[
+                "n_seeds",
+                "mean_gap",
+                "ci_low",
+                "ci_high",
+                "mean_high",
+                "mean_low",
+            ]
+        )
     mean, low, high = bootstrap_ci(gaps.values, n_resamples=n_resamples, alpha=alpha)
     best_high = _mean_over(table, metric, high_gate)
     best_low = _mean_over(table, metric, low_gate)

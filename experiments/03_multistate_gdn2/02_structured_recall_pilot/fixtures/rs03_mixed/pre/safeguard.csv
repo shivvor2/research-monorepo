@@ -1,9 +1,0 @@
-run_id,task,tier,layout,gate_mode,seed,looks_stuck
-mad_full_512_100,mad_fuzzy,calib_mad_single,single,full,100,True
-mad_kda_512_100,mad_fuzzy,calib_mad_single,single,kda,100,False
-mad_full_512_101,mad_fuzzy,calib_mad_single,single,full,101,True
-mad_kda_512_101,mad_fuzzy,calib_mad_single,single,kda,101,False
-mad_full_256_100,mad_fuzzy,calib_mad_single,single,full,100,True
-mad_kda_256_100,mad_fuzzy,calib_mad_single,single,kda,100,False
-mad_full_256_101,mad_fuzzy,calib_mad_single,single,full,101,True
-mad_kda_256_101,mad_fuzzy,calib_mad_single,single,kda,101,False

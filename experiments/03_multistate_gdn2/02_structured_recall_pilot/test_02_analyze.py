@@ -308,6 +308,7 @@ class TestCalibrationDamage:
         assert full["selected_lr"] == pytest.approx(0.01)
         assert full["damage/slice=16"] == pytest.approx(0.2)
         assert full["damage/slice=32"] == pytest.approx(0.3)
+        assert "damage" not in df.columns  # no pooled column
 
     def test_damage_uses_only_the_selected_lr(self, tmp_path, damage_protocol):
         # The selected LR is 0.01; an unselected LR carries a wildly
@@ -419,12 +420,7 @@ class TestCalibrationDamage:
         assert full["damage/slice=16"] == pytest.approx(0.2)
         assert pd.isna(full["damage/slice=32"])
 
-    def test_no_damage_reading_adds_no_damage_columns(
-        self, tmp_path, protocol, monkeypatch
-    ):
-        # No task registers a damage reading, so the schema carries no
-        # damage column (the column group is registry-driven).
-        monkeypatch.setattr(protocol, "TASK_DAMAGE", {})
+    def test_no_damage_reading_means_no_damage_columns(self, tmp_path, protocol):
         rows = [self._rows(100)]
         out = tmp_path / "out"
         out.mkdir()
@@ -558,6 +554,7 @@ class TestPositiveControl:
         assert df["damage_full/slice=32"].iloc[0] == pytest.approx(0.3)
         assert df["damage_kda/slice=16"].iloc[0] == pytest.approx(0.11)
         assert df["damage_kda/slice=32"].iloc[0] == pytest.approx(0.11)
+        assert "damage_full" not in df.columns
 
     def test_duplicate_seed_rows_raise_naming_runs(self, tmp_path, protocol):
         rows = [
@@ -606,13 +603,7 @@ class TestPositiveControl:
         # returns on an empty folder).
         empty = _table([_row("x")]).iloc[0:0]
         _analyze.positive_control(empty, out)
-        # The no-row case still carries the report schema, so read_csv works
-        # and yields an empty frame with the builder's columns.
-        df = pd.read_csv(out / "positive_control.csv")
-        assert df.empty
-        assert list(df.columns) == list(
-            _analyze.report_columns.positive_control_columns()
-        )
+        assert (out / "positive_control.csv").read_text().strip() == ""
 
 
 class TestScreeningCell:
@@ -857,13 +848,7 @@ class TestScreeningFallback:
         out = tmp_path / "out"
         out.mkdir()
         _analyze.positive_control(_table(rows), out)
-        # The no-row case still carries the report schema, so read_csv works
-        # and yields an empty frame with the builder's columns.
-        df = pd.read_csv(out / "positive_control.csv")
-        assert df.empty
-        assert list(df.columns) == list(
-            _analyze.report_columns.positive_control_columns()
-        )
+        assert (out / "positive_control.csv").read_text().strip() == ""
 
     def _control_rows(self, full_primary, kda_primary):
         rows = []
@@ -1222,28 +1207,10 @@ class TestEmptyRunsDir:
         _analyze.main()
         calib = out_dir / "calibration.csv"
         pos = out_dir / "positive_control.csv"
-        guard = out_dir / "safeguard.csv"
         comp = out_dir / "completeness.csv"
-        for p in (calib, pos, guard, comp):
-            assert p.exists()
-        # Header-only reports still read back with exactly the builder's
-        # columns, in order, so a reader sees the schema even before any
-        # runs exist.
-        calib_df = pd.read_csv(calib)
-        assert calib_df.empty
-        assert list(calib_df.columns) == list(
-            _analyze.report_columns.calibration_columns()
-        )
-        pos_df = pd.read_csv(pos)
-        assert pos_df.empty
-        assert list(pos_df.columns) == list(
-            _analyze.report_columns.positive_control_columns()
-        )
-        guard_df = pd.read_csv(guard)
-        assert guard_df.empty
-        assert list(guard_df.columns) == list(
-            _analyze.report_columns.safeguard_columns()
-        )
+        assert calib.exists() and pos.exists() and comp.exists()
+        assert calib.read_text().strip() == ""
+        assert pos.read_text().strip() == ""
         df = pd.read_csv(comp)
         assert len(df) == 1
         assert df["tier"].iloc[0] == "tier0"
@@ -1685,10 +1652,7 @@ class TestMissingWeightDecay:
 
 
 class TestNoBandWithoutRegistration:
-    def test_unregistered_task_reports_no_band(self, tmp_path, protocol):
-        # The toy task registers no setting band; bands are registered for
-        # other tasks, so the columns exist and this task's rows hold an
-        # empty (NaN) band rather than a value or a dropped column.
+    def test_unregistered_task_gets_no_band_columns(self, tmp_path, protocol):
         rows = [
             _row(
                 "a0",
@@ -1704,9 +1668,8 @@ class TestNoBandWithoutRegistration:
         out.mkdir()
         _analyze.calibration(_table(rows), out)
         df = pd.read_csv(out / "calibration.csv")
-        row = df.iloc[0]
-        assert pd.isna(row["band"])
-        assert pd.isna(row["near_edge"])
+        assert "band" not in df.columns
+        assert "near_edge" not in df.columns
 
 
 class TestSweepComposeTaskLen:
@@ -2193,397 +2156,3 @@ class TestFrozenLengthWritten:
             "lr_table:\n  toy:\n    gated_delta:\n      single:\n        full: 0.001"
             in snippet
         )
-
-
-class TestReportSchemasFixed:
-    """Report columns come from the code and the protocol tables, never
-    from which runs happen to exist (so a reader sees the same schema
-    before and after a task's runs exist)."""
-
-    EF_SCREENING = "test/acc/slice=32/class=sibling"
-    EF_HIGH = "test/acc/slice=16/class=untouched"
-    EF_LOW = "test/acc/slice=16/class=sibling"
-
-    def _rs02_row(self, task, gate, kind):
-        if task == "entity_field":
-            if kind == "calib":
-                return _row(
-                    f"ef_{gate}",
-                    task="entity_field",
-                    gate=gate,
-                    lr=1e-3,
-                    seed=100,
-                    best=0.6,
-                    step=10,
-                    tier="calib_ef_single",
-                    **{
-                        self.EF_SCREENING: 0.55,
-                        self.EF_HIGH: 0.8,
-                        self.EF_LOW: 0.7,
-                    },
-                )
-            return _row(
-                f"efpc_{gate}",
-                task="entity_field",
-                gate=gate,
-                seed=0,
-                tier="tier1_ef_single",
-                best=0.6,
-                step=5,
-                **{
-                    self.EF_SCREENING: 0.55,
-                    self.EF_HIGH: 0.8,
-                    self.EF_LOW: 0.7,
-                },
-            )
-        if kind == "calib":
-            return _row(
-                f"mad_{gate}",
-                task="mad_fuzzy",
-                gate=gate,
-                lr=1e-3,
-                seed=100,
-                best=0.2,
-                step=10,
-                tier="calib_mad_single",
-                **{"test/acc_mad": 0.2},
-                monitored_first=0.1,
-                monitored_max=0.18,
-                monitored_last_half_min=0.11,
-                monitored_last_half_max=0.14,
-            )
-        return _row(
-            f"madpc_{gate}",
-            task="mad_fuzzy",
-            gate=gate,
-            seed=0,
-            tier="tier1_mad_single",
-            best=0.6,
-            step=5,
-            **{"test/acc_mad": 0.6},
-        )
-
-    def _subset_rows(self, tasks):
-        rows = []
-        for task in tasks:
-            for gate in ("full", "kda"):
-                for kind in ("calib", "pc"):
-                    rows.append(self._rs02_row(task, gate, kind))
-        return rows
-
-    def test_schema_is_protocol_driven_not_run_driven(self, tmp_path):
-        # Whatever subset of tasks has runs, every report carries the same
-        # fixed columns, in order (a pooled column would be refused, so the
-        # writer guarantees this).
-        for subset in (["entity_field"], ["mad_fuzzy"], ["entity_field", "mad_fuzzy"]):
-            out = tmp_path / "-".join(subset)
-            out.mkdir()
-            _analyze.calibration(_table(self._subset_rows(subset)), out)
-            _analyze.positive_control(_table(self._subset_rows(subset)), out)
-            calib = pd.read_csv(out / "calibration.csv")
-            assert list(calib.columns) == list(
-                _analyze.report_columns.calibration_columns()
-            )
-            pc = pd.read_csv(out / "positive_control.csv")
-            assert list(pc.columns) == list(
-                _analyze.report_columns.positive_control_columns()
-            )
-            guard = pd.read_csv(out / "safeguard.csv")
-            assert list(guard.columns) == list(
-                _analyze.report_columns.safeguard_columns()
-            )
-
-    def test_non_applying_rows_hold_an_empty_cell(self, tmp_path):
-        # The columns come from the protocol, so an entity-field row and a
-        # MAD row both appear in the same frames; a row the group doesn't
-        # apply to holds NaN (never a dropped column).
-        out = tmp_path / "out"
-        out.mkdir()
-        _analyze.calibration(
-            _table(self._subset_rows(["entity_field", "mad_fuzzy"])), out
-        )
-        df = pd.read_csv(out / "calibration.csv")
-        ef = df[df["task"] == "entity_field"].iloc[0]
-        assert pd.isna(ef["band"]) and pd.isna(ef["near_edge"])
-        mad = df[df["task"] == "mad_fuzzy"].iloc[0]
-        assert pd.isna(mad["damage/slice=16"])
-        assert pd.isna(mad["damage/slice=32"])
-
-
-class TestValuesUnchangedAgainstFixture:
-    def test_reports_match_the_pre_change_fixture(self, tmp_path):
-        # A mixed table (both tasks, MAD at two lengths with an override)
-        # written before this change: the new reports keep every value on
-        # the shared columns (only the schema / empty-file handling and the
-        # two seq_len columns change).
-        fixture = _PILOT / "fixtures" / "rs03_mixed"
-        table = pd.read_json(fixture / "table.json", orient="records")
-        out = tmp_path / "out"
-        out.mkdir()
-        overrides = {"mad_fuzzy": 512}
-        _analyze.calibration(table, out, overrides)
-        _analyze.positive_control(table, out, overrides)
-        _analyze.completeness(table, out, overrides)
-        for name in ("calibration", "positive_control", "safeguard", "completeness"):
-            new = pd.read_csv(out / f"{name}.csv")
-            old = pd.read_csv(fixture / "pre" / f"{name}.csv")
-            shared = [c for c in old.columns if c in new.columns]
-            pd.testing.assert_frame_equal(
-                new[shared].reset_index(drop=True),
-                old[shared].reset_index(drop=True),
-                check_dtype=False,
-            )
-        # The frozen-protocol snippet is built from the row dicts, not the
-        # CSVs, so it must stay byte-identical.
-        new_snippet = (out / "frozen_protocol_snippet.yaml").read_text()
-        old_snippet = (fixture / "pre" / "frozen_protocol_snippet.yaml").read_text()
-        assert new_snippet == old_snippet
-
-
-class TestRegistryDrivenColumnGroups:
-    def test_a_registered_reading_adds_its_columns(
-        self, tmp_path, protocol, monkeypatch
-    ):
-        # A task registering a damage reading at slice 64 and a setting band
-        # adds ``damage/slice=64`` and the band columns to the calibration
-        # schema, and the per-gate slice columns to the positive control.
-        monkeypatch.setattr(
-            protocol,
-            "TASK_DAMAGE",
-            {"toy": protocol.DamageReading("untouched", "sibling", slices=(64,))},
-        )
-        monkeypatch.setattr(
-            protocol,
-            "TASK_SETTING_BANDS",
-            {"toy": protocol.SettingBand(0.15, 0.75, 0.05, "val/acc_toy")},
-        )
-        rows = [
-            _row(
-                "a",
-                gate="full",
-                lr=1e-3,
-                weight_decay=0.0,
-                seed=100,
-                best=0.5,
-                step=10,
-                **{METRIC: 0.5},
-                **{
-                    "test/acc/slice=64/class=untouched": 0.9,
-                    "test/acc/slice=64/class=sibling": 0.4,
-                },
-            )
-        ]
-        out = tmp_path / "out"
-        out.mkdir()
-        _analyze.calibration(_table(rows), out)
-        df = pd.read_csv(out / "calibration.csv")
-        assert "damage/slice=64" in df.columns
-        assert df["damage/slice=64"].iloc[0] == pytest.approx(0.5)
-        assert "band" in df.columns and "near_edge" in df.columns
-        pc = set(_analyze.report_columns.positive_control_columns())
-        assert {"damage_full/slice=64", "damage_kda/slice=64"} <= pc
-
-    def test_a_task_with_no_reading_adds_no_column(self, protocol, monkeypatch):
-        # With no damage reading and no band registered anywhere, the schema
-        # gains no such group.
-        monkeypatch.setattr(protocol, "TASK_DAMAGE", {})
-        monkeypatch.setattr(protocol, "TASK_SETTING_BANDS", {})
-        calib = _analyze.report_columns.calibration_columns()
-        assert not any(c.startswith("damage") for c in calib)
-        assert "band" not in calib and "near_edge" not in calib
-
-
-class TestWriterRefusesUnregisteredColumns:
-    def test_extra_column_raises_naming_it(self, tmp_path):
-        df = pd.DataFrame({"tier": ["a"], "a_new_reading": [1]})
-        with pytest.raises(ValueError, match="a_new_reading"):
-            _analyze._write_report(
-                df, tmp_path / "x.csv", _analyze.report_columns.completeness_columns()
-            )
-
-    def test_missing_columns_become_an_empty_cell(self, tmp_path):
-        # A column the rows don't carry is written empty (NaN), and the
-        # header always carries the full schema.
-        df = pd.DataFrame({"tier": ["a"]})
-        _analyze._write_report(
-            df, tmp_path / "x.csv", _analyze.report_columns.completeness_columns()
-        )
-        out = pd.read_csv(tmp_path / "x.csv")
-        assert list(out.columns) == list(_analyze.report_columns.completeness_columns())
-        assert pd.isna(out["seq_len"].iloc[0])
-
-
-class TestPairedGapColumnsConstant:
-    def test_paired_gap_returns_fixed_columns_with_and_without_rows(self, tmp_path):
-        columns = list(_analyze.report_columns.PAIRED_GAP_COLUMNS)
-        rows = [
-            _row(
-                "p0",
-                gate="full",
-                seed=0,
-                tier=TOY_CONTROL,
-                best=0.6,
-                step=5,
-                **{METRIC: 0.6},
-            ),
-            _row(
-                "p1",
-                gate="full",
-                seed=1,
-                tier=TOY_CONTROL,
-                best=0.7,
-                step=5,
-                **{METRIC: 0.7},
-            ),
-            _row(
-                "p2",
-                gate="kda",
-                seed=0,
-                tier=TOY_CONTROL,
-                best=0.4,
-                step=5,
-                **{METRIC: 0.4},
-            ),
-            _row(
-                "p3",
-                gate="kda",
-                seed=1,
-                tier=TOY_CONTROL,
-                best=0.5,
-                step=5,
-                **{METRIC: 0.5},
-            ),
-        ]
-        with_rows = _analyze.paired_gap_report(_table(rows), METRIC)
-        assert list(with_rows.columns) == columns
-        # The metric column must be present for the pairing to run; the no-rows
-        # frame carries the schema and an empty gap returns an empty frame.
-        empty = _table([_row("x", **{METRIC: 0.6})]).iloc[0:0]
-        no_rows = _analyze.paired_gap_report(empty, METRIC)
-        assert list(no_rows.columns) == columns
-        assert no_rows.empty
-
-
-class TestNewSeqLenColumns:
-    def test_positive_control_writes_the_selected_length(self, tmp_path, protocol):
-        rows = [
-            _row(
-                f"p{g}{s}",
-                gate=g,
-                seed=s,
-                tier=TOY_CONTROL,
-                best=0.6,
-                step=5,
-                **{METRIC: 0.6},
-                seq_len=512,
-            )
-            for g in ("full", "kda")
-            for s in (0, 1)
-        ]
-        out = tmp_path / "out"
-        out.mkdir()
-        _analyze.positive_control(_table(rows), out)
-        df = pd.read_csv(out / "positive_control.csv")
-        assert df["seq_len"].iloc[0] == 512
-
-    def test_positive_control_override_fixes_the_length(self, tmp_path, protocol):
-        rows = [
-            _row(
-                f"p{g}{s}",
-                gate=g,
-                seed=s,
-                tier=TOY_CONTROL,
-                best=0.6,
-                step=5,
-                **{METRIC: 0.6},
-                seq_len=512,
-            )
-            for g in ("full", "kda")
-            for s in (0, 1)
-        ]
-        rows.append(
-            _row(
-                "stray",
-                gate="full",
-                seed=0,
-                tier=TOY_CONTROL,
-                best=0.6,
-                step=5,
-                **{METRIC: 0.6},
-                seq_len=256,
-            )
-        )
-        out = tmp_path / "out"
-        out.mkdir()
-        _analyze.positive_control(_table(rows), out, {"toy": 512})
-        df = pd.read_csv(out / "positive_control.csv")
-        assert df["seq_len"].iloc[0] == 512
-
-    def test_positive_control_empty_when_rows_carry_no_length(self, tmp_path, protocol):
-        # A task whose tier-1 rows have no sequence length at all writes an
-        # empty (NaN) seq_len rather than a fabricated number.
-        rows = [
-            _row(
-                f"p{g}{s}",
-                gate=g,
-                seed=s,
-                tier=TOY_CONTROL,
-                best=0.6,
-                step=5,
-                **{METRIC: 0.6},
-                seq_len=None,
-            )
-            for g in ("full", "kda")
-            for s in (0, 1)
-        ]
-        out = tmp_path / "out"
-        out.mkdir()
-        _analyze.positive_control(_table(rows), out)
-        df = pd.read_csv(out / "positive_control.csv")
-        assert pd.isna(df["seq_len"].iloc[0])
-
-    def test_safeguard_writes_each_runs_length(self, tmp_path):
-        rows = [
-            _row(
-                "s512",
-                task="mad_fuzzy",
-                gate="full",
-                lr=1e-3,
-                seed=100,
-                best=0.2,
-                step=10,
-                tier="calib_mad_single",
-                **{"test/acc_mad": 0.2},
-                seq_len=512,
-                monitored_first=0.1,
-                monitored_max=0.18,
-                monitored_last_half_min=0.11,
-                monitored_last_half_max=0.14,
-            ),
-            _row(
-                "s256",
-                task="mad_fuzzy",
-                gate="kda",
-                lr=1e-3,
-                seed=100,
-                best=0.2,
-                step=10,
-                tier="calib_mad_single",
-                **{"test/acc_mad": 0.2},
-                seq_len=256,
-                monitored_first=0.1,
-                monitored_max=0.18,
-                monitored_last_half_min=0.11,
-                monitored_last_half_max=0.5,
-            ),
-        ]
-        out = tmp_path / "out"
-        out.mkdir()
-        # The frozen snippet must free the MAD length; the safeguard report
-        # still lists each run's own length (both 512 and 256).
-        _analyze.calibration(_table(rows), out, {"mad_fuzzy": 512})
-        guard = pd.read_csv(out / "safeguard.csv")
-        by_run = {r["run_id"]: int(r["seq_len"]) for _, r in guard.iterrows()}
-        assert by_run["s512"] == 512
-        assert by_run["s256"] == 256
-        assert set(guard["seq_len"]) == {512, 256}
