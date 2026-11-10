@@ -90,6 +90,37 @@ def answer_position_logits(
     return AnswerLogits(logits=logits, targets=targets, mask=mask)
 
 
+def answer_loss_parts(answers: AnswerLogits) -> tuple[torch.Tensor, torch.Tensor]:
+    """The sum of per-position losses and the number of scored rows.
+
+    The rows' negative log-likelihood under the head's distribution,
+    summed, and the row count.  Their quotient equals
+    :func:`answer_cross_entropy` in exact arithmetic; the sum/count
+    form is what a training step all-reduces across ranks to a global
+    mean without assuming any rank's row share (see
+    :class:`~research_lib.training.modules.MGDN2SyntheticRecallModule`).
+
+    Args:
+        answers: :class:`AnswerLogits` from
+            :func:`answer_position_logits`.
+
+    Returns:
+        Tuple ``(loss_sum, count)``: the per-row NLL sum (0-dim, on the
+        logits' device) and the count of rows (int64 0-dim, on the same
+        device).  ``loss_sum / count`` re-derives the mean; an empty
+        answer set yields sum 0.
+
+    Shape:
+        answers: ``(N, V)`` logits, ``(N,)`` targets; outputs scalar.
+    """
+    nll = (
+        -F.log_softmax(answers.logits, dim=-1)
+        .gather(-1, answers.targets.unsqueeze(-1))
+        .squeeze(-1)
+    )
+    return nll.sum(), torch.tensor(nll.numel(), dtype=torch.long, device=nll.device)
+
+
 def answer_cross_entropy(answers: AnswerLogits) -> torch.Tensor:
     """Mean cross-entropy over the answer rows.
 

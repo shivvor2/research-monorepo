@@ -18,6 +18,14 @@ MQAR / repeated-key overwrite:
 - **Validation / test:** answer accuracy, per slice and (for overwrite)
   per placement class, via
   :class:`~research_lib.data.synthetic.RecallMetrics`.
+- **Distributed training loss:** under several devices the loss is the
+  global mean over all ranks' scored positions, so the optimised
+  objective does not depend on how a batch is split across ranks: the
+  step all-reduces the count of scored positions (SUM) and uses
+  ``local_sum * world_size / global_count`` as the backward loss, whose
+  DDP gradient average is the gradient of the global mean; the logged
+  value is the global mean (the sum is reduced as well). With one
+  device the step is the parent's, byte for byte.
 
 Per-layer mixer statistics are collected by
 :class:`~research_lib.training.callbacks.LayerStatsCallback`, not by
@@ -44,9 +52,11 @@ from research_lib.data.synthetic.mqar import IGNORE_INDEX
 from research_lib.training.losses import (
     AnswerLogits,
     answer_cross_entropy,
+    answer_loss_parts,
     answer_position_logits,
 )
 from research_lib.training.modules.dual_optimizer import DualOptimizerModule
+from research_lib.training.scheduling.utils import get_current_lr, get_param_value
 
 logger = logging.getLogger(__name__)
 
@@ -234,6 +244,122 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
         )
+
+    # ------------------------------------------------------------------ #
+    # Distributed training step
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _distributed_world_size() -> int:
+        """The process-group world size (1 without a process group)."""
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            return torch.distributed.get_world_size()
+        return 1
+
+    def _answer_loss_parts(
+        self, model_output: torch.Tensor | AnswerLogits, batch: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """The (per-position NLL sum, count) over this rank's answer rows.
+
+        Accepts the answer-head path (:class:`AnswerLogits`) and the
+        full-logits path (the answer rows are read off ``labels``, the
+        same rows ``compute_loss`` scores).
+        """
+        if isinstance(model_output, AnswerLogits):
+            return answer_loss_parts(model_output)
+        labels = batch["labels"]
+        mask = labels[:, 1:] != IGNORE_INDEX
+        answers = AnswerLogits(
+            logits=model_output[:, :-1][mask],
+            targets=labels[:, 1:][mask],
+            mask=mask,
+        )
+        return answer_loss_parts(answers)
+
+    def training_step(
+        self, batch: dict[str, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
+        """One training step; under several devices, the global-mean loss.
+
+        With one device (no process group) this is exactly the parent's
+        step, byte for byte.  Under several devices and ``loss_on=
+        "answers"`` the per-rank rows of a global batch hold different
+        numbers of scored positions, so the per-rank means DDP's gradient
+        averaging would otherwise combine are not the global mean; the
+        step re-derives the global mean from the all-reduced counts (see
+        the module docstring).  The rest of the loop (gradient
+        accumulation, clipping, stepping, scheduling, LR logging)
+        mirrors
+        :meth:`research_lib.training.modules.DualOptimizerModule.training_step`;
+        only the loss and its logged value differ.
+
+        Returns:
+            The backward loss (the parent's mean at world size 1; the
+            global-mean-equivalent local loss under a process group).
+        """
+        world_size = self._distributed_world_size()
+        if self.loss_on is not LossOn.ANSWERS or world_size <= 1:
+            return super().training_step(batch, batch_idx)
+
+        opts = self.optimizers()
+        if not isinstance(opts, list):
+            opts = [opts]
+        grad_accum = self._get_current_grad_accum()
+        should_step = (batch_idx + 1) % grad_accum == 0
+
+        model_output = self.forward(**batch)
+        local_sum, local_count = self._answer_loss_parts(model_output, batch)
+        count = local_count.detach().clone()
+        torch.distributed.all_reduce(count, op=torch.distributed.ReduceOp.SUM)
+        global_count = int(count.item())
+        if global_count > 0:
+            # local_sum * W / global_count: DDP's average over the ranks
+            # of the gradients of this value is the gradient of the
+            # global mean (each rank contributes its own scored rows).
+            loss = local_sum * world_size / count
+            # The logged value is the global mean: reduce the sum too.
+            logged_sum = local_sum.detach().clone()
+            torch.distributed.all_reduce(logged_sum, op=torch.distributed.ReduceOp.SUM)
+            logged = logged_sum / count
+        else:
+            # No scored positions on any rank: nothing to optimise.
+            loss = torch.zeros_like(local_sum)
+            logged = loss
+        self.log("train/loss", logged, on_step=True, on_epoch=True, prog_bar=True)
+
+        scaled_loss = loss / grad_accum
+        self.manual_backward(scaled_loss)
+
+        if should_step:
+            if self.gradient_clip_value is not None and self.gradient_clip_value > 0:
+                for opt in opts:
+                    self.clip_gradients(
+                        opt,
+                        gradient_clip_val=self.gradient_clip_value,
+                        gradient_clip_algorithm=self.gradient_clip_algorithm,
+                    )
+            for i, opt in enumerate(opts):
+                if i == 0:
+                    opt.step()  # increments global_step
+                else:
+                    opt.optimizer.step()
+                opt.zero_grad()
+            if self._matrix_scheduler is not None:
+                self._matrix_scheduler.step()
+            if self._vector_scheduler is not None:
+                self._vector_scheduler.step()
+            self._optimizer_step_count += 1
+
+        self.log("train/grad_accum", float(grad_accum), on_step=True)
+        self.log(
+            "train/optimizer_step", float(self._optimizer_step_count), on_step=True
+        )
+        for i, opt in enumerate(opts):
+            self.log(f"train/lr_{i}", get_current_lr(opt), on_step=True)
+            momentum = get_param_value(opt, "momentum")
+            if momentum is not None:
+                self.log(f"train/momentum_{i}", momentum, on_step=True)
+        return loss
 
     # ------------------------------------------------------------------ #
     # Validation / test
