@@ -309,13 +309,15 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         too). Validation and test batches carry no ``"batch_index"`` and
         are left untouched. Outside Lightning (no trainer attached, or
         not in the training stage) the hook is a no-op and the position
-        only advances on in-process iteration. Under DDP the position is
-        the rank's next LOCAL batch index (global = local * world_size +
-        rank; ranks run in lockstep, so any rank's saved position is valid
-        for every rank), and :meth:`setup` raises when a val/test set size
-        is not divisible by the world size (DistributedSampler padding
-        would double-count examples). Batch *contents* are per-index
-        deterministic for any worker count and world size.
+        only advances on in-process iteration. Under several devices the
+        position is the GLOBAL batch index — the same on every rank (the
+        data stream is independent of the device count; see the module
+        docstring), so any rank's saved position is valid for every
+        rank, and :meth:`setup` raises when ``batch_size`` is not
+        divisible by the world size or a val/test set size is not
+        divisible by it (DistributedSampler padding would double-count
+        examples). Batch *contents* are per-index deterministic for any
+        worker count and world size.
 
     Example:
         >>> dm = SyntheticRecallDataModule(
