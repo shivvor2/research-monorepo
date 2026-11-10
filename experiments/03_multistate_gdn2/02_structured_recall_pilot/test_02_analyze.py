@@ -419,18 +419,20 @@ class TestCalibrationDamage:
         assert full["damage/slice=16"] == pytest.approx(0.2)
         assert pd.isna(full["damage/slice=32"])
 
-    def test_no_damage_reading_adds_no_damage_columns(
-        self, tmp_path, protocol, monkeypatch
+    def test_task_without_damage_reading_has_empty_damage_cells(
+        self, tmp_path, protocol
     ):
-        # No task registers a damage reading, so the schema carries no
-        # damage column (the column group is registry-driven).
-        monkeypatch.setattr(protocol, "TASK_DAMAGE", {})
+        # The toy task registers no damage reading, so its row holds an
+        # empty (NaN) cell under the schema's damage columns (which exist
+        # because other tasks register readings).
         rows = [self._rows(100)]
         out = tmp_path / "out"
         out.mkdir()
         _analyze.calibration(_table(rows), out)
         df = pd.read_csv(out / "calibration.csv")
-        assert not any(c.startswith("damage") for c in df.columns)
+        row = df.iloc[0]
+        assert pd.isna(row["damage/slice=16"])
+        assert pd.isna(row["damage/slice=32"])
 
 
 class TestPositiveControl:
@@ -2204,7 +2206,7 @@ class TestReportSchemasFixed:
     EF_HIGH = "test/acc/slice=16/class=untouched"
     EF_LOW = "test/acc/slice=16/class=sibling"
 
-    def _rs02_row(self, task, gate, kind):
+    def _task_row(self, task, gate, kind):
         if task == "entity_field":
             if kind == "calib":
                 return _row(
@@ -2268,7 +2270,7 @@ class TestReportSchemasFixed:
         for task in tasks:
             for gate in ("full", "kda"):
                 for kind in ("calib", "pc"):
-                    rows.append(self._rs02_row(task, gate, kind))
+                    rows.append(self._task_row(task, gate, kind))
         return rows
 
     def test_schema_is_protocol_driven_not_run_driven(self, tmp_path):
@@ -2299,15 +2301,23 @@ class TestReportSchemasFixed:
         # apply to holds NaN (never a dropped column).
         out = tmp_path / "out"
         out.mkdir()
-        _analyze.calibration(
-            _table(self._subset_rows(["entity_field", "mad_fuzzy"])), out
-        )
+        table = _table(self._subset_rows(["entity_field", "mad_fuzzy"]))
+        _analyze.calibration(table, out)
         df = pd.read_csv(out / "calibration.csv")
         ef = df[df["task"] == "entity_field"].iloc[0]
         assert pd.isna(ef["band"]) and pd.isna(ef["near_edge"])
         mad = df[df["task"] == "mad_fuzzy"].iloc[0]
         assert pd.isna(mad["damage/slice=16"])
         assert pd.isna(mad["damage/slice=32"])
+        # The same holds for the positive control: the MAD task declares no
+        # damage reading, so its report row is NaN under every per-gate
+        # damage column (the columns exist from the entity-field reading).
+        _analyze.positive_control(table, out)
+        pc = pd.read_csv(out / "positive_control.csv")
+        mad_pc = pc[pc["task"] == "mad_fuzzy"].iloc[0]
+        for col in pc.columns:
+            if col.startswith("damage_full/") or col.startswith("damage_kda/"):
+                assert pd.isna(mad_pc[col])
 
 
 class TestValuesUnchangedAgainstFixture:
@@ -2316,7 +2326,7 @@ class TestValuesUnchangedAgainstFixture:
         # written before this change: the new reports keep every value on
         # the shared columns (only the schema / empty-file handling and the
         # two seq_len columns change).
-        fixture = _PILOT / "fixtures" / "rs03_mixed"
+        fixture = _PILOT / "fixtures" / "mixed_tasks_before_fixed_schemas"
         table = pd.read_json(fixture / "table.json", orient="records")
         out = tmp_path / "out"
         out.mkdir()
