@@ -1,0 +1,8 @@
+kind,task,seq_len,layout,gate_mode,lambda_mode,decay_scheme,mixer,n_seeds,d_model,selected_lr,selected_weight_decay,mean_best_value,cell,cell_metric,damage/slice=16,damage/slice=32,gap_full_kda,band,near_edge
+single,entity_field,512,single,full,mlp,grouped,gated_delta,2,64,0.001,0.0,0.6,0.6,test/acc/slice=32/class=sibling,0.10000000000000009,0.15000000000000002,0.04999999999999993,,
+single,entity_field,512,single,kda,mlp,grouped,gated_delta,2,64,0.001,0.0,0.4,0.55,test/acc/slice=32/class=sibling,0.019999999999999907,0.04999999999999993,0.04999999999999993,,
+single,mad_fuzzy,256,single,full,mlp,grouped,gated_delta,2,64,0.001,0.0,0.2,0.2,test/acc_mad,,,-0.09999999999999998,in_band,False
+single,mad_fuzzy,256,single,kda,mlp,grouped,gated_delta,2,64,0.001,0.0,0.3,0.3,test/acc_mad,,,-0.09999999999999998,in_band,False
+single,mad_fuzzy,512,single,full,mlp,grouped,gated_delta,2,64,0.001,0.0,0.2,0.2,test/acc_mad,,,-0.09999999999999998,in_band,False
+single,mad_fuzzy,512,single,kda,mlp,grouped,gated_delta,2,64,0.001,0.0,0.3,0.3,test/acc_mad,,,-0.09999999999999998,in_band,False
+multi,entity_field,512,ws,full,mlp,grouped,gated_delta,2,64,0.0002,0.0,0.5,,,0.10000000000000009,,,,
