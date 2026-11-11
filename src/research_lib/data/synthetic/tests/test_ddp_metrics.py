@@ -82,8 +82,10 @@ def _accumulate(
     batches: list[dict[str, torch.Tensor]],
 ) -> dict[str, float]:
     """Accumulate the batches into every metric and return the combined
-    metric dict (the comparison surface)."""
-    torch.set_default_dtype(torch.float64)
+    metric dict (the comparison surface).  No default dtype is set here:
+    the batch logits are already have an explicit fp64 dtype and the
+    metrics count integer positions, so a global dtype change is not
+    needed (and would leak into the rest of the session)."""
     recall_mqar = RecallMetrics(tuple(MQ_CFG.slices))
     recall_ow = RecallMetrics(tuple(OW_CFG.slices), with_classes=True)
     macro = MacroTokenAccuracy(num_classes=_VOCAB)
