@@ -85,6 +85,7 @@ Note on Logging and Checkpointing:
 
 from . import (
     configs,
+    distributed,
     losses,
     modules,
     param_utils,
@@ -99,6 +100,7 @@ from . import (
 __all__ = [
     # Configs
     "configs",
+    "distributed",
     "losses",
     "modules",
     "param_utils",
