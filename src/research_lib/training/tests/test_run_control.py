@@ -26,6 +26,75 @@ class TestDisableTf32:
         assert flags["cudnn_allow_tf32"] is False
 
 
+class TestLauncherRanks:
+    """``lightning_launched_rank``: only Lightning's own launcher is
+    recognised, so a plain single-device run (including inside a
+    one-task Slurm allocation, which sets ``SLURM_PROCID`` for every
+    ``sbatch`` task) is rank 0, while a multi-task or unparseable Slurm
+    allocation, ``torchrun``'s ``RANK``, and a ``LOCAL_RANK`` without
+    the other Lightning variables are all refused."""
+
+    def _clear(self, monkeypatch):
+        for name in ("RANK", "LOCAL_RANK", "SLURM_PROCID", "WORLD_SIZE", "MASTER_PORT"):
+            monkeypatch.delenv(name, raising=False)
+
+    def test_no_launcher_variables_is_rank_zero(self, monkeypatch):
+        self._clear(monkeypatch)
+        assert rc.lightning_launched_rank() == 0
+
+    def test_one_task_slurm_allocation_is_rank_zero(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "0")
+        monkeypatch.setenv("SLURM_NTASKS", "1")
+        assert rc.lightning_launched_rank() == 0
+
+    def test_multi_task_slurm_allocation_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "1")
+        monkeypatch.setenv("SLURM_NTASKS", "2")
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.lightning_launched_rank()
+
+    def test_slurm_without_a_task_count_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "0")
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.lightning_launched_rank()
+
+    def test_slurm_unparseable_task_count_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "0")
+        monkeypatch.setenv("SLURM_NTASKS", "many")
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.lightning_launched_rank()
+
+    def test_torchrun_rank_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        with pytest.raises(RuntimeError, match="unsupported launcher"):
+            rc.lightning_launched_rank()
+
+    def test_multi_device_under_slurm(self):
+        """``refuse_multi_device_under_slurm`` refuses a device count other
+        than 1 only when ``SLURM_JOB_ID`` is set."""
+        import os
+
+        old = os.environ.get("SLURM_JOB_ID")
+        os.environ["SLURM_JOB_ID"] = "123"
+        try:
+            rc.refuse_multi_device_under_slurm(1)  # single device passes
+            with pytest.raises(RuntimeError, match="Slurm"):
+                rc.refuse_multi_device_under_slurm(2)
+        finally:
+            if old is None:
+                os.environ.pop("SLURM_JOB_ID", None)
+            else:
+                os.environ["SLURM_JOB_ID"] = old
+        # Outside an allocation a device count other than 1 is allowed.
+        rc.refuse_multi_device_under_slurm(2)
+
+
 class TestInShard:
     def test_membership(self):
         assert rc.in_shard(0, 0, 2) is True

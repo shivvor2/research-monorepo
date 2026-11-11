@@ -29,6 +29,7 @@ from research_lib.training.run_control import (
     disable_tf32,
     in_shard,
     lightning_launched_rank,
+    refuse_multi_device_under_slurm,
 )
 
 logger = logging.getLogger(__name__)
@@ -100,6 +101,8 @@ def begin_run(cfg: DictConfig) -> dict[str, bool] | None:
         )
         return precision_flags
 
+    # Inside a Slurm allocation each job runs a single device.
+    refuse_multi_device_under_slurm(cfg.training.get("devices"))
     stop = stop_requested(cfg)
     if stop is not None:
         logger.info(

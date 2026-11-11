@@ -103,6 +103,7 @@ from research_lib.training.run_control import (  # noqa: E402
 from research_lib.training.run_control import (
     in_shard,
     lightning_launched_rank,
+    refuse_multi_device_under_slurm,
     should_skip,
 )
 from research_lib.training.run_records import run_record_metadata  # noqa: E402
@@ -425,8 +426,10 @@ def run_job(cfg: DictConfig) -> None:
     # 0b. STOP file: while it exists, no new run starts. In a multirun
     # this ends the whole sweep (Hydra's job wrapper catches Exception,
     # not SystemExit); in a single run it just exits. The file is never
-    # deleted by the script. Decided by rank 0 only.
+    # deleted by the script. Decided by rank 0 only; a Slurm allocation
+    # runs a single device per job.
     if rank == 0:
+        refuse_multi_device_under_slurm(cfg.training.get("devices"))
         stop = stop_requested(cfg)
         if stop is not None:
             logger.info(

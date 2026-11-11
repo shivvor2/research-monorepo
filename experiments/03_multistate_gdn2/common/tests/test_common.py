@@ -25,6 +25,25 @@ from research_lib.layers.attention import CausalSelfAttention, MultistateGatedDe
 from research_lib.training.callbacks import config_hash
 
 
+def test_begin_run_refuses_multi_device_under_slurm(monkeypatch):
+    """Inside a Slurm allocation ``begin_run`` refuses a
+    ``training.devices`` other than the single integer 1 (multi-device
+    under Slurm is unsupported).  The refusal fires before the STOP/shard
+    checks, so it is testable without a Hydra context; the single-device
+    and outside-allocation paths are covered by the helper's unit tests."""
+    from common.launch import begin_run
+
+    cfg = OmegaConf.create(
+        {
+            "launch": {"stop_file": "STOP", "shard_index": 0, "num_shards": 1},
+            "training": {"devices": 2},
+        }
+    )
+    monkeypatch.setenv("SLURM_JOB_ID", "123")
+    with pytest.raises(RuntimeError, match="Slurm"):
+        begin_run(cfg)
+
+
 def _cfg(*, reserved_filler=0, tier=None):
     return OmegaConf.create(
         {
