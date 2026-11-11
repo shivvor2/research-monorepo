@@ -106,8 +106,10 @@ class _FixedEpochTrainDataset(IterableDataset):
 
         Raises:
             ValueError: ``world_size`` out of range, ``rank`` outside
-                ``[0, world_size)``, or ``batch_size`` not divisible by
-                ``world_size``.
+                ``[0, world_size)``, ``batch_size`` not divisible by
+                ``world_size``, or the last partial batch of each epoch
+                not divisible by ``world_size`` (every rank must hold
+                the same batch shape, and none may see an empty batch).
         """
         if world_size < 1:
             raise ValueError(f"world_size must be >= 1, got {world_size}")
@@ -118,6 +120,16 @@ class _FixedEpochTrainDataset(IterableDataset):
                 f"batch_size {self.batch_size} must be divisible by "
                 f"world_size {world_size} (a global batch is split into "
                 f"contiguous rank slices)"
+            )
+        remainder = self._n % self.batch_size
+        if remainder != 0 and remainder % world_size != 0:
+            raise ValueError(
+                f"each epoch's last batch has {remainder} rows "
+                f"(num_train {self._n} mod batch_size "
+                f"{self.batch_size}), not divisible by world_size "
+                f"{world_size}; the last batch of every epoch must split "
+                f"evenly across ranks so every rank holds the same batch "
+                f"shape and no rank sees an empty batch"
             )
         self.world_size = int(world_size)
         self.rank = int(rank)
@@ -338,8 +350,9 @@ class FixedSetRecallDataModule(L.LightningDataModule):
         level when it exceeds 0.001.
 
         Raises:
-            ValueError: ``batch_size`` not divisible by the world size, or
-                (as before) a validation or test set size not divisible
+            ValueError: ``batch_size`` not divisible by the world size,
+                the last partial batch of each epoch not divisible by it,
+                or (as before) a validation or test set size not divisible
                 by the world size (Lightning's DistributedSampler would
                 pad by duplicating rows and double-count examples).
         """

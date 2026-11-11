@@ -237,6 +237,82 @@ def test_fixed_set_rank_rows_are_contiguous_slices():
 # =============================================================================
 
 
+def _fixed_dm_with(num_train: int, batch_size: int):
+    """A fixed-set datamodule with a custom training-set size and batch
+    size (the MAD fuzzy generator at the smoke pad)."""
+    spec = require_task("mad_fuzzy")
+    assert spec.dataset_fn is not None and spec.row_fn is not None
+    return FixedSetRecallDataModule(
+        dataset_fn=spec.dataset_fn,
+        config=MAD_CFG,
+        to_row=spec.row_fn(MAD_CFG, MAD_PAD_TO),
+        num_train=num_train,
+        num_val=NUM_VAL,
+        num_test=NUM_TEST,
+        batch_size=batch_size,
+        train_seed=0,
+        val_seed=1_000_003,
+        test_seed=2_000_003,
+        num_workers=0,
+    )
+
+
+def test_fixed_set_last_partial_batch_splits_evenly():
+    """num_train=10, batch_size=4, W=2: the last epoch batch has 2 rows,
+    exactly one per rank, so every batch of the epoch — the partial one
+    included — splits evenly and the ranks' rows concatenate to the
+    single-device batch."""
+    single = _fixed_dm_with(num_train=10, batch_size=4)
+    single.setup()
+    whole = _fixed_batches(single, 3)  # one full epoch: 4 + 4 + 2 rows
+    assert [int(b["batch_index"]) for b in whole] == [0, 1, 2]
+    assert {b["labels"].shape[0] for b in whole} == {4, 2}
+
+    ranks = {}
+    for rank in (0, 1):
+        with patch(
+            "research_lib.data.synthetic.fixed_set.distributed_world_size_and_rank",
+            return_value=(2, rank),
+        ):
+            dm = _fixed_dm_with(num_train=10, batch_size=4)
+            dm.setup()
+            ranks[rank] = _fixed_batches(dm, 3)
+    for index, expected in enumerate(whole):
+        r0, r1 = ranks[0][index], ranks[1][index]
+        per = expected["input_ids"].shape[0] // 2
+        assert _content(r0) == _content(_slice_rows(expected, 0, per))
+        assert _content(r1) == _content(_slice_rows(expected, per, per))
+
+
+def test_fixed_set_last_partial_batch_must_split_evenly():
+    """The last partial batch of every epoch must split evenly across
+    ranks: a remainder smaller than the world size (or not a multiple of
+    it) is refused at setup, so no rank ever sees an empty batch."""
+    # num_train=9, batch_size=4, W=2: the last batch has 1 row < 2.
+    with patch(
+        "research_lib.data.synthetic.fixed_set.distributed_world_size_and_rank",
+        return_value=(2, 0),
+    ):
+        with pytest.raises(ValueError, match="last batch") as info:
+            _fixed_dm_with(num_train=9, batch_size=4).setup()
+        for fragment in ("9", "4", "2", "1"):
+            assert fragment in str(info.value)
+    # num_train=10, batch_size=4, W=4: the last batch has 2 rows < 4.
+    with patch(
+        "research_lib.data.synthetic.fixed_set.distributed_world_size_and_rank",
+        return_value=(4, 0),
+    ):
+        with pytest.raises(ValueError, match="last batch"):
+            _fixed_dm_with(num_train=10, batch_size=4).setup()
+    # Divisible partial batches and exact fits stay accepted.
+    with patch(
+        "research_lib.data.synthetic.fixed_set.distributed_world_size_and_rank",
+        return_value=(2, 0),
+    ):
+        _fixed_dm_with(num_train=10, batch_size=4).setup()  # 2 rows mod 4 % 2 == 0
+        _fixed_dm_with(num_train=8, batch_size=4).setup()  # no partial batch
+
+
 def test_batch_size_not_divisible_by_world_size_raises_at_setup():
     """``batch_size % world_size != 0`` raises at ``setup()``, naming both
     values, in both datamodules (a global batch must split evenly)."""
