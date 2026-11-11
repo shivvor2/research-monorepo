@@ -135,6 +135,17 @@ key, so a length-resolution rerun overrides `task.seq_len=256` and
 Outputs go under `analysis/` (one CSV per report); run records live under
 the launch directory's `runs/<task>/`.
 
+Each report's columns are fixed by `structured_recall_analysis/
+report_columns.py` and the protocol tables, never by which runs happen to
+have finished: the damage columns come from the tasks' damage readings
+(`damage/slice={n}`), the `band` / `near_edge` columns from the
+length-setting bands, and the per-gate damage of `positive_control` from
+the same readings. A report with no rows is written header-only, so a
+table is read the same way before and after its runs exist. Both
+`positive_control` and `safeguard` name the sequence length they read
+(`seq_len`); a column the code would write but the schema does not name
+is an error.
+
 ## Layout
 
 ```
