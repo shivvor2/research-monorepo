@@ -116,9 +116,13 @@ def lightning_launched_rank() -> int:
       a one-task allocation returns the ``LOCAL_RANK``-based rank as
       usual (multi-device runs inside Slurm stay unsupported — see
       :func:`refuse_multi_device_under_slurm`);
-    - ``LOCAL_RANK > 0`` without the other Lightning variables
-      (``WORLD_SIZE``, ``MASTER_PORT``) is not a Lightning child and is
-      refused too.
+    - ``LOCAL_RANK > 0`` without the launcher's master variables is not
+      a Lightning child and is refused too.  ``MASTER_PORT`` is the
+      durable signal: Lightning's cluster environment sets it for its
+      children (with ``MASTER_ADDR``, ``NODE_RANK`` and ``WORLD_SIZE``)
+      and only removes ``WORLD_SIZE`` in its post-fit teardown, so a
+      legitimate child still carries ``MASTER_PORT`` (and the gate that
+      calls this after ``fit`` must not require ``WORLD_SIZE``).
 
     Returns:
         The rank: 0 for the process that runs ``fit``, ``i > 0`` for a
@@ -128,7 +132,7 @@ def lightning_launched_rank() -> int:
     Raises:
         RuntimeError: An unsupported launcher's variables are present
             (``RANK``, a multi-task or unparseable Slurm allocation, or
-            ``LOCAL_RANK`` without the other Lightning variables).
+            ``LOCAL_RANK`` without the launcher's ``MASTER_PORT``).
     """
     if "RANK" in os.environ:
         raise RuntimeError(
@@ -149,15 +153,13 @@ def lightning_launched_rank() -> int:
                 "runs on one device"
             )
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    if local_rank > 0 and (
-        "WORLD_SIZE" not in os.environ or "MASTER_PORT" not in os.environ
-    ):
+    if local_rank > 0 and "MASTER_PORT" not in os.environ:
         raise RuntimeError(
             f"process was started by an unsupported launcher: LOCAL_RANK="
-            f"{local_rank} is set without the other Lightning launcher "
-            f"variables (WORLD_SIZE, MASTER_PORT); only Lightning's own "
-            f"subprocess launcher is supported: start the script once and "
-            f"let Lightning start the other ranks"
+            f"{local_rank} is set without the launcher's MASTER_PORT; "
+            f"only Lightning's own subprocess launcher is supported: "
+            f"start the script once and let Lightning start the other "
+            f"ranks"
         )
     return local_rank
 

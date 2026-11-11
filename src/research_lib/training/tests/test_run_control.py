@@ -75,22 +75,33 @@ class TestLauncherRanks:
         with pytest.raises(RuntimeError, match="unsupported launcher"):
             rc.lightning_launched_rank()
 
-    def test_local_rank_without_lightning_variables_is_refused(self, monkeypatch):
-        """A ``LOCAL_RANK`` by itself is not a Lightning child (Lightning
-        sets ``LOCAL_RANK`` together with ``WORLD_SIZE`` and
-        ``MASTER_PORT``), so it must not bypass the launch gate."""
+    def test_local_rank_without_master_port_is_refused(self, monkeypatch):
+        """A ``LOCAL_RANK`` without the launcher's ``MASTER_PORT`` is not a
+        Lightning child, so it must not bypass the launch gate."""
         self._clear(monkeypatch)
         monkeypatch.setenv("LOCAL_RANK", "2")
-        with pytest.raises(RuntimeError, match="LOCAL_RANK"):
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        with pytest.raises(RuntimeError, match="MASTER_PORT"):
             rc.lightning_launched_rank()
 
     def test_lightning_child_rank_returns_its_rank(self, monkeypatch):
         """A child rank Lightning started (``LOCAL_RANK`` with
-        ``WORLD_SIZE`` and ``MASTER_PORT``) is recognised and returned."""
+        ``MASTER_PORT``) is recognised and returned."""
         self._clear(monkeypatch)
         monkeypatch.setenv("LOCAL_RANK", "1")
-        monkeypatch.setenv("WORLD_SIZE", "2")
         monkeypatch.setenv("MASTER_PORT", "29500")
+        assert rc.lightning_launched_rank() == 1
+
+    def test_child_rank_after_lightning_teardown_is_recognised(self, monkeypatch):
+        """A ``LOCAL_RANK`` with ``MASTER_PORT`` but no ``WORLD_SIZE`` is
+        still a Lightning child: Lightning's cluster environment removes
+        ``WORLD_SIZE`` in its post-fit teardown, so the gate that runs
+        after ``fit`` (e.g. the final-checkpoint save) must not require
+        it."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        monkeypatch.setenv("MASTER_PORT", "29500")
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
         assert rc.lightning_launched_rank() == 1
 
     def test_multi_device_under_slurm(self):
