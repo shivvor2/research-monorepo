@@ -36,14 +36,31 @@ _SRC = _PROJECT.parents[1] / "src"
 _TRAIN = _PILOT / "01_train.py"
 
 
-def _run_train(cwd: Path, *overrides: str, env_extra: dict | None = None):
-    """Run the pilot's train script from ``cwd`` with the overrides."""
+def _run_train(
+    cwd: Path,
+    *overrides: str,
+    config: str = "test",
+    env_extra: dict | None = None,
+):
+    """Run the pilot's train script from ``cwd`` with the overrides.
+
+    Args:
+        cwd: The launch directory.
+        *overrides: Hydra overrides (a ``--multirun`` flag and sweep-file
+            ``+sweep=...`` go here, before any key=value overrides).
+        config: The ``--config-name`` (``None`` to use the default
+            ``config``).
+        env_extra: Extra environment variables for the subprocess.
+    """
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(
         p for p in (str(_SRC), str(_PROJECT), env.get("PYTHONPATH", "")) if p
     )
     env.update(env_extra or {})
-    cmd = [sys.executable, str(_TRAIN), "--config-name=test", *overrides]
+    cmd = [sys.executable, str(_TRAIN)]
+    if config is not None:
+        cmd.append(f"--config-name={config}")
+    cmd.extend(overrides)
     return subprocess.run(
         cmd,
         cwd=cwd,
@@ -75,10 +92,28 @@ def _final_checkpoint(cwd: Path, task: str) -> dict:
 
 
 def _lr_columns(curves: Path) -> list[tuple[str, str]]:
-    """The per-step LR values (both optimizer groups) of a curves file."""
+    """The per-step LR values (both optimizer groups) of a curves file.
+
+    Raises:
+        AssertionError: The LR monitor's first-optimizer column is missing
+            or holds no value, so a comparison of two empty column lists
+            could not pass.
+    """
     with open(curves) as f:
         rows = list(csv.DictReader(f))
-    return [(r.get("lr-AdamW", ""), r.get("lr-AdamW-1", "")) for r in rows]
+    first = [r.get("lr-AdamW", "") for r in rows]
+    assert any(column.strip() for column in first), (
+        "the LR-monitor column (lr-AdamW) is missing or empty in "
+        f"{curves}; a rename of its keys would let this comparison pass "
+        "vacuously"
+    )
+    return [(first[i], r.get("lr-AdamW-1", "")) for i, r in enumerate(rows)]
+
+
+def _hydra_job_dirs(launch: Path) -> list[Path]:
+    """The numeric Hydra job directories under ``<launch>/multirun/``
+    (one per sweep job; the children must not add more)."""
+    return sorted((launch / "multirun").glob("*/*/[0-9]*"))
 
 
 def _max_abs_diff(weights_a: dict, weights_b: dict) -> float:
@@ -136,6 +171,13 @@ def test_fixed_set_run_two_devices_matches_single_device(tmp_path):
     # device run and every rank of the multi-device run took the same
     # decision at the same step.
     assert record_one["stopping"]["early_stopped"] is True
+    # The monitored-value history (the early-stopped metric at each
+    # validation) is identical on 1 and 2 devices.
+    assert set(record_one["monitored"]) == set(record_two["monitored"])
+    for key in record_one["monitored"]:
+        assert record_one["monitored"][key] == pytest.approx(
+            record_two["monitored"][key], abs=1e-6
+        )
 
     weights_one = _final_checkpoint(runs["one"], "mad_fuzzy")
     weights_two = _final_checkpoint(runs["two"], "mad_fuzzy")
@@ -291,3 +333,42 @@ def test_hydra_multirun_two_jobs_two_devices_each(tmp_path):
             if "Lightning child rank" in line and seed_suffix in line
         ]
         assert len(lines) == 1, (seed_suffix, lines)
+    # The children reuse their job's run directory: exactly one numeric
+    # Hydra job dir per record, each holding exactly one .hydra (no
+    # second output directory appears per job).
+    job_dirs = _hydra_job_dirs(launch)
+    assert len(job_dirs) == len(records), job_dirs
+    for job_dir in job_dirs:
+        hydra_dirs = list(job_dir.glob(".hydra"))
+        assert len(hydra_dirs) == 1, (job_dir, hydra_dirs)
+    assert len(list((launch / "multirun").rglob("*/.hydra"))) == len(records)
+
+
+@pytest.mark.slow
+def test_sweep_file_task_comes_from_the_sweeper(tmp_path):
+    """A multirun launched as the pilots launch one: ``+sweep=<file>``
+    with the task in the sweeper params (not the command line).  One
+    record per job, the task and seed coming from the params.  This
+    runs single-device: a multi-device ``+sweep`` run is not supported,
+    because Lightning's subprocess launcher cannot re-invoke a
+    sweep-file-driven command (only command-line ``--multirun`` sweeps
+    work multi-device, covered above), so the device-count machinery is
+    exercised there."""
+    launch = tmp_path / "sweep"
+    launch.mkdir()
+    result = _run_train(launch, "--multirun", "+sweep=test_ddp_multirun", config=None)
+    assert result.returncode == 0, result.stderr[-4000:]
+    records = list((launch / "runs" / "mad_fuzzy").glob("*.json"))
+    assert len(records) == 2, f"expected two records, got {[r.name for r in records]}"
+    seeds = set()
+    tasks = set()
+    statuses = set()
+    for record_path in records:
+        with open(record_path) as f:
+            record = json.load(f)
+        seeds.add(record["seed"])
+        tasks.add(record["config"]["task"]["name"])
+        statuses.add(record["status"])
+    assert seeds == {0, 1}
+    assert tasks == {"mad_fuzzy"}  # the task came from the sweeper params
+    assert statuses == {"test_done"}
