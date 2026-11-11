@@ -75,6 +75,24 @@ class TestLauncherRanks:
         with pytest.raises(RuntimeError, match="unsupported launcher"):
             rc.lightning_launched_rank()
 
+    def test_local_rank_without_lightning_variables_is_refused(self, monkeypatch):
+        """A ``LOCAL_RANK`` by itself is not a Lightning child (Lightning
+        sets ``LOCAL_RANK`` together with ``WORLD_SIZE`` and
+        ``MASTER_PORT``), so it must not bypass the launch gate."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("LOCAL_RANK", "2")
+        with pytest.raises(RuntimeError, match="LOCAL_RANK"):
+            rc.lightning_launched_rank()
+
+    def test_lightning_child_rank_returns_its_rank(self, monkeypatch):
+        """A child rank Lightning started (``LOCAL_RANK`` with
+        ``WORLD_SIZE`` and ``MASTER_PORT``) is recognised and returned."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.setenv("MASTER_PORT", "29500")
+        assert rc.lightning_launched_rank() == 1
+
     def test_multi_device_under_slurm(self):
         """``refuse_multi_device_under_slurm`` refuses a device count other
         than 1 only when ``SLURM_JOB_ID`` is set."""
