@@ -64,6 +64,7 @@ from collections.abc import Sequence
 
 import torch
 
+from ._shared import distributed_reduce_device
 from .mqar import IGNORE_INDEX
 from .overwrite import OVERWRITE_CLASSES
 
@@ -465,8 +466,12 @@ class RecallMetrics:
         seq_zero_count) with a SUM all-reduce across ranks when a distributed
         process group with world size > 1 is initialized.
 
-        Reduces clones, so the accumulator itself is unchanged and further
-        updates / repeated compute() calls stay correct.
+        Under an NCCL process group the clones are moved to the current
+        CUDA device first: a rank that saw no batch keeps its counters on
+        the CPU (they are created there by ``reset``), and NCCL rejects
+        CPU tensors.  Reduces clones, so the accumulator itself is
+        unchanged and further updates / repeated compute() calls stay
+        correct.
         """
         # Every counter exists on every rank (created in :meth:`reset`;
         # ``distance_counts`` only when distance bins are configured), so
@@ -486,6 +491,15 @@ class RecallMetrics:
             and torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
         ):
+            device = distributed_reduce_device(counts)
+            if device != counts.device:
+                counts = counts.to(device)
+                unknown = unknown.to(device)
+                if distance_counts is not None:
+                    distance_counts = distance_counts.to(device)
+                seq_acc_sum = seq_acc_sum.to(device)
+                seq_count = seq_count.to(device)
+                seq_zero_count = seq_zero_count.to(device)
             torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(unknown, op=torch.distributed.ReduceOp.SUM)
             if distance_counts is not None:

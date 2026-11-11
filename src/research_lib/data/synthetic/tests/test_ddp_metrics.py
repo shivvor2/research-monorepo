@@ -31,6 +31,8 @@ from research_lib.data.synthetic.metrics import RecallMetrics
 from research_lib.data.synthetic.mqar import MQARConfig, generate_mqar
 from research_lib.data.synthetic.overwrite import OverwriteConfig, generate_overwrite
 
+CUDA_ONLY = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+
 _B = 4
 MQ_CFG = MQARConfig(vocab_size=128, seq_len=32, num_kv_pairs=(2, 4))
 OW_CFG = OverwriteConfig(
@@ -164,6 +166,32 @@ def test_metrics_equal_the_single_process_values_two_gloo_processes():
     assert "mqar/acc" in reference and "ow/acc/class=distant" in reference
     ranked = _run_two("split")
     _assert_same(ranked, reference)
+
+
+@CUDA_ONLY
+def test_recall_metrics_reduces_on_cuda_under_nccl(monkeypatch):
+    """A fresh ``RecallMetrics`` with CPU counters (a rank that saw no
+    batch) moves every clone to the current CUDA device before the
+    all-reduces when the process group's backend is NCCL (NCCL rejects
+    CPU tensors), and the emission flags land on the same device."""
+    all_reduced: list[str] = []
+
+    def fake_all_reduce(tensor, op=None):
+        all_reduced.append(tensor.device.type)
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(
+        torch.distributed, "get_backend", lambda: torch.distributed.Backend.NCCL
+    )
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(torch.distributed, "all_reduce", fake_all_reduce)
+
+    metrics = RecallMetrics(slice_values=(4, 8))
+    metrics.compute()  # no updates: every counter is still on the CPU
+
+    assert all_reduced, "no all-reduce ran"
+    assert all(device == "cuda" for device in all_reduced), all_reduced
 
 
 @pytest.mark.slow
