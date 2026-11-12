@@ -26,6 +26,105 @@ class TestDisableTf32:
         assert flags["cudnn_allow_tf32"] is False
 
 
+class TestLauncherRanks:
+    """``lightning_launched_rank``: only Lightning's own launcher is
+    recognised, so a plain single-device run (including inside a
+    one-task Slurm allocation, which sets ``SLURM_PROCID`` for every
+    ``sbatch`` task) is rank 0, while a multi-task or unparseable Slurm
+    allocation, ``torchrun``'s ``RANK``, and a ``LOCAL_RANK`` without
+    the other Lightning variables are all refused."""
+
+    def _clear(self, monkeypatch):
+        for name in (
+            "RANK",
+            "LOCAL_RANK",
+            "SLURM_PROCID",
+            "SLURM_JOB_ID",
+            "SLURM_NTASKS",
+            "SLURM_STEP_NUM_TASKS",
+            "WORLD_SIZE",
+            "MASTER_PORT",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+    def test_no_launcher_variables_is_rank_zero(self, monkeypatch):
+        self._clear(monkeypatch)
+        assert rc.lightning_launched_rank() == 0
+
+    def test_one_task_slurm_allocation_is_rank_zero(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "0")
+        monkeypatch.setenv("SLURM_NTASKS", "1")
+        assert rc.lightning_launched_rank() == 0
+
+    def test_multi_task_slurm_allocation_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "1")
+        monkeypatch.setenv("SLURM_NTASKS", "2")
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.lightning_launched_rank()
+
+    def test_slurm_without_a_task_count_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "0")
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.lightning_launched_rank()
+
+    def test_slurm_unparseable_task_count_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("SLURM_PROCID", "0")
+        monkeypatch.setenv("SLURM_NTASKS", "many")
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.lightning_launched_rank()
+
+    def test_torchrun_rank_is_refused(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        with pytest.raises(RuntimeError, match="unsupported launcher"):
+            rc.lightning_launched_rank()
+
+    def test_local_rank_without_master_port_is_refused(self, monkeypatch):
+        """A ``LOCAL_RANK`` without the launcher's ``MASTER_PORT`` is not a
+        Lightning child, so it must not bypass the launch gate."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("LOCAL_RANK", "2")
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        with pytest.raises(RuntimeError, match="MASTER_PORT"):
+            rc.lightning_launched_rank()
+
+    def test_lightning_child_rank_returns_its_rank(self, monkeypatch):
+        """A child rank Lightning started (``LOCAL_RANK`` with
+        ``MASTER_PORT``) is recognised and returned."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        monkeypatch.setenv("MASTER_PORT", "29500")
+        assert rc.lightning_launched_rank() == 1
+
+    def test_child_rank_after_lightning_teardown_is_recognised(self, monkeypatch):
+        """A ``LOCAL_RANK`` with ``MASTER_PORT`` but no ``WORLD_SIZE`` is
+        still a Lightning child: Lightning's cluster environment removes
+        ``WORLD_SIZE`` in its post-fit teardown, so the gate that runs
+        after ``fit`` (e.g. the final-checkpoint save) must not require
+        it."""
+        self._clear(monkeypatch)
+        monkeypatch.setenv("LOCAL_RANK", "1")
+        monkeypatch.setenv("MASTER_PORT", "29500")
+        monkeypatch.delenv("WORLD_SIZE", raising=False)
+        assert rc.lightning_launched_rank() == 1
+
+    def test_multi_device_under_slurm(self, monkeypatch):
+        """``refuse_multi_device_under_slurm`` refuses a device count other
+        than 1 only when ``SLURM_JOB_ID`` is set."""
+        monkeypatch.setenv("SLURM_JOB_ID", "123")
+        rc.refuse_multi_device_under_slurm(1)  # single device passes
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.refuse_multi_device_under_slurm(2)
+        monkeypatch.delenv("SLURM_JOB_ID")
+        # Outside an allocation a device count other than 1 is allowed.
+        rc.refuse_multi_device_under_slurm(2)
+
+
 class TestInShard:
     def test_membership(self):
         assert rc.in_shard(0, 0, 2) is True

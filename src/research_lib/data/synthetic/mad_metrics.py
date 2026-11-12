@@ -36,6 +36,7 @@ from __future__ import annotations
 import torch
 from torch import Tensor
 
+from ._shared import distributed_reduce_device
 from .mqar import IGNORE_INDEX
 
 
@@ -138,8 +139,8 @@ class TokenAccuracy:
         correct = self._correct.clone()
         total = self._total.clone()
         if torch.distributed.is_available() and torch.distributed.is_initialized():
-            if torch.distributed.get_backend() == torch.distributed.Backend.NCCL:
-                device = torch.device("cuda", torch.cuda.current_device())
+            device = distributed_reduce_device(correct)
+            if device != correct.device:
                 correct = correct.to(device)
                 total = total.to(device)
             torch.distributed.all_reduce(correct, op=torch.distributed.ReduceOp.SUM)

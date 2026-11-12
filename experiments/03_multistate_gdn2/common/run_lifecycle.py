@@ -42,7 +42,11 @@ from research_lib.training.callbacks import (
 from research_lib.training.configs import ScheduleConfig
 from research_lib.training.modules import MGDN2SyntheticRecallModule
 from research_lib.training.presets import build_weight_decay_configs
-from research_lib.training.run_control import RUN_DONE_STATUS, assert_fit_finished
+from research_lib.training.run_control import (
+    RUN_DONE_STATUS,
+    assert_fit_finished,
+    lightning_launched_rank,
+)
 from research_lib.training.run_records import read_record
 from research_lib.training.scheduling import (
     EpochCosineSchedule,
@@ -185,22 +189,8 @@ def run_length(cfg: DictConfig, regime: TaskRegime) -> RunLength:
 
     Raises:
         ValueError: A fixed-set task without ``training.epochs``.
-        RuntimeError: A fixed-set task on more than one device.
     """
     if regime is TaskRegime.FIXED_SET:
-        devices = cfg.training.get("devices")  # keep as-is: never resolve auto
-        if devices is not None and not (isinstance(devices, int) and devices == 1):
-            # Each rank takes its own batch per optimizer step, so the
-            # steps-per-epoch (and the derived max_steps / validation
-            # interval / per-epoch schedule) would be off by the world
-            # size.  ``auto`` is not resolved (on a multi-GPU machine it can
-            # mean several devices); any non-1 value raises.  Multi-device
-            # fixed-set training is a separate follow-up, which removes this
-            # guard.
-            raise RuntimeError(
-                "fixed-set training is single-device in this version: "
-                f"training.devices must be 1 (got {devices})"
-            )
         epochs = int(cfg.training.get("epochs") or 0)
         if epochs < 1:
             raise ValueError(
@@ -460,7 +450,12 @@ def create_callbacks_reset_curves(
         monitor_key=monitor_key,
         record_extra=record_extra,
     )
-    if bool(cfg.logging.csv.enabled):
+    # Rank 0 only: under Lightning's subprocess launcher the child ranks
+    # build the same callbacks before the process group exists, and two
+    # ranks racing to remove and re-create the same directory would
+    # corrupt each other's fresh curves.  The CSV logger writes on rank 0
+    # only anyway, so its reset belongs to rank 0 as well.
+    if bool(cfg.logging.csv.enabled) and lightning_launched_rank() == 0:
         curves_dir = Path(cfg.logging.csv.save_dir) / run_id
         if curves_dir.exists():
             import shutil
@@ -510,8 +505,10 @@ def post_fit(
         # The final checkpoint for the mechanism probes: saved after fit
         # and before test, atomically (the test pass must never run on
         # weights that were not saved; a partial file must never be
-        # observed).
-        if cfg.output.save_final_checkpoint:
+        # observed).  Rank 0 only: under Lightning's subprocess launcher
+        # every rank runs this body, and two ranks writing the same file
+        # would race on the atomic replace.
+        if cfg.output.save_final_checkpoint and lightning_launched_rank() == 0:
             path = Path(cfg.output.runs_dir) / f"{run_id}.pt"
             atomic_torch_save(module.model.state_dict(), path)
             logger.info("Saved final checkpoint to %s", path)

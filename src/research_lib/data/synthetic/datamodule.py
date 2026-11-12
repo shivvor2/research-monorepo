@@ -6,17 +6,22 @@ fixed validation/test sets, so training never reuses examples (protocol
 functions of a seed).
 
 - **Train:** an :class:`~torch.utils.data.IterableDataset` yielding whole
-  batches (dicts of stacked int64 tensors). Batch ``i`` is generated from
-  ``np.random.SeedSequence([train_seed, i])``, so the stream is
-  deterministic per ``(train_seed, batch index)`` and independent of the
-  worker count: worker ``w`` of rank ``r`` yields the stream positions
-  ``n + w, n + w + num_workers, ...`` starting at the rank's next local
-  index ``n`` (at a fresh start ``n = 0`` this is the classic ``w, w +
-  num_workers, ...`` sharding), and the GLOBAL batch index of a local
-  index is ``(local) * world_size + rank``, so the ranks' global indices
-  are disjoint and together cover the stream in lockstep, and after a
-  resume the fetch order continues the stream exactly (next, next+1,
-  ..., for any worker count).
+  batches (dicts of stacked int64 tensors). ``batch_size`` is the
+  **global** batch size: batch ``i`` is generated from
+  ``np.random.SeedSequence([train_seed, i])`` exactly as on one device,
+  and rank ``r`` keeps the contiguous rows ``[r * B / W, (r + 1) * B /
+  W)`` of it (``batch_size`` must be divisible by the world size).  The
+  stream is therefore deterministic per ``(train_seed, batch index)``,
+  independent of the worker count and of the device count: worker ``w``
+  of a rank yields the stream positions ``n + w, n + w + num_workers,
+  ...`` starting at the rank's next index ``n`` (at a fresh start
+  ``n = 0`` this is the classic ``w, w + num_workers, ...`` sharding),
+  every rank iterates the same global batch indices in the same order,
+  and after a resume the fetch order continues the stream exactly
+  (next, next+1, ..., for any worker count).  The rank identity is
+  captured by the datamodule's :meth:`SyntheticRecallDataModule.setup`
+  (which runs in the rank process) and stored on the dataset; a dataset
+  used directly falls back to world size 1, rank 0 and says so, once.
 - **Validation / test:** generated once in :meth:`setup`:
   ``num_val_per_slice`` / ``num_test_per_slice`` examples per slice value
   (``D`` for MQAR, ``K`` for overwrite), concatenated into one fixed set,
@@ -24,17 +29,17 @@ functions of a seed).
   must differ from each other and from any train seed (defaults do).
 
 Resumption: :meth:`state_dict` / :meth:`load_state_dict` carry the next
-batch index, so a resumed run continues the same stream — **exactly, for
-any ``num_workers``**: every training batch carries its global batch index
-in the ``"batch_index"`` key, and :meth:`on_before_batch_transfer` —
-called by Lightning in the training loop, in the main process, before the
-batch is moved to the device — advances the stream position from it (with
-``num_workers=0`` the in-process iterator advances the position directly
-as well). Validation and test batches carry no ``"batch_index"`` and are
-untouched; the hook is a no-op without an attached trainer in the training
-stage (i.e. outside Lightning). Under DDP the position is the rank's next
-LOCAL batch index (global = local * world_size + rank); ranks consume the
-stream in lockstep, so any rank's saved position is valid for every rank.
+batch index (the GLOBAL batch index — the same on every rank), so a
+resumed run continues the same stream — **exactly, for any
+``num_workers`` and any device count**: every training batch carries its
+global batch index in the ``"batch_index"`` key, and
+:meth:`on_before_batch_transfer` — called by Lightning in the training
+loop, in the main process, before the batch is moved to the device —
+advances the stream position from it (with ``num_workers=0`` the
+in-process iterator advances the position directly as well). Validation
+and test batches carry no ``"batch_index"`` and are untouched; the hook
+is a no-op without an attached trainer in the training stage (i.e.
+outside Lightning).
 """
 
 from __future__ import annotations
@@ -65,17 +70,26 @@ class _SyntheticTrainDataset(IterableDataset):
 
     Batch ``i`` is generated from ``np.random.SeedSequence([train_seed, i])``
     (via :func:`_batch_seed`) and carries its global batch index in the
-    ``"batch_index"`` key (int64 scalar tensor). The dataset keeps a
-    per-rank LOCAL counter ``next_local_idx``; worker ``w`` of
-    ``num_workers`` yields the local indices ``next_local_idx + w +
-    k * num_workers`` (at a fresh start: ``w, w + num_workers, ...``, the
-    same as owning the indices ≡ ``w (mod num_workers)``), so after a
-    resume the DataLoader's fetch order continues the stream exactly —
-    next, next+1, … — and every batch's content depends only on its
-    global index ``local * world_size + rank`` (world size / rank from
-    :func:`_distributed_world_size_and_rank`, i.e. 1 / 0 without a process
-    group, so global == local in single-process runs). No (rank, worker)
-    pair ever produces the same global index twice.
+    ``"batch_index"`` key (int64 scalar tensor); a rank keeps the
+    contiguous rows ``[r * B / W, (r + 1) * B / W)`` of it (``B =
+    batch_size``, divisibility is enforced by
+    :meth:`SyntheticRecallDataModule.setup`).  The dataset keeps one
+    GLOBAL cursor ``next_local_idx`` (the next global batch index;
+    every rank holds the same value, so any rank's saved position is
+    valid for every rank).  Worker ``w`` of ``num_workers`` yields the
+    indices ``next_local_idx + w + k * num_workers`` (at a fresh start:
+    ``w, w + num_workers, ...``), so after a resume the DataLoader's
+    fetch order continues the stream exactly — next, next+1, … — and a
+    batch's content depends only on its index and the rank's row slice.
+    No (rank, worker) pair ever yields the same batch index twice, and
+    the stream is independent of ``num_workers`` and of the world size.
+
+    The rank identity is stored on the dataset (world size / rank,
+    captured by the datamodule's ``setup`` in the rank process, never
+    queried from :mod:`torch.distributed` inside a DataLoader worker,
+    where under the ``spawn`` start method no process group exists).  A
+    dataset built outside a datamodule keeps the (1, 0) fallback and
+    logs that it did, once, on the first ``__iter__``.
     """
 
     def __init__(
@@ -84,14 +98,70 @@ class _SyntheticTrainDataset(IterableDataset):
         config: TaskConfig,
         batch_size: int,
         train_seed: int,
+        world_size: int = 1,
+        rank: int = 0,
     ) -> None:
-        """Args follow :class:`SyntheticRecallDataModule`."""
+        """Args follow :class:`SyntheticRecallDataModule` (plus the
+        default (1, 0) rank identity)."""
         super().__init__()
         self.task = task
         self.config = config
         self.batch_size = batch_size
         self.train_seed = train_seed
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self._identity_explicit = False
+        self._identity_fallback_logged = False
         self.next_local_idx = 0
+
+    def set_identity(self, world_size: int, rank: int) -> None:
+        """Capture the rank identity this dataset iterates as.
+
+        Called by the datamodule's ``setup`` (which runs in the rank
+        process after the process group is initialised); the value is
+        stored on the dataset so the iterator never queries
+        :mod:`torch.distributed` (a DataLoader worker under the
+        ``spawn`` start method has no process group).
+
+        Args:
+            world_size: The number of ranks.
+            rank: This rank's index, in ``[0, world_size)``.
+
+        Raises:
+            ValueError: ``world_size`` out of range, ``rank`` outside
+                ``[0, world_size)``, or ``batch_size`` not divisible by
+                ``world_size`` (a global batch must split evenly).
+        """
+        if world_size < 1:
+            raise ValueError(f"world_size must be >= 1, got {world_size}")
+        if not 0 <= rank < world_size:
+            raise ValueError(f"rank {rank} out of range for world_size {world_size}")
+        if self.batch_size % world_size != 0:
+            raise ValueError(
+                f"batch_size {self.batch_size} must be divisible by "
+                f"world_size {world_size} (a global batch is split into "
+                f"contiguous rank slices)"
+            )
+        self.world_size = int(world_size)
+        self.rank = int(rank)
+        self._identity_explicit = True
+
+    def _rank_rows(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """This rank's contiguous rows of a global batch.
+
+        Rank ``r`` of world size ``W`` keeps the rows ``[r * B / W,
+        (r + 1) * B / W)`` of the ``B``-row global batch; at world size
+        1 the whole batch is kept (the single-device form).
+        """
+        if self.world_size <= 1:
+            return batch
+        rows = batch["input_ids"].shape[0]
+        per_rank = rows // self.world_size
+        start = self.rank * per_rank
+        return {
+            key: (value[start : start + per_rank] if value.dim() >= 1 else value)
+            for key, value in batch.items()
+        }
 
     def generate_batch(self, index: int) -> dict[str, torch.Tensor]:
         """Generate batch ``index`` (pure; independent of call order).
@@ -110,25 +180,33 @@ class _SyntheticTrainDataset(IterableDataset):
         return batch
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
-        world_size, rank = _distributed_world_size_and_rank()
+        world_size, rank = self.world_size, self.rank
+        if not self._identity_explicit and not self._identity_fallback_logged:
+            self._identity_fallback_logged = True
+            logger.info(
+                "%s iterated without a captured rank identity (it was built "
+                "outside a datamodule); assuming world size 1, rank 0",
+                type(self).__name__,
+            )
         info = torch.utils.data.get_worker_info()
         worker_id = info.id if info is not None else 0
         num_workers = info.num_workers if info is not None else 1
         # Worker w yields the stream positions next_local_idx + w + k*W.
         # At a fresh start (next_local_idx == 0) this is exactly "worker w
-        # owns the local indices ≡ w (mod W)", as before.  After a resume it
+        # owns the indices ≡ w (mod W)", as before.  After a resume it
         # also aligns the DataLoader's round-robin (worker 0's batch is
-        # fetched first) with the stream position, so the consumed global
-        # batch sequence continues in exact order - next, next+1, ... -
-        # with no replay and no skip, for any worker count and world size
-        # (with the previous "smallest owned index >= next_local_idx" start,
-        # a resume at a position not divisible by num_workers would fetch
+        # fetched first) with the stream position, so the consumed batch
+        # sequence continues in exact order - next, next+1, ... - with no
+        # replay and no skip, for any worker count and world size (with
+        # the previous "smallest owned index >= next_local_idx" start, a
+        # resume at a position not divisible by num_workers would fetch
         # the batches in a rotated order and skip one index per rotation;
-        # the contents per index are unchanged either way). The global
-        # batch index of a local index is local * world_size + rank.
+        # the contents per index are unchanged either way). A batch's
+        # index is its GLOBAL index (every rank iterates the same batch
+        # indices); the rank's row slice is applied per batch.
         local = self.next_local_idx + worker_id
         while True:
-            batch = self.generate_batch(local * world_size + rank)
+            batch = self._rank_rows(self.generate_batch(local))
             if info is None:
                 # In-process iteration advances the (parent's) stream
                 # position; with DataLoader workers the parent's position is
@@ -231,13 +309,15 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         too). Validation and test batches carry no ``"batch_index"`` and
         are left untouched. Outside Lightning (no trainer attached, or
         not in the training stage) the hook is a no-op and the position
-        only advances on in-process iteration. Under DDP the position is
-        the rank's next LOCAL batch index (global = local * world_size +
-        rank; ranks run in lockstep, so any rank's saved position is valid
-        for every rank), and :meth:`setup` raises when a val/test set size
-        is not divisible by the world size (DistributedSampler padding
-        would double-count examples). Batch *contents* are per-index
-        deterministic for any worker count and world size.
+        only advances on in-process iteration. Under several devices the
+        position is the GLOBAL batch index — the same on every rank (the
+        data stream is independent of the device count; see the module
+        docstring), so any rank's saved position is valid for every
+        rank, and :meth:`setup` raises when ``batch_size`` is not
+        divisible by the world size or a val/test set size is not
+        divisible by it (DistributedSampler padding would double-count
+        examples). Batch *contents* are per-index deterministic for any
+        worker count and world size.
 
     Example:
         >>> dm = SyntheticRecallDataModule(
@@ -325,15 +405,25 @@ class SyntheticRecallDataModule(L.LightningDataModule):
     def setup(self, stage: str | None = None) -> None:
         """Build the train stream and the fixed val/test sets (idempotent).
 
-        Logs (via ``logging``, never ``print``): task, config, slice values
-        and set sizes.
+        Captures the rank identity (world size / rank from
+        :func:`_distributed_world_size_and_rank`; ``setup`` runs in the
+        rank process, so the process group — if any — is initialised
+        here) on the train dataset, and enforces ``batch_size`` /
+        world-size divisibility.  Logs (via ``logging``, never
+        ``print``): task, config, slice values and set sizes.
 
         Args:
             stage: Lightning stage; unused (all artifacts are built lazily
                 and cached).
+
+        Raises:
+            ValueError: ``batch_size`` not divisible by the world size, or
+                (as before) a non-positive world size / non-divisible
+                val/test set size.
         """
-        self._ensure_train_dataset()
-        world_size, _ = _distributed_world_size_and_rank()
+        dataset = self._ensure_train_dataset()
+        world_size, rank = _distributed_world_size_and_rank()
+        dataset.set_identity(world_size, rank)
         if world_size > 1:
             num_slices = len(tuple(self.task_config.slices))  # type: ignore[attr-defined]
             for set_name, per_slice, arg_name in (
@@ -432,14 +522,14 @@ class SyntheticRecallDataModule(L.LightningDataModule):
     def state_dict(self) -> dict[str, Any]:
         """Serialize the train stream position.
 
-        The value is the next LOCAL batch index (per rank; equal to the
-        global batch index at world size 1). Ranks consume the stream in
-        lockstep, so any rank's value is valid for every rank.
+        The value is the next GLOBAL batch index (the same on every
+        rank; at world size 1 it equals today's local index, so existing
+        checkpoints keep their meaning).
         """
         return {"next_batch_idx": int(self._ensure_train_dataset().next_local_idx)}
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
-        """Resume the train stream from a serialized local batch index."""
+        """Resume the train stream from a serialized global batch index."""
         self._ensure_train_dataset().next_local_idx = int(state_dict["next_batch_idx"])
 
     def on_before_batch_transfer(
@@ -451,6 +541,8 @@ class SyntheticRecallDataModule(L.LightningDataModule):
         (before it is moved to the device), including when the train stream
         is consumed through DataLoader workers, so the position that
         :meth:`state_dict` serializes is exact for any ``num_workers``.
+        Under several devices every rank consumes the same global batch
+        indices, so the cursor advances by one per batch on every rank.
         Validation and test batches carry no ``"batch_index"`` and are
         returned untouched, as is any batch observed without an attached
         trainer in the training stage (outside Lightning).
@@ -469,8 +561,8 @@ class SyntheticRecallDataModule(L.LightningDataModule):
             and trainer is not None
             and bool(getattr(trainer, "training", False))
         ):
-            world_size, _ = _distributed_world_size_and_rank()
             index = int(batch["batch_index"])
-            # global = local * world_size + rank  =>  local = index // world_size.
-            self._ensure_train_dataset().next_local_idx = index // world_size + 1
+            # The batch index is the global index; every rank iterates the
+            # same indices, so the shared cursor advances by one per batch.
+            self._ensure_train_dataset().next_local_idx = index + 1
         return batch

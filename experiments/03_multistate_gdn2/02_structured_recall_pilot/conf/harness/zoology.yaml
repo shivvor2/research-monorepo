@@ -47,4 +47,5 @@ training:
   answer_head: true
   compile: false
   log_every_n_steps: 50
-  devices: 1               # one device per job (the run lock is per-machine)
+  accelerator: auto        # auto | cpu (CPU multi-process smoke runs)
+  devices: 1               # global batches are split across these devices

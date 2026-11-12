@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
@@ -79,6 +80,118 @@ def disable_tf32() -> dict[str, bool]:
         "cuda_matmul_allow_tf32": bool(torch.backends.cuda.matmul.allow_tf32),
         "cudnn_allow_tf32": bool(torch.backends.cudnn.allow_tf32),
     }
+
+
+def _slurm_task_count() -> int | None:
+    """The number of tasks a Slurm allocation launched, or ``None`` when
+    it cannot be established (no task-count variable, or an unparseable
+    one)."""
+    for name in ("SLURM_STEP_NUM_TASKS", "SLURM_NTASKS"):
+        value = os.environ.get(name)
+        if value is not None:
+            try:
+                return int(value)
+            except ValueError:
+                return None
+    return None
+
+
+def lightning_launched_rank() -> int:
+    """The rank this process holds under Lightning's subprocess launcher.
+
+    Only Lightning's own launcher is supported: the training script is
+    started once (rank 0), and at ``Trainer.fit`` Lightning re-executes
+    the script for ranks 1..W-1 as child processes.  A child is told
+    apart from an ordinary rank-0 start by the environment the launcher
+    sets: ``LOCAL_RANK`` plus ``MASTER_PORT``, ``NODE_RANK`` and
+    ``WORLD_SIZE`` (lightning 2.6.6, the version pinned in ``uv.lock``;
+    it never sets a global ``RANK``).  Lightning also sets ``LOCAL_RANK``
+    (0) in the **rank-0** process's environment while ``fit`` runs its
+    subprocess launcher; that is harmless for a single run — a child
+    only ever exists there, because several devices under a Hydra
+    multirun are refused — and it is the reason multiruns with several
+    devices are not supported.  Launches that start ranks independently
+    are refused here:
+
+    - ``torchrun`` sets ``RANK``, which Lightning never does;
+    - a Slurm allocation sets ``SLURM_PROCID`` for every task, including
+      a one-task ``sbatch`` script, so it is refused only when several
+      tasks were launched (``SLURM_STEP_NUM_TASKS`` / ``SLURM_NTASKS``
+      parse to more than one) or the task count cannot be established;
+      a one-task allocation returns the ``LOCAL_RANK``-based rank as
+      usual (multi-device runs inside Slurm stay unsupported — see
+      :func:`refuse_multi_device_under_slurm`);
+    - ``LOCAL_RANK > 0`` without the launcher's master variables is not
+      a Lightning child and is refused too.  ``MASTER_PORT`` is the
+      durable signal: Lightning's cluster environment sets it for its
+      children (with ``MASTER_ADDR``, ``NODE_RANK`` and ``WORLD_SIZE``)
+      and only removes ``WORLD_SIZE`` in its post-fit teardown, so a
+      legitimate child still carries ``MASTER_PORT`` (and the gate that
+      calls this after ``fit`` must not require ``WORLD_SIZE``).
+
+    Returns:
+        The rank: 0 for the process that runs ``fit``, ``i > 0`` for a
+        child rank Lightning started.  At world size 1 this is 0 (no
+        rank variables are set).
+
+    Raises:
+        RuntimeError: An unsupported launcher's variables are present
+            (``RANK``, a multi-task or unparseable Slurm allocation, or
+            ``LOCAL_RANK`` without the launcher's ``MASTER_PORT``).
+    """
+    if "RANK" in os.environ:
+        raise RuntimeError(
+            "process was started by an unsupported launcher (found RANK); "
+            "only Lightning's own subprocess launcher is supported: start "
+            "the script once and let Lightning start the other ranks "
+            "(torchrun is refused)"
+        )
+    if "SLURM_PROCID" in os.environ:
+        ntasks = _slurm_task_count()
+        if ntasks is None or ntasks > 1:
+            raise RuntimeError(
+                "process was started by an unsupported launcher: a Slurm "
+                "allocation with several tasks (SLURM_PROCID is set, and "
+                "SLURM_STEP_NUM_TASKS/SLURM_NTASKS are missing or > 1); "
+                "only Lightning's own subprocess launcher is supported "
+                "for multi-device runs — inside an allocation each job "
+                "runs on one device"
+            )
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if local_rank > 0 and "MASTER_PORT" not in os.environ:
+        raise RuntimeError(
+            f"process was started by an unsupported launcher: LOCAL_RANK="
+            f"{local_rank} is set without the launcher's MASTER_PORT; "
+            f"only Lightning's own subprocess launcher is supported: "
+            f"start the script once and let Lightning start the other "
+            f"ranks"
+        )
+    return local_rank
+
+
+def refuse_multi_device_under_slurm(devices: Any) -> None:
+    """Refuse more than one device inside a Slurm allocation.
+
+    Slurm sets ``SLURM_JOB_ID`` in the environment of every ``sbatch`` /
+    ``srun`` job, including a one-task one.  Inside an allocation each
+    job runs a single device (the pilots' run machinery is per-machine
+    and the run lock is not shared across allocation tasks); multi-device
+    runs use Lightning's own launcher outside Slurm.
+
+    Args:
+        devices: The configured ``training.devices`` value.
+
+    Raises:
+        RuntimeError: When ``SLURM_JOB_ID`` is set and ``devices`` is not
+            the single integer 1.
+    """
+    if "SLURM_JOB_ID" in os.environ and not (isinstance(devices, int) and devices == 1):
+        raise RuntimeError(
+            f"training.devices={devices} inside a Slurm allocation "
+            f"(SLURM_JOB_ID is set) is not supported: each job runs on "
+            f"one device inside an allocation; multi-device runs use "
+            f"Lightning's own launcher outside Slurm"
+        )
 
 
 def assert_fit_finished(trainer: L.Trainer) -> None:

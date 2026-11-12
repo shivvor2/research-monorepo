@@ -34,7 +34,7 @@ for _path in (_PROJECT, _PILOT):
 
 from common import conf_resolvers  # noqa: E402,F401  (registers config resolvers)
 from common.conf_resolvers import padded_generated_length  # noqa: E402,F401
-from common.launch import begin_run, claimed_run  # noqa: E402
+from common.launch import begin_run, claimed_run, lightning_launched_rank  # noqa: E402
 from common.registries import (  # noqa: E402
     build_extra_metrics,
     config_type_of_task,
@@ -242,109 +242,140 @@ def run_job(cfg: DictConfig) -> None:
         config_hash(OmegaConf.to_container(cfg, resolve=True), HASH_EXCLUDE),
         cfg.seed,
     )
+    rank = lightning_launched_rank()
+    if rank > 0:
+        # A rank Lightning's subprocess launcher started: rank 0 already
+        # ran the launch gate (STOP file, shard membership, skip and the
+        # run lock); the child runs the same configuration alongside it.
+        # A child exists only for a single run — several devices under a
+        # Hydra multirun are refused.
+        logger.info(
+            "Lightning child rank %d: running %s without the launch gate",
+            rank,
+            run_id,
+        )
+        _run_body(cfg, run_id, precision_flags, lr, weight_decay)
+        return
     with claimed_run(cfg, run_id, identity, protocol_tiers=PROTOCOL_TIERS) as reason:
         if reason is not None:
             logger.info("skip %s: %s", run_id, reason)
             return
-        L.seed_everything(cfg.seed)
-        task = str(cfg.task.name)
-        task_config = build_task_config(cfg)
-        spec = require_task(task)
-        regime = spec.regime
-        length = run_length(cfg, regime)
-        monitor_key = str(cfg.training.monitor_key)
+        _run_body(cfg, run_id, precision_flags, lr, weight_decay)
 
-        if regime is TaskRegime.FIXED_SET:
-            # Fixed, chunk-padded rows: the run's max_seq_len must be the
-            # derived padded length (assert_fixed_set_padding).
-            padded = assert_fixed_set_padding(cfg)
-            to_row = spec.row_fn(task_config, pad_to=padded)
-            datamodule = FixedSetRecallDataModule(
-                dataset_fn=spec.dataset_fn,
-                config=task_config,
-                to_row=to_row,
-                num_train=cfg.task.num_train,
-                num_val=cfg.task.num_val,
-                num_test=cfg.task.num_test,
-                batch_size=cfg.training.batch_size,
-                train_seed=cfg.seed,
-                val_seed=cfg.task.val_seed,
-                test_seed=cfg.task.test_seed,
-                num_workers=cfg.data.num_workers,
-            )
-        else:
-            datamodule = SyntheticRecallDataModule(
-                task=task,
-                task_config=task_config,
-                batch_size=cfg.training.batch_size,
-                num_val_per_slice=cfg.data.num_val_per_slice,
-                num_test_per_slice=cfg.data.num_test_per_slice,
-                train_seed=cfg.seed,
-                val_seed=cfg.task.val_seed,
-                test_seed=cfg.task.test_seed,
-                num_workers=cfg.data.num_workers,
-            )
 
-        # 0. Model through the harness registry; the mixer kind comes from
-        # model.mixer (the run, not the harness).
-        harness = require_harness(str(cfg.harness.name))
-        model = harness(cfg)
-        if bool(getattr(cfg.training, "compile", False)):
-            model = torch.compile(model)
-        extra_metrics = build_extra_metrics(
-            list(cfg.task.get("extra_metrics") or ()),
-            vocab_size=int(cfg.task.vocab_size),
+def _run_body(
+    cfg: DictConfig,
+    run_id: str,
+    precision_flags: dict[str, bool],
+    lr: float,
+    weight_decay: float,
+) -> None:
+    """One run's body (fit + test + the run JSON write), gate passed.
+
+    Runs on the launch-gate's rank 0 and on every rank Lightning's
+    subprocess launcher starts for the same run; each rank builds its own
+    data stream slices, model and module (the shared record, curves and
+    W&B writes are rank-zero-only).
+    """
+    L.seed_everything(cfg.seed)
+    task = str(cfg.task.name)
+    task_config = build_task_config(cfg)
+    spec = require_task(task)
+    regime = spec.regime
+    length = run_length(cfg, regime)
+    monitor_key = str(cfg.training.monitor_key)
+
+    if regime is TaskRegime.FIXED_SET:
+        # Fixed, chunk-padded rows: the run's max_seq_len must be the
+        # derived padded length (assert_fixed_set_padding).
+        padded = assert_fixed_set_padding(cfg)
+        to_row = spec.row_fn(task_config, pad_to=padded)
+        datamodule = FixedSetRecallDataModule(
+            dataset_fn=spec.dataset_fn,
+            config=task_config,
+            to_row=to_row,
+            num_train=cfg.task.num_train,
+            num_val=cfg.task.num_val,
+            num_test=cfg.task.num_test,
+            batch_size=cfg.training.batch_size,
+            train_seed=cfg.seed,
+            val_seed=cfg.task.val_seed,
+            test_seed=cfg.task.test_seed,
+            num_workers=cfg.data.num_workers,
         )
-        module = build_module(
-            cfg,
-            model,
-            lr,
-            spec.slice_values(task_config),
-            weight_decay=weight_decay,
-            regime=regime,
-            monitor_key=monitor_key,
-            class_names=spec.class_names,
-            extra_metrics=extra_metrics,
+    else:
+        datamodule = SyntheticRecallDataModule(
+            task=task,
+            task_config=task_config,
+            batch_size=cfg.training.batch_size,
+            num_val_per_slice=cfg.data.num_val_per_slice,
+            num_test_per_slice=cfg.data.num_test_per_slice,
+            train_seed=cfg.seed,
+            val_seed=cfg.task.val_seed,
+            test_seed=cfg.task.test_seed,
+            num_workers=cfg.data.num_workers,
         )
 
-        # The run record's caller-owned top-level fields (the model class,
-        # the training regime and the derived run length).
-        record_extra = {
-            "model_class": type(model).__name__,
-            "task_regime": regime.value,
-            "epochs": int(cfg.training.get("epochs") or 0) or None,
-            "steps_per_epoch": length.steps_per_epoch,
-            "max_steps": length.max_steps,
-            "weight_decay": weight_decay,
-        }
-        callbacks = create_callbacks_reset_curves(
-            cfg,
-            run_id,
-            precision_flags,
-            lr=lr,
-            monitor_key=monitor_key,
-            record_extra=record_extra,
-        )
-        loggers = create_loggers(cfg, run_id)
+    # 0. Model through the harness registry; the mixer kind comes from
+    # model.mixer (the run, not the harness).
+    harness = require_harness(str(cfg.harness.name))
+    model = harness(cfg)
+    if bool(getattr(cfg.training, "compile", False)):
+        model = torch.compile(model)
+    extra_metrics = build_extra_metrics(
+        list(cfg.task.get("extra_metrics") or ()),
+        vocab_size=int(cfg.task.vocab_size),
+    )
+    module = build_module(
+        cfg,
+        model,
+        lr,
+        spec.slice_values(task_config),
+        weight_decay=weight_decay,
+        regime=regime,
+        monitor_key=monitor_key,
+        class_names=spec.class_names,
+        extra_metrics=extra_metrics,
+    )
 
-        trainer = L.Trainer(
-            max_steps=length.max_steps,
-            val_check_interval=length.val_check_interval,
-            precision=cfg.training.precision,
-            callbacks=callbacks,
-            logger=loggers,
-            accelerator="auto",
-            devices=cfg.training.devices,
-            enable_progress_bar=True,
-            log_every_n_steps=cfg.training.log_every_n_steps,
-        )
+    # The run record's caller-owned top-level fields (the model class,
+    # the training regime and the derived run length).
+    record_extra = {
+        "model_class": type(model).__name__,
+        "task_regime": regime.value,
+        "epochs": int(cfg.training.get("epochs") or 0) or None,
+        "steps_per_epoch": length.steps_per_epoch,
+        "max_steps": length.max_steps,
+        "weight_decay": weight_decay,
+    }
+    callbacks = create_callbacks_reset_curves(
+        cfg,
+        run_id,
+        precision_flags,
+        lr=lr,
+        monitor_key=monitor_key,
+        record_extra=record_extra,
+    )
+    loggers = create_loggers(cfg, run_id)
 
-        logger.info("Starting training (run_id=%s)...", run_id)
-        trainer.fit(module, datamodule=datamodule)
-        post_fit(cfg, trainer, module, callbacks, run_id)
-        trainer.test(module, datamodule=datamodule)
-        upload_run_record_artifact(cfg, run_id, trainer.is_global_zero)
-        logger.info("Run complete (run_id=%s).", run_id)
+    trainer = L.Trainer(
+        max_steps=length.max_steps,
+        val_check_interval=length.val_check_interval,
+        precision=cfg.training.precision,
+        callbacks=callbacks,
+        logger=loggers,
+        accelerator=cfg.training.accelerator,
+        devices=cfg.training.devices,
+        enable_progress_bar=True,
+        log_every_n_steps=cfg.training.log_every_n_steps,
+    )
+
+    logger.info("Starting training (run_id=%s)...", run_id)
+    trainer.fit(module, datamodule=datamodule)
+    post_fit(cfg, trainer, module, callbacks, run_id)
+    trainer.test(module, datamodule=datamodule)
+    upload_run_record_artifact(cfg, run_id, trainer.is_global_zero)
+    logger.info("Run complete (run_id=%s).", run_id)
 
 
 def _walk(node: object, *keys: str) -> object | None:

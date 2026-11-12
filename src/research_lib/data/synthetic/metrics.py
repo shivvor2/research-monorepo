@@ -49,9 +49,10 @@ synchronize the CUDA stream under ``torch.cuda.set_sync_debug_mode``).
 Answers whose ``slice_id`` is not among the configured ``slice_values`` are
 counted in a separate on-device counter and reported by
 :meth:`RecallMetrics.compute` (``ValueError``). Under a distributed
-process group with world size > 1, ``compute()`` first SUM-all-reduces the
-count tensor (and the unknown-slice counter) across ranks, so the metrics
-are global. Computation stays on the logits' device; ``compute()`` returns
+process group with world size > 1, ``compute()`` first SUM-all-reduces
+every counter across ranks (a rank that saw no batch reduces zeros), so
+the metrics are global and every rank emits the same key set.
+Computation stays on the logits' device; ``compute()`` returns
 Python floats.
 """
 
@@ -63,6 +64,7 @@ from collections.abc import Sequence
 
 import torch
 
+from ._shared import distributed_reduce_device
 from .mqar import IGNORE_INDEX
 from .overwrite import OVERWRITE_CLASSES
 
@@ -120,10 +122,13 @@ class RecallMetrics:
     :meth:`compute` for the metric dict. For overwrite batches
     (``key_class``/``old_labels`` present) the class-conditioned keys are
     accumulated too. All counts live in one long tensor of shape
-    ``(num_slices, 5, 3)`` on the logits' device; ``update()`` performs no
-    host synchronization, and ``compute()`` SUM-all-reduces the counts
-    across ranks when a distributed process group with world size > 1 is
-    initialized (so the metrics are global).
+    ``(num_slices, 5, 3)`` (created in :meth:`reset`, on the first
+    predictions' device after the first update) on the logits' device;
+    ``update()`` performs no host synchronization, and ``compute()``
+    SUM-all-reduces every counter across ranks when a distributed process
+    group with world size > 1 is initialized — including a rank that saw
+    no batch, whose counters are zeros — so the metrics are global and
+    the key set is the same on every rank.
 
     Args:
         slice_values: the slice values that can occur in the batches
@@ -186,6 +191,11 @@ class RecallMetrics:
             raise ValueError("class_names entries must be non-empty strings")
         self._slice_values = values
         self._num_slices = len(values)
+        # The device the counters live on after the first update (the
+        # first pass's predictions); ``reset`` re-creates them there so
+        # updating never moves them again (an H2D copy would be a host
+        # sync under CUDA's sync-debug mode).
+        self._device: torch.device | None = None
         self._class_names = names
         self._num_classes = len(names)
         # The count tensor's class axis: the classes plus the no-class
@@ -212,25 +222,53 @@ class RecallMetrics:
         self.reset()
 
     def reset(self) -> None:
-        """Zero all counters."""
+        """Zero all counters.
+
+        Every counter is created here (on CPU on the first pass; on the
+        previous pass's device afterwards), so a rank that never sees a
+        batch still holds the tensors its ``compute`` all-reduces (any
+        rank skipping a reduce with a missing tensor would stall the
+        others), and the updates never need to move the counters again.
+        """
         # One long tensor of shape (num_slices, num_classes + 1, 3): the
         # class axis is the task's classes plus the "no class" bucket
         # (class metrics off), axis 2 = (answers, correct, leaked).
-        # Created lazily on the device
-        # of the first update; the unknown-slice counter is a scalar.
-        self._counts: torch.Tensor | None = None
-        self._unknown: torch.Tensor | None = None
+        device = self._device if self._device is not None else torch.device("cpu")
+        self._counts: torch.Tensor = torch.zeros(
+            (self._num_slices, self._num_class_cols, 3),
+            dtype=torch.long,
+            device=device,
+        )
+        # The unknown-slice counter (answer positions whose slice_id is not
+        # among ``slice_values``) is a scalar.
+        self._unknown: torch.Tensor = torch.zeros((), dtype=torch.long, device=device)
         # Per-sequence accuracy accumulator: sum of per-sequence accuracies
         # (float64 to avoid any rounding question in tie-breaks), count of
         # sequences with at least one answer, and count of sequences with no
         # answers (reported by compute).
-        self._seq_acc_sum: torch.Tensor | None = None
-        self._seq_count: torch.Tensor | None = None
-        self._seq_zero_count: torch.Tensor | None = None
+        self._seq_acc_sum: torch.Tensor = torch.zeros(
+            self._num_slices, dtype=torch.double, device=device
+        )
+        self._seq_count: torch.Tensor = torch.zeros(
+            self._num_slices, dtype=torch.long, device=device
+        )
+        self._seq_zero_count: torch.Tensor = torch.zeros(
+            self._num_slices, dtype=torch.long, device=device
+        )
         # Write-distance counts, one more axis: (num_slices, num_bins, 3)
         # for (answers, correct, leaked) per (slice, distance bin). Only
-        # accumulated for batches that carry ``write_distance``.
-        self._distance_counts: torch.Tensor | None = None
+        # accumulated for batches that carry ``write_distance`` (their
+        # counts are zeros elsewhere); a rank with no such batch still
+        # holds the tensor for the reduce.
+        self._distance_counts: torch.Tensor | None = (
+            torch.zeros(
+                (self._num_slices, len(self._distance_bins) - 1, 3),
+                dtype=torch.long,
+                device=device,
+            )
+            if self._distance_bins is not None
+            else None
+        )
         self._has_class_batches = False
         self._has_distance_batches = False
 
@@ -271,13 +309,19 @@ class RecallMetrics:
         targets = batch["labels"][:, 1:]
         mask = targets != IGNORE_INDEX
         device = preds.device
-        if self._counts is None or self._unknown is None:
-            self._counts = torch.zeros(
-                (self._num_slices, self._num_class_cols, 3),
-                dtype=torch.long,
-                device=device,
-            )
-            self._unknown = torch.zeros((), dtype=torch.long, device=device)
+        if self._counts.device != device:
+            # The counters of :meth:`reset` (CPU on the first pass) move
+            # to the predictions' device the first time a batch arrives;
+            # remember it so ``reset`` re-creates them there and no later
+            # update moves them again (no host sync).
+            self._counts = self._counts.to(device)
+            self._unknown = self._unknown.to(device)
+            self._seq_acc_sum = self._seq_acc_sum.to(device)
+            self._seq_count = self._seq_count.to(device)
+            self._seq_zero_count = self._seq_zero_count.to(device)
+            if self._distance_counts is not None:
+                self._distance_counts = self._distance_counts.to(device)
+            self._device = device
         correct = (preds == targets) & mask
 
         with_classes = self._with_classes
@@ -337,16 +381,6 @@ class RecallMetrics:
             torch.zeros_like(seq_correct, dtype=torch.double),
         )
         seq_rows = row_pos[:, 0]
-        if self._seq_acc_sum is None or self._seq_count is None:
-            self._seq_acc_sum = torch.zeros(
-                self._num_slices, dtype=torch.double, device=device
-            )
-            self._seq_count = torch.zeros(
-                self._num_slices, dtype=torch.long, device=device
-            )
-            self._seq_zero_count = torch.zeros(
-                self._num_slices, dtype=torch.long, device=device
-            )
         self._seq_acc_sum.index_add_(0, seq_rows, seq_acc)
         self._seq_count.index_add_(0, seq_rows, seq_valid.long())
         self._seq_zero_count.index_add_(0, seq_rows, seq_zero.long())
@@ -362,11 +396,8 @@ class RecallMetrics:
         if self._distance_bins is not None and "write_distance" in batch:
             bins = self._distance_bins
             num_bins = len(bins) - 1
-            if self._distance_counts is None:
-                self._distance_counts = torch.zeros(
-                    (self._num_slices, num_bins, 3), dtype=torch.long, device=device
-                )
-                self._has_distance_batches = True
+            assert self._distance_counts is not None
+            self._has_distance_batches = True
             distances = batch["write_distance"].to(device)[:, 1:]
             # A distance below the first edge is in no bin ([lo, hi) bins,
             # the last running to infinity). bins[0] >= 0 is validated at
@@ -427,50 +458,59 @@ class RecallMetrics:
         torch.Tensor,
         torch.Tensor,
         torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
-        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
         """(counts, unknown, distance_counts, seq_acc_sum, seq_count,
         seq_zero_count) with a SUM all-reduce across ranks when a distributed
         process group with world size > 1 is initialized.
 
-        Reduces clones, so the accumulator itself is unchanged and further
-        updates / repeated compute() calls stay correct.
+        Under an NCCL process group the clones are moved to the current
+        CUDA device first: a rank that saw no batch keeps its counters on
+        the CPU (they are created there by ``reset``), and NCCL rejects
+        CPU tensors.  Reduces clones, so the accumulator itself is
+        unchanged and further updates / repeated compute() calls stay
+        correct.
         """
-        assert self._counts is not None and self._unknown is not None
-        counts, unknown = self._counts, self._unknown
-        distance_counts = self._distance_counts
-        seq_acc_sum = self._seq_acc_sum
-        seq_count = self._seq_count
-        seq_zero_count = self._seq_zero_count
+        # Every counter exists on every rank (created in :meth:`reset`;
+        # ``distance_counts`` only when distance bins are configured), so
+        # the collectives below match on every rank: a rank that saw no
+        # batch (or no distance batch) reduces zeros instead of skipping
+        # the call, which would stall the others.
+        counts = self._counts.clone()
+        unknown = self._unknown.clone()
+        distance_counts = (
+            self._distance_counts.clone() if self._distance_counts is not None else None
+        )
+        seq_acc_sum = self._seq_acc_sum.clone()
+        seq_count = self._seq_count.clone()
+        seq_zero_count = self._seq_zero_count.clone()
         if (
             torch.distributed.is_available()
             and torch.distributed.is_initialized()
             and torch.distributed.get_world_size() > 1
         ):
-            counts = counts.clone()
-            unknown = unknown.clone()
+            device = distributed_reduce_device(counts)
+            if device != counts.device:
+                counts = counts.to(device)
+                unknown = unknown.to(device)
+                if distance_counts is not None:
+                    distance_counts = distance_counts.to(device)
+                seq_acc_sum = seq_acc_sum.to(device)
+                seq_count = seq_count.to(device)
+                seq_zero_count = seq_zero_count.to(device)
             torch.distributed.all_reduce(counts, op=torch.distributed.ReduceOp.SUM)
             torch.distributed.all_reduce(unknown, op=torch.distributed.ReduceOp.SUM)
             if distance_counts is not None:
-                distance_counts = distance_counts.clone()
                 torch.distributed.all_reduce(
                     distance_counts, op=torch.distributed.ReduceOp.SUM
                 )
-            if seq_acc_sum is not None:
-                seq_acc_sum = seq_acc_sum.clone()
-                seq_count = seq_count.clone()
-                seq_zero_count = seq_zero_count.clone()
-                torch.distributed.all_reduce(
-                    seq_acc_sum, op=torch.distributed.ReduceOp.SUM
-                )
-                torch.distributed.all_reduce(
-                    seq_count, op=torch.distributed.ReduceOp.SUM
-                )
-                torch.distributed.all_reduce(
-                    seq_zero_count, op=torch.distributed.ReduceOp.SUM
-                )
+            torch.distributed.all_reduce(seq_acc_sum, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(seq_count, op=torch.distributed.ReduceOp.SUM)
+            torch.distributed.all_reduce(
+                seq_zero_count, op=torch.distributed.ReduceOp.SUM
+            )
         return counts, unknown, distance_counts, seq_acc_sum, seq_count, seq_zero_count
 
     def compute(self) -> dict[str, float]:
@@ -503,17 +543,27 @@ class RecallMetrics:
             ValueError: if any accumulated answer carried a ``slice_id``
                 outside ``slice_values``.
         """
-        if self._counts is None or self._unknown is None:
-            counts = torch.zeros((self._num_slices, 5, 3), dtype=torch.long)
-            unknown = torch.zeros((), dtype=torch.long)
-            distance_counts = self._distance_counts
-            seq_acc_sum = self._seq_acc_sum
-            seq_count = self._seq_count
-            seq_zero_count = self._seq_zero_count
-        else:
-            counts, unknown, distance_counts, seq_acc_sum, seq_count, seq_zero_count = (
-                self._global_counts()
+        counts, unknown, distance_counts, seq_acc_sum, seq_count, seq_zero_count = (
+            self._global_counts()
+        )
+        # The key set every rank emits must agree: a class / distance
+        # family observed by any rank is emitted by every rank (the counts
+        # are already reduced, so the values are global).
+        has_class = bool(self._has_class_batches)
+        has_distance = bool(self._has_distance_batches)
+        if (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        ):
+            flags = torch.tensor(
+                [int(has_class), int(has_distance)],
+                dtype=torch.long,
+                device=counts.device,  # NCCL rejects CPU tensors
             )
+            torch.distributed.all_reduce(flags, op=torch.distributed.ReduceOp.SUM)
+            has_class = bool(flags[0].item())
+            has_distance = bool(flags[1].item())
         num_unknown = int(unknown)
         if num_unknown != 0:
             raise ValueError(
@@ -547,7 +597,7 @@ class RecallMetrics:
                 continue
             acc_n, _, _ = _ratio(stats)
             out[f"acc/slice={value}"] = acc_n
-        if self._has_class_batches:
+        if has_class:
             for c in range(self._num_classes):
                 stats = counts[:, c, :].sum(dim=0)
                 if int(stats[0]) == 0:
@@ -572,7 +622,7 @@ class RecallMetrics:
         # old-value leakage per bin, overall and per (slice, bin), for
         # overwritten keys only (single-class answers carry no distance).
         # Empty bins and (slice, bin) cells are omitted, never emitted 0.0.
-        if distance_counts is not None:
+        if has_distance and distance_counts is not None:
             bins = self._distance_bins
             labels = []
             for lo, hi in zip(bins[:-1], bins[1:]):

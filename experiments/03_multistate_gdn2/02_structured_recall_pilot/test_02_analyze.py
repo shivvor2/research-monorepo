@@ -1254,9 +1254,13 @@ class TestEmptyRunsDir:
 
 class TestSweepTiersRegistered:
     def test_every_sweep_tier_is_a_protocol_tier(self):
+        # Test-only sweep files (``test_*``) drive the end-to-end tests and
+        # are not protocol sweeps; the invariant covers the real ones.
         sweep_dir = _PILOT / "conf" / "sweep"
         registered = _analyze._protocol.PROTOCOL_TIERS
         for path in sorted(sweep_dir.glob("*.yaml")):
+            if path.stem.startswith("test_"):
+                continue
             cfg = OmegaConf.load(path)
             tier = str(OmegaConf.select(cfg, "experiment.tier"))
             assert (

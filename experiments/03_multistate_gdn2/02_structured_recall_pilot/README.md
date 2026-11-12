@@ -35,6 +35,39 @@ python 01_train.py --config-name=debug task=entity_field model.mixer=attention
 python 01_train.py --config-name=debug task=mad_fuzzy model.mixer=attention
 ```
 
+## Running on several devices
+
+``training.batch_size`` is the **global** batch: batch ``i`` is produced
+exactly as on one device (same generator call, same permutation slice,
+same seed) and every rank keeps the contiguous rows
+``[rank * batch_size / world_size, (rank + 1) * batch_size / world_size)``
+of it, so the data stream, the steps per epoch, the epoch boundaries and
+the LR schedule do not depend on the device count (``batch_size`` must be
+divisible by the world size; ``training.devices`` and
+``training.accelerator`` are operational keys outside the run identity).
+The training loss is the global mean over all ranks' scored positions.
+The only supported launcher is Lightning's own: start the script once
+and let Lightning start the other ranks (``torchrun`` / ``srun`` are
+refused); the launch gate (STOP file, shard membership, skip and run
+lock) is decided by rank 0, and record, curves and W&B writes stay on
+rank 0.  Multi-device runs are **single runs only**: Lightning's
+subprocess launcher re-executes the whole sweep in each child, so a
+Hydra multirun with several devices is refused at the gate — a sweep
+runs one device per job (use shards to run several jobs on one
+machine).
+
+A CPU smoke of a multi-device run (two processes, gloo):
+
+```
+python 01_train.py --config-name=test task=mqar \
+  training.devices=2 training.accelerator=cpu
+python 01_train.py --config-name=test task=mad_fuzzy \
+  training.devices=2 training.accelerator=cpu
+```
+
+The `test` config's val/test sizes are divisible by 2 and 4, so any of
+those device counts works.
+
 ## Tasks
 
 Each task adds its own generator, config and sweeps.

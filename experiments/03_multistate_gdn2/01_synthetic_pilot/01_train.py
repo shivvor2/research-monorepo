@@ -52,7 +52,11 @@ if str(_PROJECT) not in sys.path:
 # The shared run machinery. The names imported here are the modules'
 # public surfaces; the pilot keeps only its protocol and run_job below.
 from common.harnesses import build_zoology  # noqa: E402
-from common.launch import job_num, stop_requested  # noqa: E402
+from common.launch import (  # noqa: E402
+    job_num,
+    refuse_multi_device_in_multirun,
+    stop_requested,
+)
 from common.layout import wandb_kwargs as wandb_logger_kwargs  # noqa: E402
 from common.run_id import HASH_EXCLUDE, make_run_id  # noqa: E402
 
@@ -100,7 +104,12 @@ from research_lib.training.run_control import assert_fit_finished
 from research_lib.training.run_control import (  # noqa: E402
     disable_tf32 as set_precision_flags,
 )
-from research_lib.training.run_control import in_shard, should_skip
+from research_lib.training.run_control import (
+    in_shard,
+    lightning_launched_rank,
+    refuse_multi_device_under_slurm,
+    should_skip,
+)
 from research_lib.training.run_records import run_record_metadata  # noqa: E402
 
 logger = logging.getLogger(__name__)
@@ -399,9 +408,21 @@ def run_job(cfg: DictConfig) -> None:
     Wrapped by :func:`main`, which checks the W&B credentials first and
     closes the W&B run afterwards.
     """
-    # 0. Precision first: fp32 without TF32.
+    # 0. Precision first: fp32 without TF32 (every rank, the launch-
+    # gate ranks included). Unsupported launchers are refused here
+    # (torchrun / srun carry a rank variable; see
+    # lightning_launched_rank).
     precision_flags = set_precision_flags()
     logger.info("Precision flags: %s", precision_flags)
+
+    rank = lightning_launched_rank()
+    if rank > 0:
+        # A rank Lightning's subprocess launcher started: rank 0 already
+        # ran the launch gate (STOP file, shard membership, skip, lock);
+        # the child runs the same configuration alongside it.  A child
+        # exists only for a single run — several devices under a Hydra
+        # multirun are refused.
+        logger.info("Lightning child rank %d: running without the launch gate", rank)
 
     logger.info("=" * 80)
     logger.info("Resolved Configuration:")
@@ -411,27 +432,31 @@ def run_job(cfg: DictConfig) -> None:
     # 0b. STOP file: while it exists, no new run starts. In a multirun
     # this ends the whole sweep (Hydra's job wrapper catches Exception,
     # not SystemExit); in a single run it just exits. The file is never
-    # deleted by the script.
-    stop = stop_requested(cfg)
-    if stop is not None:
-        logger.info(
-            "STOP file found at %s; not starting job %d. Remove it to continue.",
-            stop,
-            job_num(cfg),
-        )
-        sys.exit(0)
+    # deleted by the script. Decided by rank 0 only; a multirun runs one
+    # device per job and a Slurm allocation runs a single device per job.
+    if rank == 0:
+        refuse_multi_device_in_multirun(cfg.training.get("devices"))
+        refuse_multi_device_under_slurm(cfg.training.get("devices"))
+        stop = stop_requested(cfg)
+        if stop is not None:
+            logger.info(
+                "STOP file found at %s; not starting job %d. Remove it to continue.",
+                stop,
+                job_num(cfg),
+            )
+            sys.exit(0)
 
-    # 0c. Shard: several processes on one machine split one sweep; job k
-    # runs only in the process with shard_index == k % num_shards. All
-    # shards must be launched with the identical sweep command.
-    if not in_shard(job_num(cfg), cfg.launch.shard_index, cfg.launch.num_shards):
-        logger.info(
-            "job %d not in shard %d of %d; skipping",
-            job_num(cfg),
-            cfg.launch.shard_index,
-            cfg.launch.num_shards,
-        )
-        return
+        # 0c. Shard: several processes on one machine split one sweep; job k
+        # runs only in the process with shard_index == k % num_shards. All
+        # shards must be launched with the identical sweep command.
+        if not in_shard(job_num(cfg), cfg.launch.shard_index, cfg.launch.num_shards):
+            logger.info(
+                "job %d not in shard %d of %d; skipping",
+                job_num(cfg),
+                cfg.launch.shard_index,
+                cfg.launch.num_shards,
+            )
+            return
 
     # 1. Phase gate: >= 2 requires the frozen protocol.
     frozen = load_frozen_protocol()
@@ -480,6 +505,12 @@ def run_job(cfg: DictConfig) -> None:
     skip_completed = (
         bool(cfg.launch.skip_completed) and str(cfg.experiment.tier) in PROTOCOL_TIERS
     )
+    if rank > 0:
+        # A Lightning child: rank 0 already took the lock and decided to
+        # run; the child runs next to it without touching the gate.
+        _run_body(cfg, run_id, precision_flags, lr)
+        return
+
     with claim_run(
         lock_path, record_path if skip_completed else None, identity
     ) as reason:
@@ -492,63 +523,76 @@ def run_job(cfg: DictConfig) -> None:
                 ensure_run_record_uploaded(cfg, run_id)
             return
 
-        # 6. Callbacks first, then the curves reset, then the loggers.
-        callbacks = create_callbacks_reset_curves(cfg, run_id, precision_flags, lr=lr)
-        loggers = create_loggers(cfg, run_id)
+        _run_body(cfg, run_id, precision_flags, lr)
 
-        # 8. Seeds. 9. Data. 10. Model + training module.
-        L.seed_everything(cfg.seed)
-        datamodule = SyntheticRecallDataModule(
-            task=str(cfg.task.name),
-            task_config=build_task_config(cfg),
-            batch_size=cfg.training.batch_size,
-            num_val_per_slice=cfg.data.num_val_per_slice,
-            num_test_per_slice=cfg.data.num_test_per_slice,
-            train_seed=cfg.seed,
-            val_seed=cfg.task.val_seed,
-            test_seed=cfg.task.test_seed,
-            num_workers=cfg.data.num_workers,
-        )
-        model = build_model(cfg)
-        if cfg.training.compile:
-            model = torch.compile(model)
-        module = common_run_lifecycle_build_module(cfg, model, lr)
-        num_params = sum(p.numel() for p in model.parameters())
-        gd_layer = first_gated_delta(model)
-        state_bytes = gd_layer.state_bytes() if gd_layer is not None else 0
-        logger.info(
-            "Model: %s parameters; recurrent state per mixer: %d bytes",
-            f"{num_params:,}",
-            state_bytes,
-        )
 
-        # 11. Trainer.
-        trainer = L.Trainer(
-            max_steps=cfg.training.max_steps,
-            val_check_interval=cfg.training.val_check_interval,
-            precision=cfg.training.precision,
-            callbacks=callbacks,
-            logger=loggers,
-            accelerator="auto",
-            devices="auto",
-            enable_progress_bar=True,
-            log_every_n_steps=cfg.training.log_every_n_steps,
-        )
+def _run_body(
+    cfg: DictConfig, run_id: str, precision_flags: dict[str, bool], lr: float
+) -> None:
+    """One run's body (fit + test + the run JSON write), gate passed.
 
-        logger.info("Starting training (run_id=%s)...", run_id)
-        trainer.fit(module, datamodule=datamodule)
+    Runs on the launch-gate's rank 0 and on every rank Lightning's
+    subprocess launcher starts for the same run; each rank builds its own
+    data stream slices, model and module (the shared record, curves and
+    W&B writes are rank-zero-only).
+    """
+    # 6. Callbacks first, then the curves reset, then the loggers.
+    callbacks = create_callbacks_reset_curves(cfg, run_id, precision_flags, lr=lr)
+    loggers = create_loggers(cfg, run_id)
 
-        # 12. Post-fit steps: the fit-finished guard and the optional
-        # final checkpoint.
-        post_fit(cfg, trainer, module, callbacks, run_id)
+    # 8. Seeds. 9. Data. 10. Model + training module.
+    L.seed_everything(cfg.seed)
+    datamodule = SyntheticRecallDataModule(
+        task=str(cfg.task.name),
+        task_config=build_task_config(cfg),
+        batch_size=cfg.training.batch_size,
+        num_val_per_slice=cfg.data.num_val_per_slice,
+        num_test_per_slice=cfg.data.num_test_per_slice,
+        train_seed=cfg.seed,
+        val_seed=cfg.task.val_seed,
+        test_seed=cfg.task.test_seed,
+        num_workers=cfg.data.num_workers,
+    )
+    model = build_model(cfg)
+    if cfg.training.compile:
+        model = torch.compile(model)
+    module = common_run_lifecycle_build_module(cfg, model, lr)
+    num_params = sum(p.numel() for p in model.parameters())
+    gd_layer = first_gated_delta(model)
+    state_bytes = gd_layer.state_bytes() if gd_layer is not None else 0
+    logger.info(
+        "Model: %s parameters; recurrent state per mixer: %d bytes",
+        f"{num_params:,}",
+        state_bytes,
+    )
 
-        # 13. Test on the final weights; the callback updates the run JSON.
-        trainer.test(module, datamodule=datamodule)
+    # 11. Trainer.
+    trainer = L.Trainer(
+        max_steps=cfg.training.max_steps,
+        val_check_interval=cfg.training.val_check_interval,
+        precision=cfg.training.precision,
+        callbacks=callbacks,
+        logger=loggers,
+        accelerator=cfg.training.accelerator,
+        devices=cfg.training.devices,
+        enable_progress_bar=True,
+        log_every_n_steps=cfg.training.log_every_n_steps,
+    )
 
-        # 14. W&B artifact (rented machines).
-        upload_run_record_artifact(cfg, run_id, trainer.is_global_zero)
+    logger.info("Starting training (run_id=%s)...", run_id)
+    trainer.fit(module, datamodule=datamodule)
 
-        logger.info("Run complete (run_id=%s).", run_id)
+    # 12. Post-fit steps: the fit-finished guard and the optional
+    # final checkpoint.
+    post_fit(cfg, trainer, module, callbacks, run_id)
+
+    # 13. Test on the final weights; the callback updates the run JSON.
+    trainer.test(module, datamodule=datamodule)
+
+    # 14. W&B artifact (rented machines).
+    upload_run_record_artifact(cfg, run_id, trainer.is_global_zero)
+
+    logger.info("Run complete (run_id=%s).", run_id)
 
 
 def common_run_lifecycle_build_module(cfg, model, lr):

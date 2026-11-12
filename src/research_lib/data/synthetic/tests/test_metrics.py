@@ -728,10 +728,14 @@ class TestPerSequenceAccuracy:
         pre_seq_acc_sum = rank0._seq_acc_sum.clone()
         pre_seq_count = rank0._seq_count.clone()
 
-        # Monkeypatch torch.distributed to simulate SUM all-reduce.
+        # Monkeypatch torch.distributed to simulate a gloo SUM all-reduce
+        # (a gloo backend leaves the counters on their own device).
         monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
         monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
         monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+        monkeypatch.setattr(
+            torch.distributed, "get_backend", lambda: torch.distributed.Backend.GLOO
+        )
         monkeypatch.setattr(
             torch.distributed, "all_reduce", lambda t, op=None: t.mul_(2)
         )

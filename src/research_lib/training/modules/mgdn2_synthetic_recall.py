@@ -18,6 +18,17 @@ MQAR / repeated-key overwrite:
 - **Validation / test:** answer accuracy, per slice and (for overwrite)
   per placement class, via
   :class:`~research_lib.data.synthetic.RecallMetrics`.
+- **Device-count-independent loss:** the loss a run optimises is the
+  global mean over all ranks' scored positions, so it does not depend on
+  how a batch is split across ranks and training, validation and test
+  compute the same formula (any ``loss_on``, any device count).
+  :meth:`compute_loss` weights this rank's mean by ``W * c_r / C`` — its
+  count of scored positions over the global count — detached; the weight
+  is exactly 1 at one device (so single-device runs are unchanged bit for
+  bit), and under several devices DDP's average of the ranks' gradients
+  of the weighted means is the gradient of the global mean. The returned
+  tensor's value is the global mean on every rank; its gradient is that
+  of the weighted mean.
 
 Per-layer mixer statistics are collected by
 :class:`~research_lib.training.callbacks.LayerStatsCallback`, not by
@@ -41,6 +52,7 @@ from torch import Tensor
 
 from research_lib.data.synthetic.metrics import RecallMetrics
 from research_lib.data.synthetic.mqar import IGNORE_INDEX
+from research_lib.training.distributed import all_reduce_sum, world_size
 from research_lib.training.losses import (
     AnswerLogits,
     answer_cross_entropy,
@@ -209,10 +221,22 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             )
         return self.model(input_ids)
 
-    def compute_loss(
+    def _local_loss_and_count(
         self, model_output: torch.Tensor | AnswerLogits, batch: dict[str, torch.Tensor]
-    ) -> torch.Tensor:
-        """The loss under ``self.loss_on``.
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """This rank's mean loss and the number of positions it averages.
+
+        ``mean`` is computed by exactly the code a single-device run uses,
+        with the same operations.  ``count`` is the number of scored
+        positions ``mean`` averages over, matching the corresponding path:
+        the answer positions (``model_output.targets``) for the answer-head
+        path; the shifted labels that are not ``-100`` (what the parent's
+        ``ignore_index`` skips) for full logits under ``loss_on="answers"``;
+        and every shifted next-token position for ``loss_on="all"``.
+
+        Every path assumes this rank's rows hold at least one scored
+        position (true for these tasks, whose rows all carry answers), so
+        ``mean`` is never a mean over zero positions.
 
         Args:
             model_output: Logits ``(B, T, V)`` or :class:`AnswerLogits`
@@ -220,20 +244,96 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             batch: The full batch dict.
 
         Returns:
-            Scalar loss: answer-positions-only CE (``"answers"``; the
-            inherited computation) or full-sequence CE (``"all"``).
+            Tuple ``(mean, count)``: the mean loss (0-dim, as a
+            single-device run computes it) and the count of scored
+            positions (a 0-dim tensor on the same device).
         """
         if isinstance(model_output, AnswerLogits):
-            return answer_cross_entropy(model_output)
+            count = torch.tensor(
+                model_output.targets.numel(),
+                dtype=torch.long,
+                device=model_output.logits.device,
+            )
+            return answer_cross_entropy(model_output), count
         if self.loss_on is LossOn.ANSWERS:
-            return super().compute_loss(model_output, batch)
+            return (
+                super().compute_loss(model_output, batch),
+                (batch["labels"][..., 1:] != IGNORE_INDEX).sum(),
+            )
         logits = model_output
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = batch["input_ids"][..., 1:].contiguous()
-        return F.cross_entropy(
+        mean = F.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             shift_labels.view(-1),
         )
+        count = torch.tensor(shift_labels.numel(), dtype=torch.long, device=mean.device)
+        return mean, count
+
+    def compute_loss(
+        self, model_output: torch.Tensor | AnswerLogits, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """The loss under ``self.loss_on``, as the global mean over ranks.
+
+        One formula for training, validation and test, at any device
+        count: this rank's mean (:meth:`_local_loss_and_count`), weighted
+        by its share ``W * c_r / C`` of the global count of scored
+        positions (detached).  Each rank's gradient of the weighted mean
+        is ``W / C`` times the gradient of its own sum of per-position
+        losses, so DDP's average over the ranks is the gradient of the
+        global mean ``(sum over ranks of the losses) / C``.  The returned
+        tensor's **value** is the global mean (identical on every rank,
+        and what train/val/test log); its **gradient** is that of the
+        weighted mean.  At one device the weight is exactly ``1.0`` (``C
+        == c_r``, a whole number), so the value and the gradient equal
+        today's plain mean bit for bit.
+
+        Args:
+            model_output: Logits ``(B, T, V)`` or :class:`AnswerLogits`
+                (the answer-head path).
+            batch: The full batch dict.
+
+        Returns:
+            Scalar tensor whose value is the global mean loss and whose
+            gradient is the gradient of this rank's weighted mean.
+        """
+        mean, count = self._local_loss_and_count(model_output, batch)
+        weight = self._rank_weight(count).to(mean.dtype)
+        # The weight is exactly 1.0 at one device (C == c_r, a whole
+        # number), so the value and the gradient equal today's mean bit
+        # for bit.  Under W ranks, DDP's average of the ranks' gradients
+        # of mean_r * W * c_r / C is the gradient of the global mean over
+        # all ranks' scored positions.
+        backward = mean * weight.detach()
+        global_mean = all_reduce_sum(backward.detach()) / world_size()
+        # Value: the global mean (identical on every rank; what
+        # train/val/test log).  Gradient: that of ``backward``.  At one
+        # device global_mean == backward exactly.
+        return backward + (global_mean - backward).detach()
+
+    def _rank_weight(self, count: torch.Tensor) -> torch.Tensor:
+        """This rank's backward-loss weight ``W * c_r / C`` (float64).
+
+        The count is reduced as an integer: casting it to the mean's
+        dtype before the reduce would round it under fp16/bf16 (and
+        overflow fp16 above 65504), changing the weight.  The weight is
+        formed in float64 from the exact integer counts (no rounding of
+        the counts themselves); :meth:`compute_loss` casts it to the
+        mean's dtype (at one device the cast value is still exactly
+        1.0).
+
+        Args:
+            count: This rank's count of scored positions (an integer
+                tensor; the same count :meth:`_local_loss_and_count`
+                returns).
+
+        Returns:
+            A float64 0-dim tensor ``W * c_r / C``, where ``C`` is the
+            SUM all-reduced count across ranks.
+        """
+        w = world_size()
+        total = all_reduce_sum(count.detach().to(torch.int64))
+        return w * count.double() / total.double()
 
     # ------------------------------------------------------------------ #
     # Validation / test

@@ -38,8 +38,21 @@ from omegaconf import DictConfig, ListConfig, OmegaConf
 #     operational, not experimental;
 #   - data.num_workers: the training stream is defined per
 #     (train_seed, batch index) independently of the worker count
-#     (SyntheticRecallDataModule docstring).
-HASH_EXCLUDE: tuple[str, ...] = ("output", "logging", "launch", "data.num_workers")
+#     (SyntheticRecallDataModule docstring);
+#   - training.devices / training.accelerator: the data stream, the steps
+#     per epoch, the loss and the metrics do not depend on the device
+#     count or accelerator (global batches, the global-mean loss), so a
+#     run relaunched on a different number of devices is the same
+#     experiment; the first pilot's config gains these keys without its
+#     identity changing.
+HASH_EXCLUDE: tuple[str, ...] = (
+    "output",
+    "logging",
+    "launch",
+    "data.num_workers",
+    "training.devices",
+    "training.accelerator",
+)
 
 # Task config fields that never join the run ID (already in the base ID,
 # or operational seeding / naming).

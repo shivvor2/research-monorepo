@@ -1,0 +1,47 @@
+# @package _global_
+# Two-job sweep used by the multi-device end-to-end tests: the task comes
+# from the sweeper params (not the command line), exactly as in the
+# pilot's real sweep files.  It runs the default config (the smoke config
+# interpolates ``${task}`` in its defaults, which a task-from-sweeper
+# launch cannot satisfy at composition), so the sweep carries its own
+# small MAD-fuzzy smoke sizes and runs single-device (any sweep runs one
+# device per job: a multirun with ``training.devices`` other than 1 is
+# refused at the gate).  Tier ``smoke`` is tooling (not a protocol tier),
+# so the frozen-choice gate and the skip rule ignore it.
+# Run: python 01_train.py +sweep=test_ddp_multirun --multirun
+
+experiment:
+  phase: 1
+  tier: smoke
+
+optimizer:
+  lr: 0.003
+  weight_decay: 0.0
+
+training:
+  batch_size: 64
+  epochs: 2
+  val_every_epochs: 1
+  devices: 1
+  accelerator: cpu
+
+model:
+  d_model: 16
+  num_heads: 1
+
+task:
+  vocab_size: 16
+  seq_len: 32
+  num_train: 64
+  num_val: 32
+  num_test: 32
+
+data:
+  num_workers: 0
+
+hydra:
+  mode: MULTIRUN
+  sweeper:
+    params:
+      task: mad_fuzzy
+      seed: 0, 1
