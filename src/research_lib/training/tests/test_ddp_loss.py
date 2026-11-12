@@ -110,10 +110,14 @@ def _spawn(worker, *args) -> list:
     """Run ``worker(rank, 2, port, queue, *args)`` in two spawn processes
     and return the queue contents in rank order.
 
-    Spawn hygiene: every started process is terminated if still alive,
-    joined and the queue closed even when a worker fails or a ``get``
-    times out, so a rank stuck in a collective cannot hang the test at
-    exit; the exit codes are only asserted after the cleanup.
+    Spawn hygiene: the result loop marks the spawn completed only after
+    every process's result was received; an incomplete loop terminates
+    every still-alive process.  All processes are then joined, and any
+    process still alive after that join is terminated and re-joined (a
+    worker that sent its result but hangs in shutdown must not keep
+    pytest waiting at exit), so the exit codes are only asserted after
+    the cleanup.  A failed ``get`` is re-raised as an AssertionError after
+    the cleanup; interrupts are not caught and propagate.
     """
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
@@ -125,23 +129,37 @@ def _spawn(worker, *args) -> list:
     for process in processes:
         process.start()
     results = [None, None]
-    error: BaseException | None = None
+    error: Exception | None = None
+    completed = False
     try:
         for _ in processes:
             entry = queue.get(timeout=120)
             results[entry[0]] = entry
     except Exception as exc:
+        # Only a failed get: turn it into the AssertionError below, after
+        # the cleanup.  Interrupts (KeyboardInterrupt etc.) are not caught
+        # and propagate unchanged.
         error = exc
+    else:
+        completed = True
     finally:
-        if error is not None:
-            # A worker stuck in a collective (its get never fired) must not
-            # keep pytest hanging at exit; a finished worker exits on its
-            # own, so it is not terminated (which would corrupt its code).
+        if not completed:
+            # A worker stuck in a collective (its get never fired) must
+            # not keep pytest hanging at exit; a completed loop leaves
+            # finished workers to exit on their own (terminating them
+            # would corrupt their exit codes).
             for process in processes:
                 if process.is_alive():
                     process.terminate()
         for process in processes:
             process.join(timeout=30)
+        # A worker that sent its result but hangs in shutdown must not keep
+        # pytest waiting at exit, whether or not the loop completed; such a
+        # process fails the exit-code assertion below with its exit code.
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=30)
         queue.close()
         queue.join_thread()
     if error is not None:
