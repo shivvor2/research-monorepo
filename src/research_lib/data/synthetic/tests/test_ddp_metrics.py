@@ -129,6 +129,14 @@ def _metrics_worker(rank: int, world_size: int, port: int, queue, mode: str) -> 
 
 
 def _run_two(mode: str) -> list[dict[str, float]]:
+    """Run the metrics worker on two spawn processes and return their
+    metric dicts in rank order.
+
+    Spawn hygiene: every started process is terminated if still alive,
+    joined and the queue closed even when a worker fails or a ``get``
+    times out, so a rank stuck in a collective cannot hang the test at
+    exit; the exit codes are only asserted after the cleanup.
+    """
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
     port = _free_port()
@@ -139,11 +147,30 @@ def _run_two(mode: str) -> list[dict[str, float]]:
     for process in processes:
         process.start()
     results = [None, None]
-    for _ in processes:
-        rank, values = queue.get(timeout=120)
-        results[rank] = values
+    error: BaseException | None = None
+    try:
+        for _ in processes:
+            rank, values = queue.get(timeout=120)
+            results[rank] = values
+    except Exception as exc:
+        error = exc
+    finally:
+        if error is not None:
+            # A worker stuck in a collective (its get never fired) must
+            # not keep pytest hanging at exit; a finished worker exits on
+            # its own, so it is not terminated (which would corrupt its
+            # exit code).
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+        for process in processes:
+            process.join(timeout=30)
+        queue.close()
+        queue.join_thread()
+    if error is not None:
+        raise AssertionError(f"a rank worker produced no result: {error!r}") from error
+    # The exit codes are read only after every process was joined.
     for process in processes:
-        process.join(timeout=120)
         assert process.exitcode == 0, f"rank worker failed with exit {process.exitcode}"
     assert all(r is not None for r in results)
     return results

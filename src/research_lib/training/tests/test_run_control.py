@@ -35,7 +35,16 @@ class TestLauncherRanks:
     the other Lightning variables are all refused."""
 
     def _clear(self, monkeypatch):
-        for name in ("RANK", "LOCAL_RANK", "SLURM_PROCID", "WORLD_SIZE", "MASTER_PORT"):
+        for name in (
+            "RANK",
+            "LOCAL_RANK",
+            "SLURM_PROCID",
+            "SLURM_JOB_ID",
+            "SLURM_NTASKS",
+            "SLURM_STEP_NUM_TASKS",
+            "WORLD_SIZE",
+            "MASTER_PORT",
+        ):
             monkeypatch.delenv(name, raising=False)
 
     def test_no_launcher_variables_is_rank_zero(self, monkeypatch):
@@ -104,22 +113,14 @@ class TestLauncherRanks:
         monkeypatch.delenv("WORLD_SIZE", raising=False)
         assert rc.lightning_launched_rank() == 1
 
-    def test_multi_device_under_slurm(self):
+    def test_multi_device_under_slurm(self, monkeypatch):
         """``refuse_multi_device_under_slurm`` refuses a device count other
         than 1 only when ``SLURM_JOB_ID`` is set."""
-        import os
-
-        old = os.environ.get("SLURM_JOB_ID")
-        os.environ["SLURM_JOB_ID"] = "123"
-        try:
-            rc.refuse_multi_device_under_slurm(1)  # single device passes
-            with pytest.raises(RuntimeError, match="Slurm"):
-                rc.refuse_multi_device_under_slurm(2)
-        finally:
-            if old is None:
-                os.environ.pop("SLURM_JOB_ID", None)
-            else:
-                os.environ["SLURM_JOB_ID"] = old
+        monkeypatch.setenv("SLURM_JOB_ID", "123")
+        rc.refuse_multi_device_under_slurm(1)  # single device passes
+        with pytest.raises(RuntimeError, match="Slurm"):
+            rc.refuse_multi_device_under_slurm(2)
+        monkeypatch.delenv("SLURM_JOB_ID")
         # Outside an allocation a device count other than 1 is allowed.
         rc.refuse_multi_device_under_slurm(2)
 

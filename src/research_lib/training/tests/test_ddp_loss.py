@@ -108,7 +108,13 @@ def _init_gloo(rank: int, world_size: int, port: int) -> None:
 
 def _spawn(worker, *args) -> list:
     """Run ``worker(rank, 2, port, queue, *args)`` in two spawn processes
-    and return the queue contents in rank order."""
+    and return the queue contents in rank order.
+
+    Spawn hygiene: every started process is terminated if still alive,
+    joined and the queue closed even when a worker fails or a ``get``
+    times out, so a rank stuck in a collective cannot hang the test at
+    exit; the exit codes are only asserted after the cleanup.
+    """
     ctx = multiprocessing.get_context("spawn")
     queue = ctx.Queue()
     port = _free_port()
@@ -119,11 +125,29 @@ def _spawn(worker, *args) -> list:
     for process in processes:
         process.start()
     results = [None, None]
-    for _ in processes:
-        entry = queue.get(timeout=120)
-        results[entry[0]] = entry
+    error: BaseException | None = None
+    try:
+        for _ in processes:
+            entry = queue.get(timeout=120)
+            results[entry[0]] = entry
+    except Exception as exc:
+        error = exc
+    finally:
+        if error is not None:
+            # A worker stuck in a collective (its get never fired) must not
+            # keep pytest hanging at exit; a finished worker exits on its
+            # own, so it is not terminated (which would corrupt its code).
+            for process in processes:
+                if process.is_alive():
+                    process.terminate()
+        for process in processes:
+            process.join(timeout=30)
+        queue.close()
+        queue.join_thread()
+    if error is not None:
+        raise AssertionError(f"a rank worker produced no result: {error!r}") from error
+    # The exit codes are read only after every process was joined.
     for process in processes:
-        process.join(timeout=120)
         assert process.exitcode == 0, f"rank worker failed with exit {process.exitcode}"
     assert all(r is not None for r in results)
     return results
@@ -163,6 +187,7 @@ def test_compute_loss_is_bitwise_the_local_mean_single_process():
     mean = module._local_loss_and_count(answers, {})[0]
     loss = module.compute_loss(answers, {})
     assert torch.equal(loss, mean)
+    assert loss.dtype == mean.dtype
     assert torch.equal(
         torch.autograd.grad(loss, logits)[0], torch.autograd.grad(mean, logits)[0]
     )
@@ -177,6 +202,7 @@ def test_compute_loss_is_bitwise_the_local_mean_single_process():
     mean2 = module2._local_loss_and_count(logits2, batch)[0]
     loss2 = module2.compute_loss(logits2, batch)
     assert torch.equal(loss2, mean2)
+    assert loss2.dtype == mean2.dtype
     assert torch.equal(
         torch.autograd.grad(loss2, logits2)[0],
         torch.autograd.grad(mean2, logits2)[0],
@@ -190,6 +216,7 @@ def test_compute_loss_is_bitwise_the_local_mean_single_process():
     mean3 = module3._local_loss_and_count(logits3, batch)[0]
     loss3 = module3.compute_loss(logits3, batch)
     assert torch.equal(loss3, mean3)
+    assert loss3.dtype == mean3.dtype
     assert torch.equal(
         torch.autograd.grad(loss3, logits3)[0],
         torch.autograd.grad(mean3, logits3)[0],
@@ -227,6 +254,9 @@ def _loss_worker(rank: int, world_size: int, port: int, queue) -> None:
     module.eval()
     loss_eval = module.compute_loss(answers, {})
     local_mean = F.cross_entropy(answers.logits, answers.targets)
+    # Tensors cross the queue as plain lists (the sender exits right
+    # after; a torch shared-memory tensor needs the sender alive to be
+    # unpickled), rebuilt in the parent with the original dtypes.
     queue.put(
         (
             rank,
@@ -234,10 +264,45 @@ def _loss_worker(rank: int, world_size: int, port: int, queue) -> None:
             float(loss_eval.detach()),
             float(local_mean.detach()),
             int(answers.targets.numel()),
-            x.detach().clone(),
-            targets.detach().clone(),
-            grad_weight.detach().clone(),
-            grad_bias.detach().clone(),
+            x.detach().tolist(),
+            targets.detach().tolist(),
+            grad_weight.detach().tolist(),
+            grad_bias.detach().tolist(),
+        )
+    )
+    dist.destroy_process_group()
+
+
+def _bf16_weight_worker(rank: int, world_size: int, port: int, queue) -> None:
+    """One rank of the bf16-weight test: bf16 answer rows with counts
+    above 2**11 (where a count cast to bf16 would round), the module's
+    loss and its float64 weight."""
+    _init_gloo(rank, world_size, port)
+    torch.manual_seed(0)
+    weight_param = torch.nn.Parameter(torch.randn(4, _VOCAB, dtype=torch.bfloat16))
+    bias_param = torch.nn.Parameter(torch.zeros(_VOCAB, dtype=torch.bfloat16))
+    # Counts above 2**11 (2049 vs 2050): in bf16 a count would round.
+    n_rows = (2049, 2050)[rank]
+    x = torch.randn(n_rows, 4, dtype=torch.bfloat16)
+    targets = torch.randint(0, _VOCAB, (n_rows,), dtype=torch.long)
+    logits = x @ weight_param + bias_param
+    answers = AnswerLogits(
+        logits=logits,
+        targets=targets,
+        mask=torch.ones(n_rows, dtype=torch.bool),
+    )
+    module = _make_module(loss_on="answers")
+    loss = module.compute_loss(answers, {})
+    count = module._local_loss_and_count(answers, {})[1]
+    rank_weight = module._rank_weight(count)
+    queue.put(
+        (
+            rank,
+            n_rows,
+            float(loss.detach()),
+            int(count.item()),
+            float(rank_weight.detach()),
+            str(loss.dtype),
         )
     )
     dist.destroy_process_group()
@@ -295,16 +360,36 @@ def test_global_mean_loss_value_and_gradients_two_gloo_processes():
     torch.manual_seed(0)
     weight_p = torch.nn.Parameter(torch.randn(4, _VOCAB, dtype=_DTYPE))
     bias_p = torch.nn.Parameter(torch.zeros(_VOCAB, dtype=_DTYPE))
-    x_full = torch.cat([r[5] for r in results], dim=0)
-    targets_full = torch.cat([r[6] for r in results], dim=0)
+    x_full = torch.cat([torch.tensor(r[5], dtype=_DTYPE) for r in results], dim=0)
+    targets_full = torch.cat(
+        [torch.tensor(r[6], dtype=torch.long) for r in results], dim=0
+    )
     ref = F.cross_entropy(x_full @ weight_p + bias_p, targets_full)
     grad_weight_full, grad_bias_full = torch.autograd.grad(ref, (weight_p, bias_p))
     for index, full_grad in zip((7, 8), (grad_weight_full, grad_bias_full)):
-        averaged = (results[0][index] + results[1][index]) / 2
+        averaged = (
+            torch.tensor(results[0][index], dtype=_DTYPE)
+            + torch.tensor(results[1][index], dtype=_DTYPE)
+        ) / 2
         assert torch.allclose(
             averaged, full_grad, atol=1e-10, rtol=1e-10
         ), "averaged rank gradients differ from the global-mean gradient"
     assert results[0][4] != results[1][4]  # the uneven-rows premise
+
+
+@pytest.mark.slow
+def test_rank_weight_uses_integer_counts_two_gloo_processes():
+    """Counts above 2**11 under a bf16 mean reduce as integers: the
+    weight equals ``W * c_r / C`` to fp32 precision (a count rounded to
+    bf16 would be off by a bf16 ulp), and the returned loss keeps the
+    mean's (bf16) dtype."""
+    results = _spawn(_bf16_weight_worker)
+    total = sum(r[1] for r in results)
+    for rank, n_rows, loss, count, rank_weight, dtype in results:
+        reference = 2 * count / total
+        assert rank_weight == pytest.approx(reference, abs=1e-6, rel=1e-6), rank
+        assert dtype == "torch.bfloat16", rank
+    assert total == 2049 + 2050
 
 
 @pytest.mark.slow
