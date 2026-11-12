@@ -70,10 +70,11 @@ class LayerStatsCallback(L.Callback):
     snapshotted with stale values.
 
     The statistics are **per rank**: each rank snapshots its own batches'
-    values, and under several devices the recorded values come from the
-    global rank's rows (the run record's collector reads rank 0's
-    callbacks). The values are diagnostics, not metrics; they are not
-    reduced across ranks.
+    values.  They are logged per rank, not reduced: by default
+    (``sync_dist=False``) each rank logs its own values, and with
+    ``sync_dist=True`` Lightning averages them across ranks before
+    logging.  The run record's collector reads rank 0's logged values in
+    either case.  The values are diagnostics, not metrics.
 
     Args:
         prefix: Metric prefix; entries are logged as
