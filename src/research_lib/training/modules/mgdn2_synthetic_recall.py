@@ -317,9 +317,10 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
         The count is reduced as an integer: casting it to the mean's
         dtype before the reduce would round it under fp16/bf16 (and
         overflow fp16 above 65504), changing the weight.  The weight is
-        formed in float64 from the exact integer counts, so it is exact;
-        :meth:`compute_loss` casts it to the mean's dtype (at one device
-        the cast value is still exactly 1.0).
+        formed in float64 from the exact integer counts (no rounding of
+        the counts themselves); :meth:`compute_loss` casts it to the
+        mean's dtype (at one device the cast value is still exactly
+        1.0).
 
         Args:
             count: This rank's count of scored positions (an integer
