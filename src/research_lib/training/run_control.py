@@ -105,8 +105,13 @@ def lightning_launched_rank() -> int:
     apart from an ordinary rank-0 start by the environment the launcher
     sets: ``LOCAL_RANK`` plus ``MASTER_PORT``, ``NODE_RANK`` and
     ``WORLD_SIZE`` (lightning 2.6.6, the version pinned in ``uv.lock``;
-    it never sets a global ``RANK``).  Launches that start ranks
-    independently are refused here:
+    it never sets a global ``RANK``).  Lightning also sets ``LOCAL_RANK``
+    (0) in the **rank-0** process's environment while ``fit`` runs its
+    subprocess launcher; that is harmless for a single run — a child
+    only ever exists there, because several devices under a Hydra
+    multirun are refused — and it is the reason multiruns with several
+    devices are not supported.  Launches that start ranks independently
+    are refused here:
 
     - ``torchrun`` sets ``RANK``, which Lightning never does;
     - a Slurm allocation sets ``SLURM_PROCID`` for every task, including

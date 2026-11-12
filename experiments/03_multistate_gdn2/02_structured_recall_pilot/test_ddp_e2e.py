@@ -289,12 +289,14 @@ def test_launch_gate_single_machine_decisions(tmp_path):
 
 
 @pytest.mark.slow
-def test_hydra_multirun_two_jobs_two_devices_each(tmp_path):
-    """A two-job sweep with two devices per job: exactly two records with
-    the expected run IDs, each job's child ranks running that job's
-    overrides (visible in the run IDs they log), and the task override
-    reaching every rank (a child without ``task=`` would stop with \"You
-    must specify 'task'\")."""
+def test_multirun_with_several_devices_is_refused(tmp_path):
+    """A Hydra multirun with ``training.devices`` other than 1 is refused
+    by rank 0 before fit: Lightning's subprocess launcher re-executes the
+    whole sweep in each child, so a multi-device sweep would train
+    different jobs in the same process group whenever rank 0's gate skips
+    a job (a shard exclusion, a completed record, a STOP file).  The
+    refused run exits non-zero with the error, writes no record, starts
+    no child (no child-rank line) and leaves no second sweep directory."""
     launch = tmp_path / "sweep"
     launch.mkdir()
     result = _run_train(
@@ -305,37 +307,39 @@ def test_hydra_multirun_two_jobs_two_devices_each(tmp_path):
         "training.devices=2",
         "training.accelerator=cpu",
     )
+    assert result.returncode != 0
+    assert "multirun" in (result.stdout + result.stderr)
+    assert "not supported" in (result.stdout + result.stderr)
+    assert not list((launch / "runs" / "mqar").glob("*.json"))
+    assert "Lightning child rank" not in result.stdout
+    # No child sweep (children would each re-run the whole sweep and add
+    # their own timestamped directory): exactly one sweep root.
+    assert len(list((launch / "multirun").rglob("multirun.yaml"))) == 1
+
+
+@pytest.mark.slow
+def test_single_device_multirun_writes_both_records(tmp_path):
+    """The same two-job sweep with one device per job (the supported
+    configuration: a sweep runs one device per job) writes both
+    records."""
+    launch = tmp_path / "sweep"
+    launch.mkdir()
+    result = _run_train(
+        launch,
+        "--multirun",
+        "task=mqar",
+        "seed=0,1",
+        "training.devices=1",
+        "training.accelerator=cpu",
+    )
     assert result.returncode == 0, result.stderr[-4000:]
     records = list((launch / "runs" / "mqar").glob("*.json"))
     assert len(records) == 2, f"expected two records, got {[r.name for r in records]}"
     seeds = set()
-    run_ids = set()
     for record_path in records:
         with open(record_path) as f:
-            record = json.load(f)
-        seeds.add(record["seed"])
-        run_ids.add(record["run_id"])
+            seeds.add(json.load(f)["seed"])
     assert seeds == {0, 1}
-    assert any(run_id.endswith("-s0") for run_id in run_ids)
-    assert any(run_id.endswith("-s1") for run_id in run_ids)
-    # Each job started exactly one child rank, running that job's run ID
-    # (the child bypasses the launch gate and logs the run it joins).
-    for seed_suffix in ("-s0", "-s1"):
-        lines = [
-            line
-            for line in result.stdout.splitlines()
-            if "Lightning child rank" in line and seed_suffix in line
-        ]
-        assert len(lines) == 1, (seed_suffix, lines)
-    # The children reuse their job's run directory for the config: exactly
-    # one .hydra per record.  Lightning's children also leave a vestigial
-    # ``multirun/<fresh-timestamp>/<jobnum>/`` dir holding only the
-    # child's redirected log (no .hydra, no config, no record) — a
-    # Hydra/launcher artifact of the subprocess re-invocation; the
-    # invariant that matters is that no child writes its own config into
-    # a second directory.
-    hydra_configs = list((launch / "multirun").rglob(".hydra"))
-    assert len(hydra_configs) == len(records), hydra_configs
 
 
 @pytest.mark.slow
@@ -343,11 +347,10 @@ def test_sweep_file_task_comes_from_the_sweeper(tmp_path):
     """A multirun launched as the pilots launch one: ``+sweep=<file>``
     with the task in the sweeper params (not the command line).  One
     record per job, the task and seed coming from the params.  This
-    runs single-device: a multi-device ``+sweep`` run is not supported,
-    because Lightning's subprocess launcher cannot re-invoke a
-    sweep-file-driven command (only command-line ``--multirun`` sweeps
-    work multi-device, covered above), so the device-count machinery is
-    exercised there."""
+    runs single-device: any sweep runs one device per job (a multirun
+    with ``training.devices`` other than 1 is refused), so the
+    device-count machinery is exercised by the single-run multi-device
+    tests."""
     launch = tmp_path / "sweep"
     launch.mkdir()
     result = _run_train(launch, "--multirun", "+sweep=test_ddp_multirun", config=None)

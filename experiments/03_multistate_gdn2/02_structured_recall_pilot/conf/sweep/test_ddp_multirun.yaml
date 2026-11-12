@@ -4,10 +4,10 @@
 # pilot's real sweep files.  It runs the default config (the smoke config
 # interpolates ``${task}`` in its defaults, which a task-from-sweeper
 # launch cannot satisfy at composition), so the sweep carries its own
-# small MAD-fuzzy smoke sizes and runs single-device (a multi-device
-# ``+sweep`` run is not supported: Lightning's subprocess launcher cannot
-# re-invoke a sweep-file command).  Tier ``smoke`` is tooling (not a
-# protocol tier), so the frozen-choice gate and the skip rule ignore it.
+# small MAD-fuzzy smoke sizes and runs single-device (any sweep runs one
+# device per job: a multirun with ``training.devices`` other than 1 is
+# refused at the gate).  Tier ``smoke`` is tooling (not a protocol tier),
+# so the frozen-choice gate and the skip rule ignore it.
 # Run: python 01_train.py +sweep=test_ddp_multirun --multirun
 
 experiment:

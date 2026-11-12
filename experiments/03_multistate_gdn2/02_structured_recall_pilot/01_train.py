@@ -247,6 +247,8 @@ def run_job(cfg: DictConfig) -> None:
         # A rank Lightning's subprocess launcher started: rank 0 already
         # ran the launch gate (STOP file, shard membership, skip and the
         # run lock); the child runs the same configuration alongside it.
+        # A child exists only for a single run — several devices under a
+        # Hydra multirun are refused.
         logger.info(
             "Lightning child rank %d: running %s without the launch gate",
             rank,

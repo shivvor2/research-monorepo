@@ -25,6 +25,34 @@ from research_lib.layers.attention import CausalSelfAttention, MultistateGatedDe
 from research_lib.training.callbacks import config_hash
 
 
+def test_refuse_multi_device_in_multirun(monkeypatch):
+    """A Hydra multirun runs one device per job: ``training.devices``
+    other than the single integer 1 is refused (``auto`` included); a
+    single device passes, and outside a multirun the check is a no-op."""
+    from types import SimpleNamespace
+
+    from common.launch import refuse_multi_device_in_multirun
+    from hydra.core.hydra_config import HydraConfig
+    from hydra.types import RunMode
+
+    hydra_config = SimpleNamespace(mode=RunMode.MULTIRUN)
+    monkeypatch.setattr(HydraConfig, "initialized", classmethod(lambda cls: True))
+    monkeypatch.setattr(HydraConfig, "get", classmethod(lambda cls: hydra_config))
+    with pytest.raises(RuntimeError, match="multirun"):
+        refuse_multi_device_in_multirun(2)
+    with pytest.raises(RuntimeError, match="multirun"):
+        refuse_multi_device_in_multirun("auto")
+    refuse_multi_device_in_multirun(1)  # a single device passes
+
+    # Outside Hydra it is a no-op ...
+    monkeypatch.setattr(HydraConfig, "initialized", classmethod(lambda cls: False))
+    refuse_multi_device_in_multirun(2)
+    # ... and so is a plain (run-mode) launch.
+    hydra_config.mode = RunMode.RUN
+    monkeypatch.setattr(HydraConfig, "initialized", classmethod(lambda cls: True))
+    refuse_multi_device_in_multirun(2)
+
+
 def test_begin_run_refuses_multi_device_under_slurm(monkeypatch):
     """Inside a Slurm allocation ``begin_run`` refuses a
     ``training.devices`` other than the single integer 1 (multi-device

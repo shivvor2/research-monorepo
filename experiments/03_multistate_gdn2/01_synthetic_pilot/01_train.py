@@ -52,7 +52,11 @@ if str(_PROJECT) not in sys.path:
 # The shared run machinery. The names imported here are the modules'
 # public surfaces; the pilot keeps only its protocol and run_job below.
 from common.harnesses import build_zoology  # noqa: E402
-from common.launch import job_num, stop_requested  # noqa: E402
+from common.launch import (  # noqa: E402
+    job_num,
+    refuse_multi_device_in_multirun,
+    stop_requested,
+)
 from common.layout import wandb_kwargs as wandb_logger_kwargs  # noqa: E402
 from common.run_id import HASH_EXCLUDE, make_run_id  # noqa: E402
 
@@ -415,7 +419,9 @@ def run_job(cfg: DictConfig) -> None:
     if rank > 0:
         # A rank Lightning's subprocess launcher started: rank 0 already
         # ran the launch gate (STOP file, shard membership, skip, lock);
-        # the child runs the same configuration alongside it.
+        # the child runs the same configuration alongside it.  A child
+        # exists only for a single run — several devices under a Hydra
+        # multirun are refused.
         logger.info("Lightning child rank %d: running without the launch gate", rank)
 
     logger.info("=" * 80)
@@ -426,9 +432,10 @@ def run_job(cfg: DictConfig) -> None:
     # 0b. STOP file: while it exists, no new run starts. In a multirun
     # this ends the whole sweep (Hydra's job wrapper catches Exception,
     # not SystemExit); in a single run it just exits. The file is never
-    # deleted by the script. Decided by rank 0 only; a Slurm allocation
-    # runs a single device per job.
+    # deleted by the script. Decided by rank 0 only; a multirun runs one
+    # device per job and a Slurm allocation runs a single device per job.
     if rank == 0:
+        refuse_multi_device_in_multirun(cfg.training.get("devices"))
         refuse_multi_device_under_slurm(cfg.training.get("devices"))
         stop = stop_requested(cfg)
         if stop is not None:

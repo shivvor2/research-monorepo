@@ -50,7 +50,11 @@ The only supported launcher is Lightning's own: start the script once
 and let Lightning start the other ranks (``torchrun`` / ``srun`` are
 refused); the launch gate (STOP file, shard membership, skip and run
 lock) is decided by rank 0, and record, curves and W&B writes stay on
-rank 0.
+rank 0.  Multi-device runs are **single runs only**: Lightning's
+subprocess launcher re-executes the whole sweep in each child, so a
+Hydra multirun with several devices is refused at the gate — a sweep
+runs one device per job (use shards to run several jobs on one
+machine).
 
 A CPU smoke of a multi-device run (two processes, gloo):
 
