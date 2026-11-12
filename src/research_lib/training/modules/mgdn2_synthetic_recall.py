@@ -298,20 +298,41 @@ class MGDN2SyntheticRecallModule(DualOptimizerModule):
             gradient is the gradient of this rank's weighted mean.
         """
         mean, count = self._local_loss_and_count(model_output, batch)
-        w = world_size()
-        c = count.to(mean.dtype)
-        total = all_reduce_sum(c.detach())
-        # Rank weight W * c_r / C: exactly 1.0 at one device (C == c_r, a
-        # whole number), so the value and the gradient equal today's mean
-        # bit for bit.  Under W ranks, DDP's average of the ranks'
-        # gradients of mean_r * W * c_r / C is the gradient of the global
-        # mean over all ranks' scored positions.
-        backward = mean * (w * c / total).detach()
-        global_mean = all_reduce_sum(backward.detach()) / w
+        weight = self._rank_weight(count).to(mean.dtype)
+        # The weight is exactly 1.0 at one device (C == c_r, a whole
+        # number), so the value and the gradient equal today's mean bit
+        # for bit.  Under W ranks, DDP's average of the ranks' gradients
+        # of mean_r * W * c_r / C is the gradient of the global mean over
+        # all ranks' scored positions.
+        backward = mean * weight.detach()
+        global_mean = all_reduce_sum(backward.detach()) / world_size()
         # Value: the global mean (identical on every rank; what
         # train/val/test log).  Gradient: that of ``backward``.  At one
         # device global_mean == backward exactly.
         return backward + (global_mean - backward).detach()
+
+    def _rank_weight(self, count: torch.Tensor) -> torch.Tensor:
+        """This rank's backward-loss weight ``W * c_r / C`` (float64).
+
+        The count is reduced as an integer: casting it to the mean's
+        dtype before the reduce would round it under fp16/bf16 (and
+        overflow fp16 above 65504), changing the weight.  The weight is
+        formed in float64 from the exact integer counts, so it is exact;
+        :meth:`compute_loss` casts it to the mean's dtype (at one device
+        the cast value is still exactly 1.0).
+
+        Args:
+            count: This rank's count of scored positions (an integer
+                tensor; the same count :meth:`_local_loss_and_count`
+                returns).
+
+        Returns:
+            A float64 0-dim tensor ``W * c_r / C``, where ``C`` is the
+            SUM all-reduced count across ranks.
+        """
+        w = world_size()
+        total = all_reduce_sum(count.detach().to(torch.int64))
+        return w * count.double() / total.double()
 
     # ------------------------------------------------------------------ #
     # Validation / test
