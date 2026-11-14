@@ -339,6 +339,14 @@ class TestHarnessBuildsTheRunsMixer:
         with pytest.raises(ValueError):
             build_zoology(_harness_cfg(mixer="nope"))
 
+    def test_zoology_attention_config_without_key_keeps_the_norm(self):
+        # The Zoology harness has no ``attention_qk_norm`` key (adding one
+        # would change the entity-field run identities); its attention keeps
+        # the default query/key RMSNorm.
+        model = build_zoology(_harness_cfg(mixer="attention"))
+        for m in _managed_mixers(model):
+            assert m.attention.qk_norm_str == "RMSNorm"
+
 
 class TestAnalysis:
     def test_gap_column(self):
@@ -469,6 +477,95 @@ class TestBuildMadAttention:
         cfg = _mad_model_cfg(d_model=104, mixer="gated_delta", attention_num_heads=16)
         model = build_mad(cfg)
         assert isinstance(model.blocks[0].mixer, MultistateGatedDelta)
+
+    def test_attention_qk_norm_none_removes_the_norm(self):
+        # ``attention_qk_norm: none`` builds attention without query/key
+        # normalisation (MAD's attention does this).
+        from common.harnesses import build_mad
+
+        cfg = _mad_model_cfg(mixer="attention", attention_qk_norm="none")
+        model = build_mad(cfg)
+        mixer = model.blocks[0].mixer
+        assert mixer.attention.qk_norm_str == "None"
+        keys = set(mixer.state_dict())
+        assert not any(
+            k in keys for k in ("attention.q_norm.weight", "attention.k_norm.weight")
+        )
+
+    def test_attention_qk_norm_absent_defaults_to_rms(self):
+        # A MAD attention config without the key keeps today's behaviour: an
+        # RMSNorm on the query and key projections.
+        from common.harnesses import build_mad
+
+        cfg = _mad_model_cfg(mixer="attention")  # no attention_qk_norm key
+        model = build_mad(cfg)
+        assert model.blocks[0].mixer.attention.qk_norm_str == "RMSNorm"
+
+    def test_unknown_attention_qk_norm_value_raises(self):
+        from common.harnesses import build_mad
+
+        cfg = _mad_model_cfg(mixer="attention", attention_qk_norm="banana")
+        with pytest.raises(ValueError, match="attention_qk_norm") as exc:
+            build_mad(cfg)
+        assert "rms" in str(exc.value) and "none" in str(exc.value)
+
+    def test_mad_attention_trainable_parameters_match_mad(self):
+        # With query/key normalisation off, the MAD-harness attention control
+        # has the same learnable parameters as MAD's own model (407,824).
+        from common.harnesses import build_mad
+
+        cfg = _mad_model_cfg(mixer="attention", attention_qk_norm="none")
+        model = build_mad(cfg)
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        assert trainable == 407_824
+        # The 8 non-trainable parameters are the rotary frequency buffers; the
+        # learnable set is byte-for-byte MAD's 407,824.
+
+    def test_attention_qk_norm_is_part_of_the_config_identity(self):
+        # The two MAD-harness attention runs (query/key norm on or off) have
+        # distinct run identities, so a completed one never skips the other,
+        # even though the run-ID string does not carry the value.
+        from common.run_id import identity_exclude_keys
+
+        from research_lib.training.callbacks.run_summary import config_hash
+
+        with_norm = _mad_model_cfg(mixer="attention")  # absent -> rms
+        without = _mad_model_cfg(mixer="attention", attention_qk_norm="none")
+        h1 = config_hash(
+            OmegaConf.to_container(with_norm, resolve=True),
+            identity_exclude_keys(with_norm),
+        )
+        h2 = config_hash(
+            OmegaConf.to_container(without, resolve=True),
+            identity_exclude_keys(without),
+        )
+        assert h1 != h2
+
+    def test_attention_qk_norm_does_not_change_gated_delta_identity(self):
+        # ``attention_qk_norm`` is set for every mixer on the MAD harness but
+        # only the attention control reads it, so a gated-delta run's identity
+        # must not depend on it (or the in-flight gated-delta calibration's
+        # run identities would change).
+        from common.run_id import identity_exclude_keys
+
+        from research_lib.training.callbacks.run_summary import config_hash
+
+        base = _mad_model_cfg(mixer="gated_delta")  # absent -> rms
+        with_key = _mad_model_cfg(mixer="gated_delta", attention_qk_norm="none")
+        h1 = config_hash(
+            OmegaConf.to_container(base, resolve=True), identity_exclude_keys(base)
+        )
+        h2 = config_hash(
+            OmegaConf.to_container(with_key, resolve=True),
+            identity_exclude_keys(with_key),
+        )
+        assert h1 == h2
+        # ... but the two attention variants still differ from the gated run.
+        attn = _mad_model_cfg(mixer="attention")
+        ha = config_hash(
+            OmegaConf.to_container(attn, resolve=True), identity_exclude_keys(attn)
+        )
+        assert ha != h1
 
 
 class TestRunLength:

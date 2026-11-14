@@ -13,6 +13,8 @@ rather than on the gate.
 
 from __future__ import annotations
 
+from typing import Callable, Type, Union
+
 import torch
 import torch.nn as nn
 
@@ -30,6 +32,9 @@ class CausalSelfAttention(nn.Module):
             head width (``d_model // num_heads``).
         dropout: Dropout probability on the attention output weights
             (0 by default; off during evaluation).
+        qk_norm: Normalises the query and key projections per head before
+            the rotary embedding (``None`` gives plain scaled-dot-product
+            attention; the default is an ``RMSNorm``).
 
     Shape:
         - Input: ``(B, T, d_model)``
@@ -48,6 +53,7 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         rotary_dim: int | None = None,
         dropout: float = 0.0,
+        qk_norm: Union[Type[nn.Module], Callable[[int], nn.Module], None] = nn.RMSNorm,
     ) -> None:
         super().__init__()
         if d_model <= 0:
@@ -88,6 +94,7 @@ class CausalSelfAttention(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             rotary_dim=rotary_dim,
+            qk_norm=qk_norm,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

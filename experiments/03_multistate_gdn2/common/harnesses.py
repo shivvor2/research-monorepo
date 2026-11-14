@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from enum import Enum
 
+import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 
 from research_lib.architectures.config import MadLMConfig, ZoologyLMConfig
@@ -31,6 +32,39 @@ class MixerKind(str, Enum):
 
     GATED_DELTA = "gated_delta"
     ATTENTION = "attention"
+
+
+class AttentionQkNorm(str, Enum):
+    """Query/key normalisation for the attention positive control.
+
+    - ``RMS``: an ``RMSNorm`` per head on the query and key projections
+      (the :class:`~research_lib.layers.attention.CausalSelfAttention`
+      default).
+    - ``NONE``: no query/key normalisation — plain scaled-dot-product
+      attention, as MAD's attention applies.
+    """
+
+    RMS = "rms"
+    NONE = "none"
+
+
+def resolve_attention_qk_norm(cfg: DictConfig) -> type[nn.Module] | None:
+    """The query/key norm module (or ``None``) for the attention control.
+
+    Reads ``model.attention_qk_norm``; an absent key means the default, an
+    ``RMSNorm`` (the behaviour before the switch existed). Only the values
+    of :class:`AttentionQkNorm` are accepted; anything else is rejected so
+    a typo is loud.
+    """
+    value = OmegaConf.select(cfg, "model.attention_qk_norm", default="rms")
+    try:
+        choice = AttentionQkNorm(str(value))
+    except ValueError:
+        raise ValueError(
+            "model.attention_qk_norm must be one of "
+            f"{[v.value for v in AttentionQkNorm]} (got {value!r})"
+        ) from None
+    return nn.RMSNorm if choice is AttentionQkNorm.RMS else None
 
 
 def build_zoology(cfg: DictConfig) -> ZoologyLM:
@@ -105,7 +139,9 @@ def build_mad(cfg: DictConfig) -> MadLM:
     num_heads``); attention is :class:`CausalSelfAttention` with rotary on
     the full head width and its own head count,
     ``model.attention_num_heads`` (default 16, so its head width is
-    ``d_model // attention_num_heads``).
+    ``d_model // attention_num_heads``).  Query/key normalisation follows
+    ``model.attention_qk_norm`` (default ``rms``); the MAD control sets it
+    to ``none``, as MAD's attention applies no query/key norm.
 
     Args:
         cfg: The resolved config (``model.*``).
@@ -166,7 +202,10 @@ def build_mad(cfg: DictConfig) -> MadLM:
                     f"model.attention_num_heads ({attention_heads})"
                 )
             return CausalSelfAttention(
-                d, attention_heads, rotary_dim=d // attention_heads
+                d,
+                attention_heads,
+                rotary_dim=d // attention_heads,
+                qk_norm=resolve_attention_qk_norm(cfg),
             )
         raise ValueError(f"unknown mixer {kind}")
 

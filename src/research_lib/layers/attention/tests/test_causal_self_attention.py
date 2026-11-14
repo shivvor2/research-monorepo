@@ -7,10 +7,12 @@ Run with: pytest src/research_lib/layers/attention/tests/test_causal_self_attent
 """
 
 import torch
+import torch.nn as nn
 
 from research_lib.architectures.config.zoology_lm import ZoologyLMConfig
 from research_lib.architectures.zoology_lm import ZoologyLM
 from research_lib.layers.attention import CausalSelfAttention
+from research_lib.layers.attention.rotatory_mha import RotaryMultiheadAttention
 
 
 class TestOutputShape:
@@ -114,3 +116,76 @@ class TestValidation:
         attn = CausalSelfAttention(32, 2, rotary_dim=16)
         x = torch.randn(2, 8, 32)
         assert attn(x).shape == (2, 8, 32)
+
+
+class TestQkNorm:
+    """The query/key-norm switch: the default is unchanged (an RMSNorm on
+    the query and key projections), ``None`` removes it entirely and agrees
+    with a literal scaled-dot-product attention, and the underlying layer is
+    unchanged."""
+
+    def test_default_applies_rmsnorm_and_matches_explicit(self):
+        # The default must be the same RMSNorm as before the switch existed:
+        # for a fixed seed the default builds bit-identically to an explicit
+        # ``qk_norm=nn.RMSNorm``, with the same state_dict keys.
+        torch.manual_seed(0)
+        attn = CausalSelfAttention(32, 2)
+        torch.manual_seed(0)
+        explicit = CausalSelfAttention(32, 2, qk_norm=nn.RMSNorm)
+        assert attn.attention.qk_norm_str == "RMSNorm"
+        keys = set(explicit.attention.state_dict())
+        # the norm is present and elementwise-affine on the head width
+        assert set(attn.attention.state_dict()) == keys
+        assert "attention.q_norm.weight" in attn.state_dict()
+        assert "attention.k_norm.weight" in attn.state_dict()
+        assert attn.attention.q_norm.weight.shape == (16,)
+        torch.manual_seed(0)
+        x = torch.randn(2, 8, 32)
+        torch.testing.assert_close(attn(x), explicit(x), atol=0.0, rtol=0.0)
+
+    def test_default_attention_submodule_matches_the_underlying_layer(self):
+        # The default wrapper should leave the attention submodule exactly as
+        # a bare RotaryMultiheadAttention with the same arguments (nothing
+        # added or moved); equal weights (same seed) give equal output.
+        torch.manual_seed(0)
+        attn = CausalSelfAttention(32, 2, rotary_dim=16)
+        torch.manual_seed(0)
+        bare = RotaryMultiheadAttention(embed_dim=32, num_heads=2, rotary_dim=16)
+        assert set(attn.attention.state_dict()) == set(bare.state_dict())
+        for key in bare.state_dict():
+            torch.testing.assert_close(
+                attn.attention.state_dict()[key], bare.state_dict()[key], atol=0, rtol=0
+            )
+
+    def test_qk_norm_none_removes_norm_parameters(self):
+        attn = CausalSelfAttention(32, 2, qk_norm=None)
+        assert attn.attention.qk_norm_str == "None"
+        keys = set(attn.state_dict())
+        assert not any(
+            k in keys for k in ("attention.q_norm.weight", "attention.k_norm.weight")
+        )
+
+    def test_qk_norm_none_equals_literal_scaled_dot_product(self):
+        # With qk_norm=None the attention is exactly the raw projections,
+        # rotated, run through scaled-dot-product attention and out-projected
+        # (no query/key normalisation anywhere).
+        torch.manual_seed(0)
+        attn = CausalSelfAttention(32, 2, qk_norm=None)
+        torch.manual_seed(0)
+        x = torch.randn(2, 16, 32)
+        y = attn(x)
+
+        mha = attn.attention
+        B, T, _ = x.shape
+        H, D = mha.num_heads, mha.head_dim
+        qkv = torch.nn.functional.linear(x, mha.in_proj_weight, mha.in_proj_bias)
+        qkv = qkv.view(B, T, 3, H, D)
+        q, k, v = qkv.unbind(2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        q, k = mha._apply_rotary(q, k, seq_dim=-2, offset=0)
+        o = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+        o = o.transpose(1, 2).contiguous().view(B, T, mha.embed_dim)
+        o = torch.nn.functional.linear(o, mha.out_proj.weight, mha.out_proj.bias)
+        torch.testing.assert_close(y, o, atol=1e-5, rtol=1e-5)

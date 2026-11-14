@@ -100,7 +100,9 @@ MAD uses bf16+TF32) with a separate validation set and the reported metric
 being MAD's macro token accuracy at the final weights. The gated-delta
 layer uses 8 heads of width 16 at `d_model=128`; MAD's attention positive
 control is a different layout, 16 heads of width 8 with rotary on the full
-head width. The generator (`research_lib.data.synthetic.mad_fuzzy`)
+head width, and it runs with no query/key normalisation (the attention
+layer's default would otherwise add an RMSNorm), as MAD's attention does.
+The generator (`research_lib.data.synthetic.mad_fuzzy`)
 reproduces MAD's own generator call for call (fixtures in the library
 tests), training runs on a fixed set for 200 epochs with a per-epoch
 cosine LR, and the two AdamW groups decay only the 2-D linear weights (the

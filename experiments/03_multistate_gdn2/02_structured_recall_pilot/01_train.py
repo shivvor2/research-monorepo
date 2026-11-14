@@ -40,7 +40,7 @@ from common.registries import (  # noqa: E402
     config_type_of_task,
     require_harness,
 )
-from common.run_id import HASH_EXCLUDE, make_run_id  # noqa: E402
+from common.run_id import identity_exclude_keys, make_run_id  # noqa: E402
 from common.run_lifecycle import (  # noqa: E402
     build_module,
     create_callbacks_reset_curves,
@@ -239,7 +239,10 @@ def run_job(cfg: DictConfig) -> None:
 
     run_id = make_run_id(cfg, lr, weight_decay=weight_decay, include_task_keys=True)
     identity = (
-        config_hash(OmegaConf.to_container(cfg, resolve=True), HASH_EXCLUDE),
+        config_hash(
+            OmegaConf.to_container(cfg, resolve=True),
+            identity_exclude_keys(cfg),
+        ),
         cfg.seed,
     )
     rank = lightning_launched_rank()

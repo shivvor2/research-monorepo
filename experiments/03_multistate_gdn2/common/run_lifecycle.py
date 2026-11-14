@@ -55,7 +55,7 @@ from research_lib.training.scheduling import (
 from research_lib.utils.io import atomic_torch_save
 
 from .layout import record_files, wandb_kwargs
-from .run_id import HASH_EXCLUDE
+from .run_id import identity_exclude_keys
 
 logger = logging.getLogger(__name__)
 
@@ -400,8 +400,9 @@ def create_callbacks(
             packages=("torch", "lightning", "hydra-core", "omegaconf", "torchmetrics"),
             monitor=monitor_key,
             mode="max",
-            # The run identity excludes operational keys (see HASH_EXCLUDE).
-            hash_exclude=HASH_EXCLUDE,
+            # The run identity excludes operational keys (HASH_EXCLUDE) and
+            # any mixer-specific keys the run's mixer does not read.
+            hash_exclude=identity_exclude_keys(cfg),
             # The lockfile hash is part of the run's provenance: a tier
             # that mixed lock versions would be visible.
             provenance_files=("uv.lock",),

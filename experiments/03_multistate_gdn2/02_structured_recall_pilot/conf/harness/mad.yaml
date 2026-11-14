@@ -20,6 +20,7 @@ model:
   mixer: gated_delta         # gated_delta | attention (positive control)
   num_heads: 8               # gated-delta: 8 heads of width 16 at d=128
   attention_num_heads: 16    # attention control: 16 heads of width 8
+  attention_qk_norm: none    # attention control: rms | none (MAD's attention uses no query/key norm)
   expand_v: 1.0
   chunk_size: 16
   window: 8
