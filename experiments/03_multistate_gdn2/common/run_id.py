@@ -54,6 +54,28 @@ HASH_EXCLUDE: tuple[str, ...] = (
     "training.accelerator",
 )
 
+_MIXER_SPECIFIC_IDENTITY_KEYS: tuple[str, ...] = ("model.attention_qk_norm",)
+"""Config keys that are part of a run's identity only for some mixers."""
+
+
+def identity_exclude_keys(cfg: DictConfig) -> tuple[str, ...]:
+    """The config keys excluded from a run's identity hash.
+
+    ``HASH_EXCLUDE`` (the operational keys) always applies, plus the
+    mixer-specific keys that a run of the current ``model.mixer`` does not
+    read.  ``model.attention_qk_norm`` is set for every mixer on the MAD
+    harness (the harness config carries it) but only the attention control
+    reads it, so it must not change the identity of a run using another
+    mixer (e.g. a gated-delta run); for an attention run it is part of the
+    identity, so a run with and without query/key normalisation are
+    distinct.
+    """
+    keys = list(HASH_EXCLUDE)
+    if str(OmegaConf.select(cfg, "model.mixer", default="gated_delta")) != "attention":
+        keys.extend(_MIXER_SPECIFIC_IDENTITY_KEYS)
+    return tuple(keys)
+
+
 # Task config fields that never join the run ID (already in the base ID,
 # or operational seeding / naming).
 _TASK_SKIP_FIELDS = frozenset({"name", "val_seed", "test_seed", "max_seq_len"})

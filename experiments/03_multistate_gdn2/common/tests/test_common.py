@@ -523,17 +523,49 @@ class TestBuildMadAttention:
 
     def test_attention_qk_norm_is_part_of_the_config_identity(self):
         # The two MAD-harness attention runs (query/key norm on or off) have
-        # distinct config hashes, so a completed one never skips the other,
+        # distinct run identities, so a completed one never skips the other,
         # even though the run-ID string does not carry the value.
-        from common.run_id import HASH_EXCLUDE
+        from common.run_id import identity_exclude_keys
 
         from research_lib.training.callbacks.run_summary import config_hash
 
         with_norm = _mad_model_cfg(mixer="attention")  # absent -> rms
         without = _mad_model_cfg(mixer="attention", attention_qk_norm="none")
-        h1 = config_hash(OmegaConf.to_container(with_norm, resolve=True), HASH_EXCLUDE)
-        h2 = config_hash(OmegaConf.to_container(without, resolve=True), HASH_EXCLUDE)
+        h1 = config_hash(
+            OmegaConf.to_container(with_norm, resolve=True),
+            identity_exclude_keys(with_norm),
+        )
+        h2 = config_hash(
+            OmegaConf.to_container(without, resolve=True),
+            identity_exclude_keys(without),
+        )
         assert h1 != h2
+
+    def test_attention_qk_norm_does_not_change_gated_delta_identity(self):
+        # ``attention_qk_norm`` is set for every mixer on the MAD harness but
+        # only the attention control reads it, so a gated-delta run's identity
+        # must not depend on it (or the in-flight gated-delta calibration's
+        # run identities would change).
+        from common.run_id import identity_exclude_keys
+
+        from research_lib.training.callbacks.run_summary import config_hash
+
+        base = _mad_model_cfg(mixer="gated_delta")  # absent -> rms
+        with_key = _mad_model_cfg(mixer="gated_delta", attention_qk_norm="none")
+        h1 = config_hash(
+            OmegaConf.to_container(base, resolve=True), identity_exclude_keys(base)
+        )
+        h2 = config_hash(
+            OmegaConf.to_container(with_key, resolve=True),
+            identity_exclude_keys(with_key),
+        )
+        assert h1 == h2
+        # ... but the two attention variants still differ from the gated run.
+        attn = _mad_model_cfg(mixer="attention")
+        ha = config_hash(
+            OmegaConf.to_container(attn, resolve=True), identity_exclude_keys(attn)
+        )
+        assert ha != h1
 
 
 class TestRunLength:
