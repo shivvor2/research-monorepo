@@ -70,9 +70,9 @@ TASK_TIERS: dict[str, TaskTiers] = {
 # layouts x 2 gates x seeds 0-9; 6 = 3 LRs x 2 seeds, no gate for the
 # attention control).
 EXPECTED_RUNS: dict[str, int] = {
-    "calib_ef_single": 12,
-    "calib_ef_multi": 24,
-    "calib_ef_attention": 6,
+    "calib_ef_single": 20,
+    "calib_ef_multi": 40,
+    "calib_ef_attention": 10,
     "tier1_ef_single": 20,
     "tier1_ef_multi": 40,
     "calib_mad_single": 12,

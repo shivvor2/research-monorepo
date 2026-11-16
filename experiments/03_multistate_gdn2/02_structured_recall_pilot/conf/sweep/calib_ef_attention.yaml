@@ -19,5 +19,5 @@ hydra:
       task: entity_field
       model.mixer: attention
       model.layout: single
-      optimizer.lr: 0.001,0.003,0.01
+      optimizer.lr: 0.0003,0.001,0.003,0.01,0.03
       seed: range(100,102)
