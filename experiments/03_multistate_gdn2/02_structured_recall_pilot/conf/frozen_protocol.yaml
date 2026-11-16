@@ -5,7 +5,7 @@
 # phase >= 2 refuses to run. Calibration fills the LR and weight-decay
 # tables and the harness choices for each harness, then sets ``frozen: true``.
 
-frozen: false
+frozen: true
 
 # The frozen architecture choices per harness. The keys a harness may
 # hold are the protocol's ``FROZEN_HARNESS_KEYS`` (the single source of
@@ -13,14 +13,14 @@ frozen: false
 # num_mixers - and ``check_frozen_choices`` requires a frozen entry to list
 # exactly those, comparing each set key against the run.
 harness_choices:
-  zoology: {d_model: null, layer_pattern: null, state_mixer: null}
-  mad: {d_model: null, num_mixers: null}
+  zoology: {d_model: 32, layer_pattern: zoology, state_mixer: none}
+  mad: {d_model: 128, num_mixers: 2}
 
 # The frozen per-task settings. The keys a task may freeze are the
 # protocol's ``FROZEN_TASK_KEYS``; a task with no entry there (its
 # difficulty comes from its slices, not its length) has nothing to freeze.
 task_settings:
-  mad_fuzzy: {seq_len: null}
+  mad_fuzzy: {seq_len: 512}
 
 # The frozen peak LR per (task, mixer, layout, gate).
 #
@@ -33,8 +33,20 @@ task_settings:
 #
 # A missing or null node anywhere in a key's path falls through to the
 # "fill conf/frozen_protocol.yaml" error.
-lr_table: {}
+lr_table:
+  entity_field:
+    gated_delta:
+      single: {full: 0.003, kda: 0.01}
+      ws: {full: 0.01, kda: 0.01}
+      ll: {full: 0.01, kda: 0.01}
+    attention: 0.03
 
 # The frozen weight decay, with the same key path as ``lr_table``
 # (``<task>.gated_delta.<layout>.<gate>``, ``<task>.attention``).
-weight_decay_table: {}
+weight_decay_table:
+  entity_field:
+    gated_delta:
+      single: {full: 0.1, kda: 0.1}
+      ws: {full: 0.1, kda: 0.1}
+      ll: {full: 0.1, kda: 0.1}
+    attention: 0.1
