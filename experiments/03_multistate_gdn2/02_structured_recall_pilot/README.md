@@ -102,9 +102,10 @@ token accuracy are recorded for every run. The macro average counts token
 classes that are never targets, so a few stray predictions move it far
 more than accuracy changes do, and it cannot carry a gap of a few points
 between gates. The gated-delta layer uses 8 heads of width 16 at
-`d_model=128`; MAD's attention positive control is a different layout, 16
-heads of width 8 with rotary on the full head width, and it runs with no query/key normalisation (the attention
-layer's default would otherwise add an RMSNorm), as MAD's attention does.
+`d_model=128`; MAD's attention positive control is a different layout,
+16 heads of width 8 with rotary on the full head width, and it runs with
+no query/key normalisation (the attention layer's default would otherwise
+add an RMSNorm), as MAD's attention does.
 The generator (`research_lib.data.synthetic.mad_fuzzy`)
 reproduces MAD's own generator call for call (fixtures in the library
 tests), training runs on a fixed set for 200 epochs with a per-epoch
@@ -146,11 +147,9 @@ follows:
    length for the frozen snippet). The setting is chosen on accuracy level
    only, never on the gap. If one gate reads below 0.15 and the other
    above 0.75, the floor takes precedence and the length moves to 256: a
-   reading near 0.15 is close to the per-sequence chance level (each
-   scored position picks among the eight value tokens, so chance is about
-   1/8), so that gate gives no usable comparison, while a gate above
-   0.75 is still measured and only leaves less headroom for multi-state
-   gains.
+   reading near 0.15 is close to the per-sequence chance level, so that
+   gate gives no usable comparison, while a gate above 0.75 is still
+   measured and only leaves less headroom for multi-state gains.
 3. Go/no-go: `full − kda ≥ +0.03` at each gate's best point.
 4. On a go, run `calib_mad_multi` and the attention calibration
    (`calib_mad_attention` for the positive control), freeze both the LR

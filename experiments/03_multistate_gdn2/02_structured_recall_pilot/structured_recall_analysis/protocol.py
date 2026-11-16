@@ -105,17 +105,16 @@ positive-control tier."""
 # --------------------------------------------------------------------------- #
 
 
-"""The screening metric key per registered task (a ``test/<key>``
-column): the overall per-sequence mean accuracy (``test/acc``) for a
-task without slices, and the slice cell a task with slices reads. A
-task with a screening cell but no :data:`TASK_TIERS` entry is skipped
-by the reports with a log line, not an error."""
-
 SCREENING_CELLS: dict[str, str] = {
     "mqar": "test/acc/slice=64",
     "entity_field": "test/acc/slice=32/class=sibling",
     "mad_fuzzy": "test/acc",
 }
+"""The screening metric key per registered task (a ``test/<key>``
+column): the overall per-sequence mean accuracy (``test/acc``) for a
+task without slices, and the slice cell a task with slices reads. A
+task with a screening cell but no :data:`TASK_TIERS` entry is skipped
+by the reports with a log line, not an error."""
 
 SCREENING_FALLBACKS: dict[str, tuple[str, float]] = {
     # Both gates below 0.15 at the longest slice: read the next-shorter slice.

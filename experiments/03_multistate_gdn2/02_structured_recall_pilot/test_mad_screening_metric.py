@@ -39,11 +39,10 @@ def _resolve(task: str, *overrides: str) -> str:
     for path in (_PILOT, _PROJECT, _SRC):
         if str(path) not in sys.path:
             sys.path.insert(0, str(path))
-    from hydra import compose, initialize_config_dir
-    from omegaconf import OmegaConf
-
     from common import conf_resolvers  # noqa: F401  (registers the resolver)
     from common.run_id import identity_exclude_keys
+    from hydra import compose, initialize_config_dir
+    from omegaconf import OmegaConf
 
     from research_lib.training.callbacks import config_hash
 
@@ -73,10 +72,11 @@ class TestHarnessAndProtocolKeys:
     def test_entity_field_config_keeps_the_base_monitor_key(self):
         # The MAD harness change must not leak into other tasks: an
         # entity-field run (the Zoology harness) still monitors the base
-        # ``val/acc`` key. The monitor key is part of the identity hash,
-        # so this (plus the untouched harness and task stores) is what
-        # keeps the 70 existing entity-field calibration records' config
-        # hashes identical before and after this change.
+        # ``val/acc`` key. This is the config-side guard for run identity:
+        # the monitor key is part of the identity hash, so keeping it at
+        # the base value for entity field is what keeps that task's config
+        # hashes unchanged by this change (the enforcement test is
+        # ``test_mad_monitor_key_changes_the_run_identity``).
         from hydra import compose, initialize_config_dir
 
         with initialize_config_dir(config_dir=str(_CONF), version_base=None):
@@ -85,11 +85,12 @@ class TestHarnessAndProtocolKeys:
         assert cfg.training.monitor_key == "val/acc"
 
     def test_mad_monitor_key_changes_the_run_identity(self):
-        # ``training.monitor_key`` is part of the identity hash, so this
-        # change gives every MAD run a new (stage-consistent) identity.
-        # That is expected and harmless: no protocol-tier MAD record
-        # exists yet, so nothing changes identity retroactively. The test
-        # pins that the change is visible to the identity machinery.
+        # ``training.monitor_key`` is part of the identity hash, so the
+        # switch to the per-sequence reading changes every MAD run's
+        # identity. That is expected and harmless here: the change only
+        # re-keys runs that have not started a protocol tier yet, so no
+        # existing record's identity is moved. The test pins that the
+        # change is visible to the identity machinery.
         assert _resolve("mad_fuzzy") != _resolve(
             "mad_fuzzy", "training.monitor_key=val/acc_mad"
         )

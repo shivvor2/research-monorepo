@@ -2357,15 +2357,13 @@ class TestReportSchemasFixed:
 
 class TestValuesUnchangedAgainstFixture:
     def test_reports_match_the_pre_change_fixture(self, tmp_path):
-        # A mixed table (both tasks, MAD at two lengths with an override):
-        # the reports keep every value on the shared columns, and the MAD
-        # fuzzy screening reading is the per-sequence mean accuracy
-        # (``test/acc``) with the length band read on ``val/acc`` (the
-        # table carries both test accuracies and the monitor key, as a
-        # real run record does). The fixture was regenerated from current
-        # master so its shared columns also reflect the entity-field
-        # calibration sweep sizes; only the MAD reading keys differ from
-        # the pre-change pin.
+        # A mixed table (both tasks, MAD at two lengths with an override),
+        # a snapshot of this branch's output: the reports keep every value
+        # on the shared columns, and the MAD fuzzy screening reading is the
+        # per-sequence mean accuracy (``test/acc``) with the length band on
+        # ``val/acc`` (the table carries both test accuracies and the
+        # monitor key, as a real run record does). Its row set also
+        # reflects the current entity-field calibration sweep.
         fixture = _PILOT / "fixtures" / "mixed_tasks_before_fixed_schemas"
         table = pd.read_json(fixture / "table.json", orient="records")
         out = tmp_path / "out"
