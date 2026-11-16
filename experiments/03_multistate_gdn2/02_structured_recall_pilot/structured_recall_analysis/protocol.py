@@ -106,17 +106,16 @@ positive-control tier."""
 
 
 """The screening metric key per registered task (a ``test/<key>``
-column). A task with a screening cell but no :data:`TASK_TIERS` entry is
-skipped by the reports with a log line, not an error."""
+column): the overall per-sequence mean accuracy (``test/acc``) for a
+task without slices, and the slice cell a task with slices reads. A
+task with a screening cell but no :data:`TASK_TIERS` entry is skipped
+by the reports with a log line, not an error."""
 
 SCREENING_CELLS: dict[str, str] = {
     "mqar": "test/acc/slice=64",
     "entity_field": "test/acc/slice=32/class=sibling",
-    "mad_fuzzy": "test/acc_mad",
+    "mad_fuzzy": "test/acc",
 }
-"""The screening metric key per registered task (a ``test/<key>``
-column). A task with a screening cell but no :data:`TASK_TIERS` entry is
-skipped by the reports with a log line, not an error."""
 
 SCREENING_FALLBACKS: dict[str, tuple[str, float]] = {
     # Both gates below 0.15 at the longest slice: read the next-shorter slice.
@@ -232,11 +231,10 @@ class SettingBand:
 
 
 TASK_SETTING_BANDS: dict[str, SettingBand] = {
-    # The MAD length rule reads a best validation ``acc_mad`` and moves
-    # the length if it sits outside the band [0.15, 0.75].
-    "mad_fuzzy": SettingBand(
-        floor=0.15, ceiling=0.75, margin=0.05, metric="val/acc_mad"
-    ),
+    # The MAD length rule reads the best validation per-sequence mean
+    # accuracy (``val/acc``) and moves the length if it sits outside the
+    # band [0.15, 0.75].
+    "mad_fuzzy": SettingBand(floor=0.15, ceiling=0.75, margin=0.05, metric="val/acc"),
 }
 """The tasks whose best validation reading drives a length-setting band,
 keyed by task.  A task with no entry gets no band columns."""

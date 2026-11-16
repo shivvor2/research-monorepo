@@ -96,11 +96,14 @@ when it does not touch the layer under test — no position embedding,
 per-mixer `[mixer, SwiGLU]` pre-norm LayerNorm blocks, a final LayerNorm
 and a biased linear head, the MAD backbone init and a bias-free SwiGLU —
 in fp32 (the reference layer's triangular solve is precision-sensitive;
-MAD uses bf16+TF32) with a separate validation set and the reported metric
-being MAD's macro token accuracy at the final weights. The gated-delta
-layer uses 8 heads of width 16 at `d_model=128`; MAD's attention positive
-control is a different layout, 16 heads of width 8 with rotary on the full
-head width, and it runs with no query/key normalisation (the attention
+MAD uses bf16+TF32) with a separate validation set; the readings are the
+per-sequence mean accuracy, and MAD's macro token accuracy and the plain
+token accuracy are recorded for every run. The macro average counts token
+classes that are never targets, so a few stray predictions move it far
+more than accuracy changes do, and it cannot carry a gap of a few points
+between gates. The gated-delta layer uses 8 heads of width 16 at
+`d_model=128`; MAD's attention positive control is a different layout, 16
+heads of width 8 with rotary on the full head width, and it runs with no query/key normalisation (the attention
 layer's default would otherwise add an RMSNorm), as MAD's attention does.
 The generator (`research_lib.data.synthetic.mad_fuzzy`)
 reproduces MAD's own generator call for call (fixtures in the library
@@ -114,16 +117,21 @@ exempt). Its `max_seq_len` (the row length) is derived, not hand-set:
 ### MAD fuzzy calibration workflow
 
 LR/weight-decay selection and the length rule read each gate's **best
-validation** `acc_mad` (the report's `mean_best_value`); the go/no-go gap
-is read from the report's gap column, `test/acc_mad` at each gate's
-selected point. The MAD sweep tiers pin `task=mad_fuzzy` (a sweep must not
-run another task under a MAD tier name); the length is an ordinary task
-key, so a length-resolution rerun overrides `task.seq_len=256` and
-`max_seq_len` follows:
+validation** per-sequence mean accuracy (`acc`, the report's
+`mean_best_value`); the go/no-go gap is read from the report's gap
+column, `test/acc` at each gate's selected point. MAD's macro token
+accuracy and the plain token accuracy are logged for every run (`acc_mad`
+and `acc_token`, on validation and test), but no protocol reading uses
+them: the macro average counts token classes that are never targets, so
+a few stray predictions move it far more than accuracy changes do. The
+MAD sweep tiers pin `task=mad_fuzzy` (a sweep must not run another task
+under a MAD tier name); the length is an ordinary task key, so a
+length-resolution rerun overrides `task.seq_len=256` and `max_seq_len`
+follows:
 
 1. Run `calib_mad_single` (sweeping LR and weight decay; the report
    selects the `(lr, weight_decay)` pair) and read each gate's best
-   validation `acc_mad` (re-run any look-stuck or near-edge cell at seed
+   validation `acc` (re-run any look-stuck or near-edge cell at seed
    101).
 
    ```
@@ -138,10 +146,11 @@ key, so a length-resolution rerun overrides `task.seq_len=256` and
    length for the frozen snippet). The setting is chosen on accuracy level
    only, never on the gap. If one gate reads below 0.15 and the other
    above 0.75, the floor takes precedence and the length moves to 256: a
-   reading near 0.15 is close to chance for the macro accuracy over MAD's
-   value tokens, so that gate gives no usable comparison, while a gate
-   above 0.75 is still measured and only leaves less headroom for
-   multi-state gains.
+   reading near 0.15 is close to the per-sequence chance level (each
+   scored position picks among the eight value tokens, so chance is about
+   1/8), so that gate gives no usable comparison, while a gate above
+   0.75 is still measured and only leaves less headroom for multi-state
+   gains.
 3. Go/no-go: `full − kda ≥ +0.03` at each gate's best point.
 4. On a go, run `calib_mad_multi` and the attention calibration
    (`calib_mad_attention` for the positive control), freeze both the LR
