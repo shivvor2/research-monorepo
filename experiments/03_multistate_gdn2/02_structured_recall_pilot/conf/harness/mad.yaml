@@ -46,7 +46,9 @@ training:
   epochs: 200                # fixed training set, one permutation per epoch
   val_every_epochs: 1        # validate after this many epochs
   max_steps: null            # derived: epochs * steps_per_epoch
-  monitor_key: val/acc_mad   # drives early stopping and the best-value track
+  monitor_key: val/acc       # drives early stopping and the best-value track: the
+                             # per-sequence mean accuracy; MAD's macro token
+                             # accuracy (val/acc_mad) is logged alongside it
   early_stop_threshold: 0.999
   precision: 32-true
   grad_clip_val: null

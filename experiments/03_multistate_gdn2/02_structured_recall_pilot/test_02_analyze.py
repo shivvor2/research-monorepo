@@ -1405,7 +1405,8 @@ class TestMadBandAndSafeguard:
                 weight_decay=0.1,
                 seed=100,
                 best=0.18,
-                **{"test/acc_mad": 0.18},
+                **{"test/acc": 0.18},
+                monitor_key="val/acc",
                 monitored_first=0.1,
                 monitored_max=0.15,
                 monitored_last_half_min=0.12,
@@ -1420,7 +1421,8 @@ class TestMadBandAndSafeguard:
                 weight_decay=0.1,
                 seed=100,
                 best=0.95,
-                **{"test/acc_mad": 0.9},
+                **{"test/acc": 0.9},
+                monitor_key="val/acc",
                 monitored_first=0.8,
                 monitored_max=1.9,
                 monitored_last_half_min=0.9,
@@ -2090,6 +2092,34 @@ class TestBandMetric:
         out.mkdir()
         _analyze.calibration(_table(rows), out)  # no raise
 
+    def test_tooling_tier_rows_on_the_old_monitor_are_skipped_not_refused(
+        self, tmp_path, protocol
+    ):
+        # A smoke / debug / bench record monitored on the pre-change key
+        # (val/acc_mad) is not a calibration-tier row, so the mixed-monitor
+        # guard never sees it: only calibration-tier runs are selected, and
+        # the report is written (header-only here) instead of refused.
+        rows = [
+            _row(
+                f"pre_{tier}",
+                task="mad_fuzzy",
+                gate="full",
+                lr=1e-3,
+                weight_decay=0.0,
+                seed=100,
+                best=0.2,
+                **{"test/acc_mad": 0.2, "test/acc": 0.2},
+                monitor_key="val/acc_mad",
+                tier=tier,
+            )
+            for tier in ("smoke", "debug", "bench")
+        ]
+        out = tmp_path / "out"
+        out.mkdir()
+        _analyze.calibration(_table(rows), out)  # no raise
+        df = pd.read_csv(out / "calibration.csv")
+        assert df.empty  # nothing to read, but the schema is written
+
 
 class TestMissingLearningRate:
     def test_no_lr_raises_naming_runs(self, tmp_path, protocol):
@@ -2252,7 +2282,8 @@ class TestReportSchemasFixed:
                 best=0.2,
                 step=10,
                 tier="calib_mad_single",
-                **{"test/acc_mad": 0.2},
+                **{"test/acc": 0.2},
+                monitor_key="val/acc",
                 monitored_first=0.1,
                 monitored_max=0.18,
                 monitored_last_half_min=0.11,
@@ -2266,7 +2297,7 @@ class TestReportSchemasFixed:
             tier="tier1_mad_single",
             best=0.6,
             step=5,
-            **{"test/acc_mad": 0.6},
+            **{"test/acc": 0.6},
         )
 
     def _subset_rows(self, tasks):
@@ -2326,10 +2357,13 @@ class TestReportSchemasFixed:
 
 class TestValuesUnchangedAgainstFixture:
     def test_reports_match_the_pre_change_fixture(self, tmp_path):
-        # A mixed table (both tasks, MAD at two lengths with an override)
-        # written before this change: the new reports keep every value on
-        # the shared columns (only the schema / empty-file handling and the
-        # two seq_len columns change).
+        # A mixed table (both tasks, MAD at two lengths with an override),
+        # a snapshot of this branch's output: the reports keep every value
+        # on the shared columns, and the MAD fuzzy screening reading is the
+        # per-sequence mean accuracy (``test/acc``) with the length band on
+        # ``val/acc`` (the table carries both test accuracies and the
+        # monitor key, as a real run record does). Its row set also
+        # reflects the current entity-field calibration sweep.
         fixture = _PILOT / "fixtures" / "mixed_tasks_before_fixed_schemas"
         table = pd.read_json(fixture / "table.json", orient="records")
         out = tmp_path / "out"
@@ -2567,7 +2601,8 @@ class TestNewSeqLenColumns:
                 best=0.2,
                 step=10,
                 tier="calib_mad_single",
-                **{"test/acc_mad": 0.2},
+                **{"test/acc": 0.2},
+                monitor_key="val/acc",
                 seq_len=512,
                 monitored_first=0.1,
                 monitored_max=0.18,
@@ -2583,7 +2618,8 @@ class TestNewSeqLenColumns:
                 best=0.2,
                 step=10,
                 tier="calib_mad_single",
-                **{"test/acc_mad": 0.2},
+                **{"test/acc": 0.2},
+                monitor_key="val/acc",
                 seq_len=256,
                 monitored_first=0.1,
                 monitored_max=0.18,

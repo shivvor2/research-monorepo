@@ -294,7 +294,9 @@
   "monitored_first":0.1,
   "monitored_max":0.18,
   "monitored_last_half_min":0.11,
-  "monitored_last_half_max":0.14
+  "monitored_last_half_max":0.14,
+  "test\/acc":0.2,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_kda_512_100",
@@ -321,7 +323,9 @@
   "monitored_first":0.2,
   "monitored_max":0.9,
   "monitored_last_half_min":0.25,
-  "monitored_last_half_max":0.4
+  "monitored_last_half_max":0.4,
+  "test\/acc":0.3,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_full_512_101",
@@ -348,7 +352,9 @@
   "monitored_first":0.1,
   "monitored_max":0.18,
   "monitored_last_half_min":0.11,
-  "monitored_last_half_max":0.14
+  "monitored_last_half_max":0.14,
+  "test\/acc":0.2,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_kda_512_101",
@@ -375,7 +381,9 @@
   "monitored_first":0.2,
   "monitored_max":0.9,
   "monitored_last_half_min":0.25,
-  "monitored_last_half_max":0.4
+  "monitored_last_half_max":0.4,
+  "test\/acc":0.3,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_full_256_100",
@@ -402,7 +410,9 @@
   "monitored_first":0.1,
   "monitored_max":0.18,
   "monitored_last_half_min":0.11,
-  "monitored_last_half_max":0.14
+  "monitored_last_half_max":0.14,
+  "test\/acc":0.2,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_kda_256_100",
@@ -429,7 +439,9 @@
   "monitored_first":0.2,
   "monitored_max":0.9,
   "monitored_last_half_min":0.25,
-  "monitored_last_half_max":0.4
+  "monitored_last_half_max":0.4,
+  "test\/acc":0.3,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_full_256_101",
@@ -456,7 +468,9 @@
   "monitored_first":0.1,
   "monitored_max":0.18,
   "monitored_last_half_min":0.11,
-  "monitored_last_half_max":0.14
+  "monitored_last_half_max":0.14,
+  "test\/acc":0.2,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_kda_256_101",
@@ -483,7 +497,9 @@
   "monitored_first":0.2,
   "monitored_max":0.9,
   "monitored_last_half_min":0.25,
-  "monitored_last_half_max":0.4
+  "monitored_last_half_max":0.4,
+  "test\/acc":0.3,
+  "monitor_key":"val\/acc"
  },
  {
   "run_id":"mad_pc_full_512_0",
@@ -510,7 +526,8 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.6
  },
  {
   "run_id":"mad_pc_kda_512_0",
@@ -537,7 +554,8 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.4
  },
  {
   "run_id":"mad_pc_full_512_1",
@@ -564,7 +582,8 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.6
  },
  {
   "run_id":"mad_pc_kda_512_1",
@@ -591,7 +610,8 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.4
  },
  {
   "run_id":"mad_pc_full_256_0",
@@ -618,7 +638,8 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.6
  },
  {
   "run_id":"mad_pc_kda_256_0",
@@ -645,7 +666,8 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.4
  },
  {
   "run_id":"mad_pc_full_256_1",
@@ -672,7 +694,8 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.6
  },
  {
   "run_id":"mad_pc_kda_256_1",
@@ -699,6 +722,7 @@
   "monitored_first":null,
   "monitored_max":null,
   "monitored_last_half_min":null,
-  "monitored_last_half_max":null
+  "monitored_last_half_max":null,
+  "test\/acc":0.4
  }
 ]
